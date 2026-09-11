@@ -32,13 +32,13 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 
 - **`opencode serve` per project dir**, spawned lazily; sessions persist on disk, so restarts are seamless.
 - **One Slack thread ⇄ one OpenCode session.** New root messages create sessions; thread replies continue them.
-- Streams via OpenCode's SSE event stream; Slack-safe rendering (debounced status message, chunked text, snippet files).
+- Streams via OpenCode's SSE event stream; Slack-safe rendering (live 1-second status ticker, chunked text, snippet files).
 
 ## Features
 
 - **Remote prompting** from Slack DM or mention, with answers streamed into threads
 - **Proactive threads with a mute** — once a thread has a session, replies are answered with no @ mention needed; `\hush` quiets the thread (an @ always wakes it)
-- **Tool visibility by default** — `\verbose full|on|off`; each tool call posts a compact line showing exactly what it's doing (`Read src/x.ts`, `$ npm test`, `🔍 grep "pattern"`), `full` adds output snippets
+- **Tool visibility by default** — `\verbose full|on|off`; each tool call posts a compact line showing exactly what it's doing (`📄 read src/x.ts`, `🔧 npm test`, `🔍 grep "pattern"`), `full` adds output snippets
 - **Markdown answers render properly** — GFM → Slack mrkdwn conversion (bold, lists, links, headings); fenced code stays code
 - **Image support, both ways** — attach a screenshot (or any text/PDF/JSON file ≤8MB) to your message and the model sees it; images the model produces are posted back into the thread
 - **Approval buttons** — Approve once / Always allow / Deny, resolving OpenCode's permission requests in place — mirrored to your DMs, so a blocked run pages you on your phone
