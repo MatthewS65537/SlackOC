@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # SlackOC installer — builds from source and installs the `slackoc` CLI globally.
 #
-#   curl -fsSL https://raw.githubusercontent.com/matthewsu/SlackOC/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash
 #
 # Overrides (mostly for testing):
 #   SLACKOC_REF          git ref to install (default: main)
 #   SLACKOC_TARBALL_URL  full tarball URL override (skips GitHub URL construction)
 set -euo pipefail
 
-REPO="matthewsu/SlackOC"
+REPO="MatthewS65537/SlackOC"
 REF="${SLACKOC_REF:-main}"
 TARBALL_URL="${SLACKOC_TARBALL_URL:-https://codeload.github.com/${REPO}/tar.gz/refs/heads/${REF}}"
 

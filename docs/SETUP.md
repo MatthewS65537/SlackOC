@@ -10,7 +10,7 @@ End-to-end: from zero to controlling OpenCode from Slack in ~10 minutes.
 ## 1. Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/matthewsu/SlackOC/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash
 ```
 
 The script downloads the repo tarball, builds it, and installs the `slackoc`
