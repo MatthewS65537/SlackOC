@@ -8,8 +8,6 @@ slackoc init      # one-time: create a Slack app from the bundled manifest, past
 slackoc start     # bridge up
 ```
 
-(npm: `npm i -g slackoc` — coming soon.)
-
 Then DM the bot (or `@mention` it in a channel where it's invited) from your phone or desktop:
 
 ```
@@ -57,7 +55,7 @@ Backslash commands run inside Slack but are invisible to the workspace — they 
 
 ## Setup (5–10 min)
 
-1. Install (Node ≥ 20): `curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash` — and have `opencode` ≥ 1.18 on your box. *(npm: `npm i -g slackoc` — coming soon.)*
+1. Install (Node ≥ 20): `curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash` — and have `opencode` ≥ 1.18 on your box.
 2. `slackoc init` — guided: create the Slack app from the bundled manifest, install it, paste the bot token (`xoxb-`) and app-level token (`xapp-`), enter your Slack member ID. Both tokens are validated live against Slack; the member ID is verified (`users:read` scope — already in the manifest). Non-interactive flags for CI: `--bot-token --app-token --owner [--dir]`
 3. `slackoc doctor` — sanity check
 4. `slackoc start` — bridge online

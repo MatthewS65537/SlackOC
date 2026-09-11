@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.
 ```
 
 The script downloads the repo tarball, builds it, and installs the `slackoc`
-CLI into your global npm bin. (npm: `npm i -g slackoc` — coming soon.)
+CLI into your global npm bin.
 
 ## 2. Create your Slack app (one time)
 
