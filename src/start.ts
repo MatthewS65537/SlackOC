@@ -34,6 +34,14 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   process.on("unhandledRejection", (err) => {
     logErr(`unhandled rejection: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
   });
+  // A SYNC throw through the event loop leaves the process in an undefined
+  // state — die LOUDLY instead: the stack lands in bridge.log via logErr (a
+  // detached daemon must be noticed, not limp half-wedged). After exit the
+  // pidfile is stale; claimPidfile replaces it on the next start.
+  process.on("uncaughtException", (err) => {
+    logErr(`uncaught exception: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
+    process.exit(1);
+  });
   const config = loadConfig();
   if (!config) {
     console.error(`No config at ${CONFIG_PATH} — run \`slackoc init\` first.`);
@@ -483,7 +491,12 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     for (const { key, thread } of interrupted) {
       const [channel, threadTs] = key.split(":") as [string, string];
       const pr = thread.pendingRun!;
-      for (const ts of pr.userMsgTs) await render.react(channel, ts, "x").catch(() => {});
+      for (const ts of pr.userMsgTs) {
+        // The 👀 from dispatch belongs to the dead instance's view — sweep it
+        // too so no message is left with a stale "seen but never resolved".
+        await render.unreact(channel, ts, "eyes").catch(() => {});
+        await render.react(channel, ts, "x").catch(() => {});
+      }
       if (pr.statusTs) await render.delete(channel, pr.statusTs).catch(() => {});
       await render
         .post(

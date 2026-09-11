@@ -5,7 +5,7 @@ import type { StateStore, ThreadState } from "../state.js";
 import { execute, type CmdCtx } from "../commands/registry.js";
 import { parseBackslash } from "../commands/parse.js";
 import "../commands/handlers.js"; // registers all commands on import
-import { SessionView, getView, type RenderDeps } from "./render.js";
+import { SessionView, getView, reactLogged, type RenderDeps } from "./render.js";
 import { slackToPlain, truncate } from "../util.js";
 
 /** Loose structural shape of a Bolt message/app_mention event we handle. */
@@ -18,7 +18,9 @@ export interface SlackMsg {
   subtype?: string;
   channel_type?: string;
   bot_id?: string;
-  /** Present on file_share messages — images the user attached. */
+  /** Present whenever the user attached files. NOTE: newer Slack clients
+   *  upload images with NO subtype at all (subtype-less file_share) — gate on
+   *  this array's presence, never on `subtype === "file_share"` (live bug). */
   files?: Array<{
     mimetype?: string;
     name?: string;
@@ -121,8 +123,12 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps): Promi
   let text = cleanMentionText(slackToPlain(raw), d.botUserId);
   const parsed = text ? parseBackslash(text) : null;
 
-  // Files attached to this message (file_share) — images AND text/pdf/json.
-  const attachments = (msg.subtype === "file_share" ? msg.files ?? [] : []).filter(
+  // Files attached to this message — images AND text/pdf/json. Key off the
+  // files array's presence, not the subtype: newer Slack clients send image
+  // uploads with subtype ABSENT entirely, and gating on "file_share" silently
+  // dropped every such image (live-verified 2026-09-10; the subtype gate
+  // above still blocks bot echoes/message_changed before this ever runs).
+  const attachments = (msg.files ?? []).filter(
     (f) => attachable(f.mimetype) && !!f.url_private_download,
   );
   if (attachments.length) {
@@ -247,6 +253,13 @@ const creatingThreads = new Map<string, Promise<ThreadState>>();
 async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: ImagePart[] = []): Promise<void> {
   const threadTs = threadRootTs(msg);
   const threadKey = d.state.threadKey(msg.channel, threadTs);
+
+  // 👀 liveness ack — the owner learns the bridge is up and saw their
+  // message even if the run then takes minutes (or fails quietly downstream).
+  // Removed at finalize when ✅/❌ lands (one state per message). Best-effort,
+  // fire-and-forget: it must never delay or fail the run.
+  void reactLogged(d.render, msg.channel, msg.ts, "eyes");
+
   let thread = d.state.getThread(threadKey);
 
   if (!thread && creatingThreads.has(threadKey)) {
@@ -333,7 +346,8 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: 
  */
 async function failBoot(msg: SlackMsg, d: BridgeDeps, ackTs: string | null, err: unknown): Promise<void> {
   if (ackTs) await d.render.delete(msg.channel, ackTs).catch(() => {});
-  await d.render.react(msg.channel, msg.ts, "x").catch(() => {});
+  await reactLogged(d.render, msg.channel, msg.ts, "eyes", false);
+  await reactLogged(d.render, msg.channel, msg.ts, "x");
   await d.render
     .post(
       msg.channel,

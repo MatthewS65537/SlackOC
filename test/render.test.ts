@@ -3,6 +3,7 @@ import {
   SessionView,
   deleteView,
   describeActiveRuns,
+  errorMessage,
   finalizeViewsForProject,
   getView,
   hasActiveViewForProject,
@@ -85,6 +86,26 @@ function blank(): CallLog {
   return { posted: [], unfurls: [], updates: [], deleted: [], reacted: [], unreacted: [], uploads: [], dms: [], dmBlocks: [] };
 }
 
+describe("errorMessage (session.error wire shape)", () => {
+  it("passes strings through", () => {
+    expect(errorMessage("boom")).toBe("boom");
+  });
+
+  it("extracts the message from the OpenCode error object (was rendering [object Object])", () => {
+    expect(errorMessage({ name: "ProviderAuthError", data: { message: "invalid api key" } })).toBe("invalid api key");
+    expect(errorMessage({ name: "UnknownError", message: "socket exploded" })).toBe("socket exploded");
+    expect(errorMessage({ name: "ProviderAuthError" })).toBe("ProviderAuthError");
+  });
+
+  it("falls back for empty/degenerate values", () => {
+    expect(errorMessage(undefined)).toBe("unknown session error");
+    expect(errorMessage(null)).toBe("unknown session error");
+    expect(errorMessage("")).toBe("unknown session error");
+    expect(errorMessage({})).toBe("unknown session error");
+    expect(errorMessage(42)).toBe("unknown session error");
+  });
+});
+
 describe("SessionView reactions (user-mandated UX)", () => {
   it("beginPrompt posts the working status and reacts nothing (no hourglass)", async () => {
     const log = blank();
@@ -101,7 +122,7 @@ describe("SessionView reactions (user-mandated UX)", () => {
     const v = makeView(log, "sess-react-b");
     await v.beginPrompt("111.333");
     await v.finalize();
-    expect(log.unreacted).toEqual([]);
+    expect(log.unreacted).toEqual([["111.333", "eyes"]]);
     expect(log.reacted).toEqual([["111.333", "white_check_mark"]]);
     expect(log.deleted.length).toBe(1); // the live status message
     const everything = [...log.posted, ...log.updates].join("\n").toLowerCase();

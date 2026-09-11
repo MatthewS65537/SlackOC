@@ -17,7 +17,7 @@ bot>  ⏳ OpenCode is on it…                  (live status line — deleted wh
       🔧 npm test                    ← tool calls as compact one-liners (📄 read, ✏️ edit, 🔍 grep, …)
       ⎯⎯⎯ response ⎯⎯⎯
       …the answer, markdown rendered for Slack…
-      ✅ (reaction on your message)
+      👀 on your message the moment the bridge sees it, ✅ when done (❌ on error)
       *my-app* · +41/−8 across 2 file(s) · `anthropic/claude-sonnet-4-5` · 12s · $0.041 · 12.0k↑/2.0k↓ · Verbose Tools
 ```
 
@@ -46,6 +46,7 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 - **Crash-proof, self-healing threads** — an `opencode serve` that dies mid-run fails the thread loudly instead of hanging silently; a run whose completion events are lost (wifi blip, sleep/wake) is reconciled and finished from polled state within ~2 minutes; `\restart` rescues a wedged server; idle servers auto-stop after 30 minutes
 - **Status board in your pocket** — `\status` lists runs in flight (elapsed, queued, thread links); markdown tables from the model render as aligned code blocks
 - **Restart-safe** — a run interrupted by a bridge restart gets its ❌ and a clear notice instead of a frozen "working…" message
+- **Alive-at-a-glance** — every accepted prompt stamps a 👀 on your message within a second (cleared when ✅/❌ lands), so a dead bridge can never look identical to a slow one
 - **Lost-message catch-up** — Slack discards Socket Mode envelopes it can't deliver (restart gap, network flap, zombie connection) without replaying them; every minute the bridge re-reads active threads from `conversations.replies` and routes anything it missed, so a delivery gap costs latency, never the message itself. Socket connect/disconnect/ping-timeout evidence lands in `\logs`
 - **Multi-project** — not locked to one folder: `\projects`, `\cd /path`, `\new /path`
 - **Native command passthrough** — `\cmd <opencode command>`, plus model (`\model <#>`) and agent (`\agent <#|name>`) swaps

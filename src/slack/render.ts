@@ -39,6 +39,42 @@ const registry = new Map<string, SessionView>();
 let reactionWarned = false;
 
 /**
+ * react/unreact that failures can never break a run through — but never
+ * silently either (a missing reactions:write scope is fixed by reinstalling
+ * the app, so the first failure logs a reinstall hint, once).
+ */
+export async function reactLogged(deps: RenderDeps, channel: string, ts: string, name: string, add = true): Promise<void> {
+  try {
+    if (add) await deps.react(channel, ts, name);
+    else await deps.unreact(channel, ts, name);
+  } catch (err) {
+    if (!reactionWarned) {
+      reactionWarned = true;
+      logErr(
+        `slackoc: reaction "${name}" failed (${String((err as Error)?.message ?? err)}) — ` +
+          "check that the app has reactions:write; if scopes changed, reinstall the app in Slack.",
+      );
+    }
+  }
+}
+
+/**
+ * OpenCode's `session.error` carries a structured error object ({name,
+ * data:{message,…}}), not a string — String() on it renders "[object
+ * Object]" into the user's failure line and pager DM (live-verified). Pull
+ * the human-readable message out.
+ */
+export function errorMessage(err: unknown, fallback = "unknown session error"): string {
+  if (typeof err === "string") return err || fallback;
+  if (err && typeof err === "object") {
+    const e = err as { message?: unknown; name?: unknown; data?: { message?: unknown } };
+    const msg = e.data?.message ?? e.message ?? e.name;
+    if (typeof msg === "string" && msg.trim()) return msg;
+  }
+  return fallback;
+}
+
+/**
  * One-line, ≤n chars: keep the first line only, collapse whitespace runs,
  * truncate. Keeps thread tool lines compact — bash commands especially.
  */
@@ -494,7 +530,7 @@ export class SessionView {
         await this.onIdle();
         return;
       case "session.error":
-        await this.finalizeInner(String(props.error ?? "unknown session error")); // in-chain
+        await this.finalizeInner(errorMessage(props.error)); // in-chain
         return;
       case "file.edited": {
         if (typeof props.file === "string") {
@@ -515,18 +551,7 @@ export class SessionView {
    * either (a missing reactions:write scope is fixed by reinstalling the app).
    */
   private async reactOrLog(channel: string, ts: string, name: string, add: boolean): Promise<void> {
-    try {
-      if (add) await this.deps.react(channel, ts, name);
-      else await this.deps.unreact(channel, ts, name);
-    } catch (err) {
-      if (!reactionWarned) {
-        reactionWarned = true;
-        logErr(
-          `slackoc: reaction "${name}" failed (${String((err as Error)?.message ?? err)}) — ` +
-            "check that the app has reactions:write; if scopes changed, reinstall the app in Slack.",
-        );
-      }
-    }
+    await reactLogged(this.deps, channel, ts, name, add);
   }
 
   private activityUpdate(line: string): void {
@@ -930,8 +955,10 @@ export class SessionView {
 
     // Outcome lives on the USER's message(s) as reactions — no "Done" chatter.
     // Every prompt picked up since the last finalize gets resolved, so
-    // back-to-back messages can't miss their ✅/❌.
+    // back-to-back messages can't miss their ✅/❌. The 👀 liveness ack from
+    // dispatch is removed first — one state per message (seen → outcome).
     for (const ts of this.pendingUserMsgs) {
+      await this.reactOrLog(this.channel, ts, "eyes", false);
       await this.reactOrLog(this.channel, ts, err ? "x" : "white_check_mark", true);
     }
     this.pendingUserMsgs.length = 0;

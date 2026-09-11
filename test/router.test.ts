@@ -129,7 +129,10 @@ describe("rebind prompt failure (NB1)", () => {
     await handleIncomingMessage(msg, d);
 
     expect(promptCalls).toBe(2); // original + the rebind retry
-    expect(log.reacted).toEqual([["900.001", "x"]]);
+    expect(log.reacted).toEqual([
+      ["900.001", "eyes"], // liveness ack on dispatch
+      ["900.001", "x"],
+    ]);
     expect(log.posted.some((p) => p.includes("prompt failed after rebind: boom"))).toBe(true);
     expect(log.deleted.length).toBe(1); // live status/ack removed
     expect(log.dms.some((m) => m.includes("failed"))).toBe(true); // pager fired
@@ -177,5 +180,151 @@ describe("concurrent cold-start prompts (NB3)", () => {
     expect(promptCalls).toBe(2); // both prompts delivered on the shared session
     expect(log.posted.some((p) => p.includes("Queued — runs after the current task"))).toBe(true);
     expect(d.state.getThread("C9:900.100")?.sessionId).toBe("sess-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attachments (F1 live bug): newer Slack clients upload images with NO
+// subtype at all — gating on `subtype === "file_share"` silently dropped
+// them. Attachments now key off the files array's presence.
+
+describe("attachments key off files presence, not subtype", () => {
+  const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer;
+
+  type FullLog = CallLog & { unreacted: Array<[string, string]> };
+  const blankLog = (): FullLog => ({ posted: [], deleted: [], reacted: [], dms: [], unreacted: [] });
+
+  function stubDownload(): void {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => PNG_BYTES })),
+    );
+  }
+
+  /** richer render fake: also records unreacts and returns tracked posts. */
+  function fakeRenderFull(log: FullLog): RenderDeps {
+    const base = fakeRender(log);
+    return { ...base, unreact: async (_c, ts, name) => void log.unreacted.push([ts, name]) };
+  }
+
+  function promptCapturingClient(): { client: Record<string, unknown>; bodies: Array<{ parts?: Array<Record<string, unknown>> }> } {
+    const bodies: Array<{ parts?: Array<Record<string, unknown>> }> = [];
+    const client = {
+      session: {
+        promptAsync: async (args: { body: { parts?: Array<Record<string, unknown>> } }) => {
+          bodies.push(args.body);
+          return { data: {} };
+        },
+        create: async () => ({ data: { id: "sess-att" } }),
+        messages: async () => ({ data: [] }),
+        get: async () => {
+          throw new Error("no summary");
+        },
+      },
+    };
+    return { client, bodies };
+  }
+
+  function imgMsg(channel: string, ts: string, text: string | undefined, subtype?: string): SlackMsg {
+    return {
+      channel,
+      ts,
+      user: "U1",
+      text,
+      subtype,
+      files: [{ mimetype: "image/png", name: "shot.png", url_private_download: "https://files.example/shot.png", size: 4 }],
+    };
+  }
+
+  it("subtype-absent image upload + caption: model receives the image as a file part", async () => {
+    stubDownload();
+    const log = blankLog();
+    const { client, bodies } = promptCapturingClient();
+    const d = makeDeps("router-att-a", fakePool(client), fakeRenderFull(log));
+
+    await handleIncomingMessage(imgMsg("C10", "910.001", "what is in this screenshot?"), d);
+
+    expect(bodies).toHaveLength(1);
+    const parts = bodies[0]?.parts ?? [];
+    expect(parts[0]).toMatchObject({ type: "text", text: "what is in this screenshot?" });
+    const file = parts.find((p) => p.type === "file");
+    expect(file).toMatchObject({ type: "file", mime: "image/png", filename: "shot.png" });
+    expect(String(file?.url)).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("subtype-absent image with no caption: default caption + file part", async () => {
+    stubDownload();
+    const log = blankLog();
+    const { client, bodies } = promptCapturingClient();
+    const d = makeDeps("router-att-b", fakePool(client), fakeRenderFull(log));
+
+    await handleIncomingMessage(imgMsg("C10", "910.002", undefined, undefined), d);
+
+    const parts = bodies[0]?.parts ?? [];
+    expect(parts[0]).toMatchObject({ type: "text", text: "look at this attached file" });
+    expect(parts.some((p) => p.type === "file")).toBe(true);
+  });
+
+  it("classic file_share subtype still attaches (regression of the original gate)", async () => {
+    stubDownload();
+    const log = blankLog();
+    const { client, bodies } = promptCapturingClient();
+    const d = makeDeps("router-att-c", fakePool(client), fakeRenderFull(log));
+
+    await handleIncomingMessage(imgMsg("C10", "910.003", "old-style upload", "file_share"), d);
+
+    expect((bodies[0]?.parts ?? []).some((p) => p.type === "file")).toBe(true);
+  });
+
+  it("download failure: warning posted, no file part, no silent swallow", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 403, arrayBuffer: async () => new ArrayBuffer(0) })),
+    );
+    const log = blankLog();
+    const { client, bodies } = promptCapturingClient();
+    const d = makeDeps("router-att-d", fakePool(client), fakeRenderFull(log));
+
+    await handleIncomingMessage(imgMsg("C10", "910.004", undefined, undefined), d);
+
+    expect(log.posted.some((p) => p.includes("couldn't attach"))).toBe(true);
+    expect(bodies).toHaveLength(0); // caption-less + all downloads failed → abort (no misleading fileless prompt)
+  });
+});
+
+describe("eyes liveness ack", () => {
+  it("an accepted prompt gets 👀 immediately (removed at finalize by the view)", async () => {
+    const log = { posted: [] as string[], deleted: [] as string[], reacted: [] as Array<[string, string]>, dms: [] as string[], unreacted: [] as Array<[string, string]> };
+    const base = fakeRender(log);
+    const render: RenderDeps = { ...base, unreact: async (_c, ts, name) => void log.unreacted.push([ts, name]) };
+    const d = makeDeps("router-eyes", fakePool({
+      session: {
+        promptAsync: async () => ({ data: {} }),
+        create: async () => ({ data: { id: "sess-eyes" } }),
+        messages: async () => ({ data: [] }),
+        get: async () => {
+          throw new Error("no summary");
+        },
+      },
+    }), render);
+
+    await handleIncomingMessage(ownerMsg("C11", "911.001", undefined, "run something"), d);
+
+    expect(log.reacted[0]).toEqual(["911.001", "eyes"]); // first reaction on the message
+  });
+
+  it("cold-start failure also clears the 👀 (❌ alone remains)", async () => {
+    const log = { posted: [] as string[], deleted: [] as string[], reacted: [] as Array<[string, string]>, dms: [] as string[], unreacted: [] as Array<[string, string]> };
+    const base = fakeRender(log);
+    const render: RenderDeps = { ...base, unreact: async (_c, ts, name) => void log.unreacted.push([ts, name]) };
+    const pool = { ensure: async () => { throw new Error("spawn blew up"); }, list: () => [], killOne: async () => {} } as unknown as ServerPool;
+    const d = makeDeps("router-eyes-fail", pool, render);
+
+    await handleIncomingMessage(ownerMsg("C11", "911.010", undefined, "run something"), d);
+
+    expect(log.reacted).toContainEqual(["911.010", "eyes"]);
+    expect(log.unreacted).toContainEqual(["911.010", "eyes"]);
+    expect(log.reacted[log.reacted.length - 1]).toEqual(["911.010", "x"]);
+    expect(log.posted.some((p) => p.includes("spawn blew up"))).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "slackoc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Control a local OpenCode session from Slack. No terminal, SSH, or VPN.",
   "type": "module",
   "engines": {
