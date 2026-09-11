@@ -1,0 +1,46 @@
+{
+  "name": "slackoc",
+  "version": "0.1.0",
+  "description": "Control a local OpenCode session from Slack. No terminal, SSH, or VPN.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "slackoc": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "manifest",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "smoke": "tsx test/integration/smoke.ts",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [
+    "opencode",
+    "slack",
+    "bot",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.25",
+    "@slack/bolt": "^5.0.0",
+    "diff": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "@types/node": "^24",
+    "tsup": "^8",
+    "tsx": "^4",
+    "typescript": "^5",
+    "vitest": "^3"
+  }
+}

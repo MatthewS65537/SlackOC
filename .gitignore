@@ -1,0 +1,11 @@
+node_modules/
+dist/
+cc_mnt/
+plans/
+web/
+scratch/
+test/.fixtures/
+*.log
+.DS_Store
+.env
+.env.*
