@@ -104,6 +104,8 @@ npm run build
 - Multi-machine routing (per-machine Slack apps from a manifest template)
 - Homebrew tap / single binaries
 - Richer diff/file previews
+- Improved statusline and other modals (via Slack).
+- Expansion to other platforms (i.e. Discord, Telegram) and agents (i.e. Codex)
 
 ## License
 
