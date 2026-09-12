@@ -23,6 +23,12 @@ export interface CmdCtx {
   postToThread(text: string): Promise<void>;
   /** Upload a text file (snippet, diff…) into the current thread. */
   uploadToThread(filename: string, content: string): Promise<void>;
+  /**
+   * Best-effort liveness ack on the command's own message (👀 → ✅/❌), mirroring
+   * the prompt path. add=false removes the reaction. Optional so non-Slack
+   * contexts (tests) can omit it.
+   */
+  react?(name: string, add?: boolean): Promise<void>;
 }
 
 export interface CmdDef {
@@ -99,8 +105,13 @@ export async function execute(parsed: ParsedCmd, ctx: CmdCtx): Promise<void> {
     return;
   }
   try {
+    await ctx.react?.("eyes");
     await target.run(ctx, parsed.args);
+    await ctx.react?.("eyes", false);
+    await ctx.react?.("white_check_mark");
   } catch (err) {
+    await ctx.react?.("eyes", false);
+    await ctx.react?.("x");
     const msg = err instanceof Error ? err.message : String(err);
     await ctx.postToThread(`⚠️ \`\\${parsed.name}\` failed: ${msg.slice(0, 400)}`);
   }

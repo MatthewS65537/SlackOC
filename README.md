@@ -40,7 +40,7 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 - **Proactive threads with a mute** — once a thread has a session, replies are answered with no @ mention needed; `\hush` quiets the thread (an @ always wakes it)
 - **Tool visibility by default** — `\verbose full|on|off`; each tool call posts a compact line showing exactly what it's doing (`📄 read src/x.ts`, `🔧 npm test`, `🔍 grep "pattern"`), `full` adds output snippets
 - **Markdown answers render properly** — GFM → Slack mrkdwn conversion (bold, lists, links, headings); fenced code stays code
-- **Image support, both ways** — attach a screenshot (or any text/PDF/JSON file ≤8MB) to your message and the model sees it; images the model produces are posted back into the thread
+- **Image support, both ways** — attach a screenshot (or any text/PDF/JSON file ≤8MB) to your message and the model sees it; images over ~1MB are auto-compressed to stay under provider request-size limits; images the model produces are posted back into the thread
 - **Approval buttons** — Approve once / Always allow / Deny, resolving OpenCode's permission requests in place — mirrored to your DMs, so a blocked run pages you on your phone
 - **Notifications that reach you** — failures DM the owner by default; `\notify on` adds a DM when each run finishes (with a one-tap 📄 View diff button); a 3-minute stall pages you once
 - **Crash-proof, self-healing threads** — an `opencode serve` that dies mid-run fails the thread loudly instead of hanging silently; a run whose completion events are lost (wifi blip, sleep/wake) is reconciled and finished from polled state within ~2 minutes; `\restart` rescues a wedged server; idle servers auto-stop after 30 minutes

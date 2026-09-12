@@ -4,6 +4,7 @@ import type { StateStore, ThreadState, VerboseMode } from "../state.js";
 import { viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
 import { chunkText, dur, mdToMrkdwn, money, shortPath, tok, truncate } from "../util.js";
+import { queueDepth } from "./queue.js";
 
 export interface RenderDeps {
   post(
@@ -235,6 +236,14 @@ export class SessionView {
   /** Coalesce: never pile a second status update behind a still-stuck one. */
   private tickInFlight = false;
   /**
+   * Set by any thread-content post while a run is active. Slack can't reorder
+   * messages, so once content lands BELOW the live-status line the next tick
+   * re-posts the status at the bottom (delete + post) instead of updating in
+   * place — keeping the indicator visible on long tool-heavy runs (issue #4).
+   * Cleared on a successful sink and reset per run in beginPrompt.
+   */
+  private contentBelow = false;
+  /**
    * Set by the watchdog after a true stall: the ticker keeps re-rendering a
    * "still working" stall line (instead of the stale activity) until any SSE
    * event lands, so the nudge message is never silently clobbered 1s later.
@@ -387,6 +396,7 @@ export class SessionView {
     this.cancelIdleGrace(); // a new prompt cancels any pending "queue drained" finalize
     this.nudges = 0;
     this.stalled = false;
+    this.contentBelow = false; // fresh run: the status line is at the top again
     if (!this.pendingUserMsgs.includes(userMsgTs)) this.pendingUserMsgs.push(userMsgTs);
     this.runStartedAt = Date.now();
     this.lastEventAt = Date.now();
@@ -406,6 +416,7 @@ export class SessionView {
           unfurl: false,
         })
         .catch(() => {});
+      this.contentBelow = true; // the ack landed below the status line
     }
   }
 
@@ -571,10 +582,40 @@ export class SessionView {
 
   private tick(): void {
     if (this.finalized || this.statusTs == null || this.tickInFlight) return;
+    // Yield when the FIFO has real work queued: a command reply / ack / content
+    // post ahead of us is more time-sensitive than a status re-render, and the
+    // next beat is 1s away regardless. The ticker's OWN in-flight update is
+    // already drained out of the queue by the time this runs, so this only
+    // fires for OTHER work — exactly the contention we want to shed (issue #3).
+    if (queueDepth() > 0) return;
     this.tickInFlight = true;
     this.tickSeen += 1;
+    const text = this.statusText();
+    if (this.contentBelow) {
+      // Content landed below the status line. Slack can't reorder messages, so
+      // re-post the status at the BOTTOM (delete the old one only after the new
+      // one is live) to keep the indicator visible (issue #4). On a failed post
+      // we keep the old status + the flag and retry on the next beat.
+      const oldTs = this.statusTs;
+      void this.deps
+        .post(this.channel, this.threadTs, text, undefined, { unfurl: false })
+        .then(({ ts }) => {
+          // finalize() may have run while the post was in flight (it clears the
+          // ticker and deletes the then-current statusTs). If so, the message we
+          // just posted is an orphan — delete it rather than re-adopting it.
+          if (this.finalized) return this.deps.delete(this.channel, ts).catch(() => {});
+          this.statusTs = ts;
+          this.contentBelow = false;
+          return this.deps.delete(this.channel, oldTs).catch(() => {});
+        })
+        .catch(() => {})
+        .finally(() => {
+          this.tickInFlight = false;
+        });
+      return;
+    }
     void this.deps
-      .update(this.channel, this.statusTs, this.statusText())
+      .update(this.channel, this.statusTs, text)
       .catch(() => {})
       .finally(() => {
         this.tickInFlight = false;
@@ -630,6 +671,7 @@ export class SessionView {
       undefined,
       { unfurl: s === "tools" ? false : undefined },
     );
+    this.contentBelow = true; // content landed below the live-status line
   }
 
   /** Emit buffered tool lines as a single tools-section message (atomic with the divider). */
@@ -825,6 +867,7 @@ export class SessionView {
     }
     if (!data.length) return;
     const ext = mime.includes("/") ? mime.split("/").pop()! : "bin";
+    const filename = part.filename ?? `output-${part.id.slice(-6)}.${ext}`;
     await this.flushTools(); // buffered tool chatter precedes response content
     // Divider must precede the upload — post it with a tiny banner comment as
     // its own message when a section flip is due (uploads can't join text).
@@ -833,18 +876,21 @@ export class SessionView {
     await this.deps.upload({
       channelId: this.channel,
       threadTs: this.threadTs,
-      filename: part.filename ?? `output-${part.id.slice(-6)}.${ext}`,
+      filename,
       file: data,
-      comment: ":framed_picture: model output",
+      comment: `:framed_picture: ${filename} received.`,
     });
+    this.contentBelow = true; // the upload landed below the live-status line
   }
 
   async postThreadText(text: string): Promise<void> {
-    // Assistants emit GitHub-flavored markdown; Slack speaks mrkdwn.
-    const converted = mdToMrkdwn(text);
+    // Assistants emit GitHub-flavored markdown; Slack speaks mrkdwn. Trim the
+    // extremes: model parts routinely lead/trail with \n, and the divider joins
+    // with \n\n — untrimmed, that becomes 3+ blank lines after ⎯ response ⎯.
+    const converted = mdToMrkdwn(text).trim();
     // Response divider ONLY when real non-reasoning content is about to show —
     // whitespace-only or otherwise invisible text must not mint a section.
-    if (!converted.trim()) return;
+    if (!converted) return;
     await this.flushTools(); // buffered tool chatter precedes response content
     const chunks = chunkText(converted);
     const first = chunks.shift();

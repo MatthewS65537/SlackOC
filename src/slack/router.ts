@@ -7,6 +7,7 @@ import { parseBackslash } from "../commands/parse.js";
 import "../commands/handlers.js"; // registers all commands on import
 import { SessionView, getView, reactLogged, type RenderDeps } from "./render.js";
 import { slackToPlain, truncate } from "../util.js";
+import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_DOWNLOAD_BYTES, TARGET_IMAGE_BYTES, shrinkImage } from "../image.js";
 
 /** Loose structural shape of a Bolt message/app_mention event we handle. */
 export interface SlackMsg {
@@ -185,20 +186,63 @@ async function downloadAttachments(
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length > 8 * 1024 * 1024) {
+      const mime = f.mimetype ?? "application/octet-stream";
+      const filename = f.name ?? "file";
+      if (mime.startsWith("image/")) {
+        // Provider gateways 413 on large request bodies, so ANY image above
+        // the target gets JPEG-re-encoded to fit (not just >8MB ones — a 5MB
+        // image is a 6.7MB data URI). Undecodable/unshrinkable images skip+warn.
+        if (buf.length > MAX_IMAGE_DOWNLOAD_BYTES) {
+          await d.render.post(
+            msg.channel,
+            threadRootTs(msg),
+            `:warning: ${filename} is too large to process (${Math.round(buf.length / 1024 / 1024)} MB) — skipped.`,
+            undefined,
+            { unfurl: false },
+          );
+          continue;
+        }
+        if (buf.length > TARGET_IMAGE_BYTES) {
+          const shrunk = await shrinkImage(buf, mime, filename, TARGET_IMAGE_BYTES);
+          if (shrunk) {
+            parts.push({
+              mime: shrunk.mime,
+              filename: shrunk.filename,
+              dataUrl: `data:${shrunk.mime};base64,${shrunk.data.toString("base64")}`,
+            });
+            await d.render.post(
+              msg.channel,
+              threadRootTs(msg),
+              `:small_orange_diamond: ${filename} was ${Math.round(buf.length / 1024)} kB — compressed to ${Math.round(shrunk.data.length / 1024)} kB to fit.`,
+              undefined,
+              { unfurl: false },
+            );
+            continue;
+          }
+          await d.render.post(
+            msg.channel,
+            threadRootTs(msg),
+            `:warning: couldn't compress ${filename} to fit — skipped.`,
+            undefined,
+            { unfurl: false },
+          );
+          continue;
+        }
+      }
+      if (buf.length > MAX_ATTACHMENT_BYTES) {
         await d.render.post(
           msg.channel,
           threadRootTs(msg),
-          `:warning: ${f.name ?? "file"} is too large to send (${Math.round(buf.length / 1024)} kB) — skipped.`,
+          `:warning: ${filename} is too large to send (${Math.round(buf.length / 1024)} kB) — skipped.`,
           undefined,
           { unfurl: false },
         );
         continue;
       }
       parts.push({
-        mime: f.mimetype ?? "application/octet-stream",
-        filename: f.name ?? "file",
-        dataUrl: `data:${f.mimetype ?? "application/octet-stream"};base64,${buf.toString("base64")}`,
+        mime,
+        filename,
+        dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
       });
     } catch (err) {
       await d.render.post(
@@ -232,6 +276,9 @@ function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = nul
     },
     uploadToThread: async (filename, content) => {
       await d.render.upload({ channelId: msg.channel, threadTs, filename, content });
+    },
+    react: async (name, add = true) => {
+      await reactLogged(d.render, msg.channel, msg.ts, name, add);
     },
   };
 }

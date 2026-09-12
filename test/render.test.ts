@@ -12,6 +12,7 @@ import {
 } from "../src/slack/render.js";
 import { StateStore } from "../src/state.js";
 import type { OCClient } from "../src/opencode/api.js";
+import { enqueue, queueDepth, _resetQueueForTests } from "../src/slack/queue.js";
 
 interface CallLog {
   posted: string[];
@@ -470,6 +471,7 @@ describe("SessionView section dividers", () => {
     expect(log.posted).toEqual([]);
     expect(log.uploads.length).toBe(1);
     expect(log.uploads[0]?.filename).toBe("chart.png");
+    expect(log.uploads[0]?.comment).toBe(":framed_picture: chart.png received.");
     expect(Buffer.from(log.uploads[0]?.file ?? Buffer.alloc(0)).toString()).toBe("ipho");
     // Duplicate delivery is deduped.
     await v.handle({
@@ -1248,5 +1250,128 @@ describe("completion DM diff button (RF1)", () => {
     expect(JSON.stringify(blocks)).toContain('"sess-rf1"');
     expect(JSON.stringify(blocks)).toContain("View diff");
     deleteView("sess-rf1");
+  });
+});
+
+// ─── #1: postThreadText trims whitespace ────────────────────────────────────
+
+describe("SessionView postThreadText trim (#1)", () => {
+  it("trims leading/trailing whitespace from the posted text", async () => {
+    const log = blank();
+    const v = makeView(log, "sess-trim-a", { verbose: "on" });
+    await v.postThreadText("  \n  hello world  \n  ");
+    // The posted text should be trimmed — no leading/trailing whitespace
+    const posted = log.posted.find((p) => p.includes("hello world"));
+    expect(posted).toBeDefined();
+    expect(posted!.startsWith("  ")).toBe(false);
+    expect(posted!.endsWith("  ")).toBe(false);
+    expect(posted!.trim()).toBe(posted!);
+    deleteView("sess-trim-a");
+  });
+
+  it("whitespace-only text posts nothing (no dangling divider)", async () => {
+    const log = blank();
+    const v = makeView(log, "sess-trim-b", { verbose: "on" });
+    await v.postThreadText("   \n\t  \n  ");
+    expect(log.posted).toEqual([]);
+    deleteView("sess-trim-b");
+  });
+});
+
+// ─── #3: tick() yields when the FIFO has work ───────────────────────────────
+
+describe("SessionView tick yields to queue (#3)", () => {
+  it("tick() does not update when queueDepth() > 0", async () => {
+    vi.useFakeTimers();
+    _resetQueueForTests();
+    const queueMod = await import("../src/slack/queue.js");
+    const spy = vi.spyOn(queueMod, "queueDepth").mockReturnValue(1);
+    try {
+      const log = blank();
+      const v = makeView(log, "sess-qdepth-a", { verbose: "on" });
+      await v.beginPrompt("111.qd1");
+      // Advance one tick — should be skipped because queueDepth() returns 1
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(log.updates).toEqual([]);
+      // Now let the queue drain
+      spy.mockReturnValue(0);
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(log.updates.length).toBeGreaterThanOrEqual(1);
+      deleteView("sess-qdepth-a");
+    } finally {
+      spy.mockRestore();
+      _resetQueueForTests();
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ─── #4: contentBelow sink (status re-posts at bottom) ─────────────────────
+
+describe("SessionView contentBelow sink (#4)", () => {
+  it("after content posts below the status, the next tick re-posts status at the bottom and deletes the old", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      const v = makeView(log, "sess-sink-a", { verbose: "on" });
+      await v.beginPrompt("111.sink1");
+      // The status message was posted (status-1)
+      expect(log.posted.length).toBe(1);
+      const oldStatusTs = log.posted[0] ? "status-1" : null;
+
+      // Post some content (a tool line) which sets contentBelow = true
+      await v.handle({
+        type: "message.part.updated",
+        properties: { part: { id: "s1", type: "tool", tool: "bash", callID: "s1c", state: { status: "running", input: { command: "ls" } } } },
+      } as never);
+      // Tool lines are buffered — flush via finalize to trigger postSection
+      // Actually, let's use a text part which posts immediately
+      deleteView("sess-sink-a");
+
+      const log2 = blank();
+      const v2 = makeView(log2, "sess-sink-b", { verbose: "on" });
+      await v2.beginPrompt("111.sink2");
+      // Post a text part — this goes through postThreadText → postSection → sets contentBelow
+      await v2.handle({
+        type: "message.part.updated",
+        properties: { part: { id: "t1", messageID: "tm", type: "text", text: "some answer", time: { end: 1 } } },
+      } as never);
+      // The content post should have set contentBelow
+      // Now advance one tick — the sink should post a new status + delete the old
+      await vi.advanceTimersByTimeAsync(1_100);
+      // The sink posts a new status message and deletes the old one
+      expect(log2.posted.length).toBeGreaterThanOrEqual(2); // original status + content + new status
+      expect(log2.deleted.length).toBe(1); // old status deleted
+      // The new status should be the last posted message
+      const lastPosted = log2.posted.at(-1);
+      expect(lastPosted).toMatch(/:hourglass/);
+      deleteView("sess-sink-b");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("finalize clears contentBelow so no further sink posts occur", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      const v = makeView(log, "sess-sink-d", { verbose: "on" });
+      await v.beginPrompt("111.sink4");
+      // Post content to set contentBelow
+      await v.handle({
+        type: "message.part.updated",
+        properties: { part: { id: "t3", messageID: "tm3", type: "text", text: "content", time: { end: 1 } } },
+      } as never);
+      // Finalize — clears the ticker and sets finalized
+      await v.finalize();
+      // Advance well past a tick interval — no further sink posts should occur
+      await vi.advanceTimersByTimeAsync(3_000);
+      // Only the initial status + content + finalize summary were posted; no extra sink re-posts
+      const statusPosts = log.posted.filter((p) => p.includes(":hourglass"));
+      expect(statusPosts.length).toBe(1); // just the original beginPrompt status
+      deleteView("sess-sink-d");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { homedir } from "node:os";
-import { getCommand, allCommands, execute, type CmdCtx } from "../src/commands/registry.js";
+import { getCommand, allCommands, execute, registerCommand, type CmdCtx } from "../src/commands/registry.js";
 import { newThreadState, HELP_SECTIONS } from "../src/commands/handlers.js";
 import { StateStore } from "../src/state.js";
 
@@ -73,6 +73,19 @@ function modelListCtx(out: string[], threadModel?: string, cfgModel: string | nu
           default: { anthropic: "claude-sonnet-4-5" },
         },
       }),
+    },
+    // Live-probe target: what a bare prompt would ACTUALLY resolve to. Deliberately
+    // distinct from providers[0]'s default (anthropic/claude-sonnet-4-5) so a test
+    // can prove the probe — not the old first-provider guess — drove the result.
+    session: {
+      create: async () => ({ data: { id: "ses_probe" } }),
+      promptAsync: async () => ({ data: {} }),
+      messages: async () => [
+        { info: { role: "user" }, parts: [] },
+        { info: { role: "assistant", providerID: "openai", modelID: "gpt-5" }, parts: [] },
+      ],
+      abort: async () => ({ data: {} }),
+      delete: async () => ({ data: {} }),
     },
   };
   return {
@@ -182,12 +195,14 @@ describe("command registry (user-mandated surface)", () => {
     expect(text).not.toContain("(server default)");
   });
 
-  it("\\model falls back to the provider default map when the server configures no model", async () => {
+  it("\\model resolves the server's real default via live probe when no model is configured", async () => {
     const out: string[] = [];
     await getCommand("model")!.run(modelListCtx(out, undefined, null), "");
     const text = out.join("\n");
-    expect(text).toContain("*Models* — current: `anthropic/claude-sonnet-4-5`");
-    expect(text).toContain("1) `anthropic/claude-sonnet-4-5` ★");
+    // probe reports openai/gpt-5 (NOT providers[0]'s anthropic default) → live detection
+    expect(text).toContain("*Models* — current: `openai/gpt-5`");
+    expect(text).toContain("3) `openai/gpt-5` ★");
+    expect(text).not.toContain("(server default)");
   });
 
   it("\\model <#> selects from the same ordering the listing showed", async () => {
@@ -757,5 +772,52 @@ describe("remote-work round 3 (Sep 2026)", () => {
     const text = out.join("\n");
     expect(text).toContain("needle-");
     expect(text).not.toContain("hay line");
+  });
+});
+
+describe("command liveness ack (👀 → ✅/❌)", () => {
+  // Records the react sequence; add=false is tagged "name!" to distinguish remove.
+  function ackCtx(reactLog: string[], out: string[]) {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/ack/state.json`);
+    return {
+      channelId: "C1",
+      threadTs: "T1",
+      threadKey: "C1:T1",
+      thread: null,
+      state,
+      config: null as never,
+      cwd: "/",
+      postToThread: async (t: string) => {
+        out.push(t);
+      },
+      uploadToThread: async () => {},
+      react: async (name: string, add = true) => {
+        reactLog.push(add ? name : `${name}!`);
+      },
+    } as unknown as CmdCtx;
+  }
+
+  it("adds 👀 then swaps to ✅ when the command succeeds", async () => {
+    const log: string[] = [];
+    const out: string[] = [];
+    await execute({ name: "help", args: "" }, ackCtx(log, out));
+    expect(log).toEqual(["eyes", "eyes!", "white_check_mark"]);
+  });
+
+  it("swaps to ❌ and still reports the error when the command throws", async () => {
+    registerCommand({ name: "__ack_throw__", usage: "", summary: "", run: async () => { throw new Error("kaboom"); } });
+    const log: string[] = [];
+    const out: string[] = [];
+    await execute({ name: "__ack_throw__", args: "" }, ackCtx(log, out));
+    expect(log).toEqual(["eyes", "eyes!", "x"]);
+    expect(out.join("\n")).toContain("failed: kaboom");
+  });
+
+  it("does NOT react on unknown commands (they reply instantly)", async () => {
+    const log: string[] = [];
+    const out: string[] = [];
+    await execute({ name: "zzzzzz", args: "" }, ackCtx(log, out));
+    expect(log).toEqual([]);
+    expect(out.join("\n")).toContain("Unknown command");
   });
 });

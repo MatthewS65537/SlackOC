@@ -62,6 +62,12 @@ export class ServerPool {
     private onDeath?: (dir: string, code: number | null) => void,
     /** SSE stream recovered after a drop — fired with the outage length so stale runs can be reconciled (RB2). */
     private onResume?: (dir: string, gapMs: number) => void,
+    /**
+     * A server just became ready (fresh spawn OR reused). Fired once per ready
+     * transition with the base URL so the bridge can sweep for parked questions
+     * that outlived a bridge restart (issue #2 boot recovery).
+     */
+    private onReady?: (dir: string, baseUrl: string) => void,
   ) {}
 
   /** Canonical dir key so equivalent paths share a server. */
@@ -209,6 +215,12 @@ export class ServerPool {
           entry.client = makeClient(baseUrl!);
           entry.status = "ready";
           this.log(`opencode server for ${dir} listening on ${baseUrl}`);
+          // Sweep for parked questions that outlived a bridge restart (issue #2).
+          try {
+            this.onReady?.(dir, baseUrl!);
+          } catch (err) {
+            this.log(`onReady sweep failed for ${dir}: ${String(err)}`);
+          }
           resolve();
         }
       };

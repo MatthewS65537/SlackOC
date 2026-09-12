@@ -1,11 +1,13 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { Jimp, JimpMime } from "jimp";
 import { claimEvent, hushAction, handleIncomingMessage, type BridgeDeps, type SlackMsg } from "../src/slack/router.js";
 import type { RenderDeps } from "../src/slack/render.js";
 import type { ServerPool } from "../src/opencode/server.js";
 import type { SlackocConfig } from "../src/config.js";
 import { StateStore } from "../src/state.js";
+import { MAX_ATTACHMENT_BYTES, TARGET_IMAGE_BYTES } from "../src/image.js";
 
 describe("claimEvent (Slack double-delivery dedup)", () => {
   it("claims a channel+ts exactly once", () => {
@@ -289,6 +291,77 @@ describe("attachments key off files presence, not subtype", () => {
 
     expect(log.posted.some((p) => p.includes("couldn't attach"))).toBe(true);
     expect(bodies).toHaveLength(0); // caption-less + all downloads failed → abort (no misleading fileless prompt)
+  });
+
+  it("oversized image is downscaled to a JPEG and sent (no skip)", async () => {
+    // 1900x1750 noise PNG ≈ 9.5MB — over the 1MB image target.
+    const img = new Jimp({ width: 1900, height: 1750 });
+    let s = 7;
+    img.scan(0, 0, 1900, 1750, (_x, _y, i) => {
+      s = (s * 1103515245 + 12345) & 0x7fffffff;
+      img.bitmap.data[i] = s & 0xff;
+      img.bitmap.data[i + 1] = (s >> 8) & 0xff;
+      img.bitmap.data[i + 2] = (s >> 16) & 0xff;
+      img.bitmap.data[i + 3] = 255;
+    });
+    const big = await img.getBuffer(JimpMime.png);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => big.buffer.slice(big.byteOffset, big.byteOffset + big.byteLength),
+      })),
+    );
+    const log = blankLog();
+    const { client, bodies } = promptCapturingClient();
+    const d = makeDeps("router-att-big", fakePool(client), fakeRenderFull(log));
+
+    await handleIncomingMessage(imgMsg("C10", "910.201", "big screenshot"), d);
+
+    const parts = bodies[0]?.parts ?? [];
+    const file = parts.find((p) => p.type === "file");
+    expect(file).toMatchObject({ type: "file", mime: "image/jpeg" });
+    expect(String(file?.url)).toMatch(/^data:image\/jpeg;base64,/);
+    expect(log.posted.some((p) => p.includes("compressed"))).toBe(true);
+    expect(log.posted.some((p) => p.includes("too large to send"))).toBe(false);
+  });
+
+  it("mid-size image (over 1MB target, under 8MB) is now compressed, not passed through", async () => {
+    // The 413 regression: a 2MB image is a 2.7MB data URI — under the old 8MB
+    // cap (passed through untouched) but over provider gateway body limits.
+    const img = new Jimp({ width: 950, height: 850 });
+    let s = 13;
+    img.scan(0, 0, 950, 850, (_x, _y, i) => {
+      s = (s * 1103515245 + 12345) & 0x7fffffff;
+      img.bitmap.data[i] = s & 0xff;
+      img.bitmap.data[i + 1] = (s >> 8) & 0xff;
+      img.bitmap.data[i + 2] = (s >> 16) & 0xff;
+      img.bitmap.data[i + 3] = 255;
+    });
+    const mid = await img.getBuffer(JimpMime.png);
+    expect(mid.length).toBeGreaterThan(TARGET_IMAGE_BYTES);
+    expect(mid.length).toBeLessThan(MAX_ATTACHMENT_BYTES);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => mid.buffer.slice(mid.byteOffset, mid.byteOffset + mid.byteLength),
+      })),
+    );
+    const log = blankLog();
+    const { client, bodies } = promptCapturingClient();
+    const d = makeDeps("router-att-mid", fakePool(client), fakeRenderFull(log));
+
+    await handleIncomingMessage(imgMsg("C10", "910.202", "mid-size shot"), d);
+
+    const parts = bodies[0]?.parts ?? [];
+    const file = parts.find((p) => p.type === "file");
+    expect(file).toMatchObject({ type: "file", mime: "image/jpeg" });
+    // data URI stays under the ~1.37MB envelope the target implies
+    expect(String(file?.url).length).toBeLessThanOrEqual(Math.ceil((TARGET_IMAGE_BYTES * 4) / 3) + 32);
+    expect(log.posted.some((p) => p.includes("compressed"))).toBe(true);
   });
 });
 

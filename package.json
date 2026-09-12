@@ -33,7 +33,8 @@
   "dependencies": {
     "@opencode-ai/sdk": "^1.18.25",
     "@slack/bolt": "^5.0.0",
-    "diff": "^9.0.0"
+    "diff": "^9.0.0",
+    "jimp": "^1.6.1"
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",

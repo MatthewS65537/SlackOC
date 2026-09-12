@@ -4,7 +4,16 @@
  */
 
 import { createOpencodeClient } from "@opencode-ai/sdk";
-import type { OCClient, OcEvent, OcFileDiff, OcMessageInfo, OcPart, OcSession, OcPermission } from "./api.js";
+import type {
+  OCClient,
+  OcEvent,
+  OcFileDiff,
+  OcMessageInfo,
+  OcPart,
+  OcSession,
+  OcPermission,
+  OcQuestionRequest,
+} from "./api.js";
 
 export type { OCClient };
 
@@ -117,6 +126,45 @@ export async function configGet(c: OCClient): Promise<OcConfigInfo> {
   return data(c.config.get());
 }
 
+/** projectDir → "provider/model". One dir = one server = one default. */
+const defaultModelCache = new Map<string, string>();
+
+/**
+ * Resolve the model a bare prompt would ACTUALLY use, by asking the server.
+ * The server stamps providerID/modelID on the assistant message before the LLM
+ * produces output, so a trivial probe reads it in ~250ms, then aborts + deletes
+ * the throwaway session. Cached per project dir so it runs once per server.
+ * Returns undefined (never a guess) if the probe fails — callers show no star.
+ */
+export async function detectDefaultModel(c: OCClient, projectDir: string): Promise<string | undefined> {
+  const hit = defaultModelCache.get(projectDir);
+  if (hit) return hit;
+  let model: string | undefined;
+  let sess: OcSession | undefined;
+  try {
+    sess = await sessionCreate(c);
+    await promptAsync(c, sess.id, "ping");
+    for (let i = 0; i < 24; i++) {
+      const msgs = await sessionMessages(c, sess.id);
+      const a = msgs.find((m) => m.info?.role === "assistant");
+      if (a?.info?.providerID && a?.info?.modelID) {
+        model = `${a.info.providerID}/${a.info.modelID}`;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  } catch {
+    /* probe failed — leave undefined */
+  } finally {
+    if (sess) {
+      await sessionAbort(c, sess.id).catch(() => {});
+      await sessionDelete(c, sess.id).catch(() => {});
+    }
+  }
+  if (model) defaultModelCache.set(projectDir, model);
+  return model;
+}
+
 export interface AgentInfo {
   name: string;
   description?: string;
@@ -133,6 +181,38 @@ export async function pendingPermissions(baseUrl: string): Promise<OcPermission[
   const res = await fetch(`${baseUrl}/permission`);
   if (!res.ok) throw new Error(`permission list failed: HTTP ${res.status}`);
   return (await res.json()) as OcPermission[];
+}
+
+/**
+ * GET /question — global pending question list (boot-recovery sweep). The
+ * pinned v1 SDK has no typed wrapper, so this is a raw fetch like
+ * pendingPermissions; base URL comes from PoolEntry.url.
+ */
+export async function pendingQuestions(baseUrl: string): Promise<OcQuestionRequest[]> {
+  const res = await fetch(`${baseUrl}/question`);
+  if (!res.ok) throw new Error(`question list failed: HTTP ${res.status}`);
+  return (await res.json()) as OcQuestionRequest[];
+}
+
+/**
+ * POST /question/{id}/reply — answer a parked question. `answers` is one
+ * label-array per question, in question order (single-select ⇒ one label each).
+ */
+export async function questionReply(baseUrl: string, requestId: string, answers: string[][]): Promise<unknown> {
+  const res = await fetch(`${baseUrl}/question/${requestId}/reply`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers }),
+  });
+  if (!res.ok) throw new Error(`question reply failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+/** POST /question/{id}/reject — skip a parked question (unblocks the run). */
+export async function questionReject(baseUrl: string, requestId: string): Promise<unknown> {
+  const res = await fetch(`${baseUrl}/question/${requestId}/reject`, { method: "POST" });
+  if (!res.ok) throw new Error(`question reject failed: HTTP ${res.status}`);
+  return res.json();
 }
 
 /**

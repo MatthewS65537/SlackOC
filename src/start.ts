@@ -4,8 +4,15 @@ import { App, LogLevel } from "@slack/bolt";
 import { loadConfig, PID_PATH, CONFIG_PATH, STATE_PATH } from "./config.js";
 import { StateStore } from "./state.js";
 import { ServerPool } from "./opencode/server.js";
-import { permRespond, sessionDiff } from "./opencode/client.js";
-import { permissionBlocks, permissionResultText, VIEW_DIFF_ACTION, type PermButtonValue } from "./slack/blocks.js";
+import { permRespond, sessionDiff, pendingQuestions, questionReply, questionReject } from "./opencode/client.js";
+import {
+  permissionBlocks,
+  permissionResultText,
+  questionBlocks,
+  VIEW_DIFF_ACTION,
+  type PermButtonValue,
+  type QuestionButtonValue,
+} from "./slack/blocks.js";
 import { handleIncomingMessage, type BridgeDeps, type SlackMsg } from "./slack/router.js";
 import { buildUnifiedDiff, formatDiffSummary } from "./commands/handlers.js";
 import { finalizeViewsForProject, getView, hasActiveViewForProject, reconcileStaleViews } from "./slack/render.js";
@@ -14,7 +21,7 @@ import { sweepMissedMessages, type CatchupDeps } from "./slack/catchup.js";
 import { GhostDetector } from "./ghosts.js";
 import { enqueue } from "./slack/queue.js";
 import { logErr, pushLog, ringLogger } from "./log.js";
-import type { OcPermission } from "./opencode/api.js";
+import { normalizePermission, type OcPermission, type OcQuestionRequest } from "./opencode/api.js";
 
 export interface StartOpts {
   cwd: string;
@@ -107,11 +114,15 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     delete: async (channel, ts) => {
       await enqueue(() => app.client.chat.delete({ channel, ts }));
     },
+    // Reactions don't order with messages, so they bypass the FIFO: the 👀
+    // liveness ack and the ✅/❌ outcome land instantly instead of queueing
+    // behind ticker beats (issue #3). Failures are caught by reactLogged's
+    // warn-once wrapper at every call site.
     react: async (channel, ts, name) => {
-      await enqueue(() => app.client.reactions.add({ channel, timestamp: ts, name }));
+      await app.client.reactions.add({ channel, timestamp: ts, name });
     },
     unreact: async (channel, ts, name) => {
-      await enqueue(() => app.client.reactions.remove({ channel, timestamp: ts, name }));
+      await app.client.reactions.remove({ channel, timestamp: ts, name });
     },
     upload: async ({ channelId, threadTs, filename, content, file, comment }) => {
       await enqueue(() =>
@@ -156,6 +167,11 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   const seenPerms = new Set<string>();
   /** Pending permission-ask nudges — cleared when the owner answers. */
   const permNudges = new Map<string, NodeJS.Timeout>();
+  // Same dedupe/nudge pattern for the question tool (issue #2): a parked
+  // question blocks its run server-side, so a missed/replayed ask must not
+  // repost, and a sitting ask gets the same two 3-min nudges as permissions.
+  const seenQuestions = new Set<string>();
+  const quesNudges = new Map<string, NodeJS.Timeout>();
 
   const pool = new ServerPool(
     (dir, eventType, props) => {
@@ -184,6 +200,11 @@ export async function startBridge(opts: StartOpts): Promise<void> {
         if (n) pushLog(`reconciler finalized ${n} stale run(s) for ${dir}`);
       });
     },
+    // A server just became ready: sweep for parked questions that outlived a
+    // bridge restart and re-post the asks for bound sessions (issue #2).
+    (dir, baseUrl) => {
+      void sweepQuestions(dir, baseUrl);
+    },
   );
 
   // Idle-server reaper: an untouched opencode serve stays resident forever on
@@ -209,10 +230,36 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   /** Live permission asks, so an answer can update BOTH the thread and DM copies. */
   const permAsks = new Map<string, { channel: string; threadTs: string; askTs: string | null; dmTs: string | null }>();
 
+  /**
+   * Live question asks. `req` is the full stored ask (options resolved from
+   * here, not from the button value); `answers` accumulates one label-array
+   * per question as the owner taps — when every question has one, we reply.
+   */
+  const quesAsks = new Map<
+    string,
+    { req: OcQuestionRequest; answers: string[][]; channel: string; threadTs: string; askTs: string | null; dmTs: string | null }
+  >();
+
   async function onPoolEvent(dir: string, eventType: string, props: Record<string, unknown>): Promise<void> {
     try {
-      if (eventType === "permission.updated") {
-        await onPermission(props as unknown as OcPermission);
+      // Both event names: ≤1.18.25 emits permission.updated, ≥1.18.2x emits
+      // permission.asked (auto-update renamed it). The adapter normalizes the
+      // differing payloads onto one OcPermission the rest of the flow consumes.
+      if (eventType === "permission.updated" || eventType === "permission.asked") {
+        await onPermission(normalizePermission(props));
+        return;
+      }
+      // Question tool (issue #2): the server parks a blocking question and
+      // emits question.asked. Intercepted here (like permissions) so it never
+      // reaches the view's default: drop — the run would hang with no way to
+      // answer. replied/rejected echoes resolve the posted copies idempotently.
+      if (eventType === "question.asked") {
+        await onQuestion(props as unknown as OcQuestionRequest);
+        return;
+      }
+      if (eventType === "question.replied" || eventType === "question.rejected") {
+        const rid = (props.requestID as string | undefined) ?? (props.id as string | undefined);
+        if (rid) await onQuestionResolved(rid, eventType === "question.rejected" ? "rejected" : "replied");
         return;
       }
       const sid = (props.sessionID as string | undefined) ?? (props.part as { sessionID?: string } | undefined)?.sessionID ?? (props.info as { sessionID?: string } | undefined)?.sessionID;
@@ -277,6 +324,107 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       );
     };
     nudge(1);
+  }
+
+  /**
+   * A parked question (issue #2). Mirrors onPermission: dedupe, find the bound
+   * thread, post the interactive blocks to the thread + owner DM, track both
+   * copies, and nudge twice if it sits unanswered. The run is BLOCKED
+   * server-side until the owner taps an option or Skip.
+   */
+  async function onQuestion(req: OcQuestionRequest): Promise<void> {
+    if (!req?.id || seenQuestions.has(req.id)) return;
+    seenQuestions.add(req.id);
+    if (seenQuestions.size > 500) {
+      const first = seenQuestions.values().next().value;
+      if (first) seenQuestions.delete(first);
+    }
+    const bound = state.findThreadBySession(req.sessionID);
+    if (!bound) return; // question for a session not driven from Slack — ignore
+    const [channel, threadTs] = bound.key.split(":") as [string, string];
+    const header = `❓ *OpenCode has a question* — ${req.questions.length} to answer`;
+    const blocks = questionBlocks(req, []) as never;
+    let askTs: string | null = null;
+    try {
+      askTs = (await render.post(channel, threadTs, header, blocks, { unfurl: false })).ts;
+    } catch {
+      /* thread ask failed — DM below may still reach the owner */
+    }
+    let dmTs: string | null = null;
+    try {
+      dmTs = (await render.dm?.(channel, threadTs, header, blocks))?.ts ?? null;
+    } catch {
+      pushLog(`question DM failed (${req.id}): DM channel unavailable`);
+    }
+    quesAsks.set(req.id, { req, answers: req.questions.map(() => []), channel, threadTs, askTs, dmTs });
+    if (quesAsks.size > 200) {
+      const first = quesAsks.keys().next().value;
+      if (first) quesAsks.delete(first);
+    }
+    const nudge = (remaining: number): void => {
+      quesNudges.set(
+        req.id,
+        setTimeout(() => {
+          if (!seenQuestions.has(req.id)) {
+            quesNudges.delete(req.id);
+            return;
+          }
+          void render
+            .post(channel, threadTs, ":alarm_clock: Still waiting on this question — pick an option or Skip above.", undefined, {
+              unfurl: false,
+            })
+            .catch(() => {});
+          if (remaining > 0) nudge(remaining - 1);
+          else quesNudges.delete(req.id);
+        }, 180_000),
+      );
+    };
+    nudge(1);
+  }
+
+  /**
+   * A parked question resolved (owner tapped, or an SSE replied/rejected echo).
+   * Idempotent: clears tracking + nudges and collapses both copies to a final
+   * line. Safe to call from the action handler AND the SSE echo.
+   */
+  async function onQuestionResolved(requestId: string, kind: "replied" | "rejected"): Promise<void> {
+    const nudge = quesNudges.get(requestId);
+    if (nudge) {
+      clearTimeout(nudge);
+      quesNudges.delete(requestId);
+    }
+    const ask = quesAsks.get(requestId);
+    quesAsks.delete(requestId);
+    const line =
+      kind === "rejected"
+        ? ":arrow_forward: Skipped — OpenCode continuing."
+        : ":white_check_mark: Answered — OpenCode continuing.";
+    const updateOne = (ch: string, ts: string): Promise<unknown> =>
+      render.update(ch, ts, line).catch(() => {});
+    const updates: Promise<unknown>[] = [];
+    if (ask?.askTs) updates.push(updateOne(ask.channel, ask.askTs));
+    if (ask?.dmTs && dmChannelId) updates.push(updateOne(dmChannelId, ask.dmTs));
+    await Promise.all(updates);
+  }
+
+  /**
+   * Boot recovery (issue #2): a parked question outlived a bridge restart (the
+   * opencode server is a detached child that can survive an unclean bridge
+   * death). When a server first becomes ready, list its pending questions and
+   * re-post the asks for bound sessions. onQuestion dedupes (seenQuestions)
+   * and skips unbound sessions itself, so this just fans out.
+   */
+  async function sweepQuestions(dir: string, baseUrl: string): Promise<void> {
+    let list: OcQuestionRequest[];
+    try {
+      list = await pendingQuestions(baseUrl);
+    } catch (err) {
+      pushLog(`question sweep failed for ${dir}: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    for (const req of list) {
+      await onQuestion(req);
+    }
   }
 
   const botAuth = await app.client.auth.test().catch((err) => {
@@ -398,6 +546,84 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       if (ch && ts) updates.push(updateOne(ch, ts));
     }
     await Promise.all(updates);
+  });
+
+  // Question tool (issue #2): owner taps an option (single-select, one tap per
+  // question) or Skip. Labels are resolved from the stored ask, so the button
+  // value stays tiny. When every question is answered we send the full matrix;
+  // the SSE question.replied/rejected echo then collapses both copies too.
+  app.action("question", async ({ ack, body, action, client, respond }) => {
+    await ack();
+    if (body.user.id !== config.ownerSlackUserId) {
+      await respond({ text: "Only the paired owner can answer OpenCode questions.", response_type: "ephemeral" }).catch(() => {});
+      return;
+    }
+    const raw = (action as { value?: string }).value;
+    if (!raw) return;
+    let v: QuestionButtonValue;
+    try {
+      v = JSON.parse(raw) as QuestionButtonValue;
+    } catch {
+      return;
+    }
+    const bound = state.findThreadBySession(v.s);
+    if (!bound) {
+      await respond({ text: "That session is no longer tracked here.", response_type: "ephemeral" }).catch(() => {});
+      return;
+    }
+    const ask = quesAsks.get(v.q);
+    if (!ask) {
+      await respond({ text: "That question is no longer tracked here.", response_type: "ephemeral" }).catch(() => {});
+      return;
+    }
+    const entry = await pool.ensure(bound.thread.projectDir);
+    if (!entry.url) {
+      await respond({ text: "The OpenCode server isn't ready yet — try again in a moment.", response_type: "ephemeral" }).catch(() => {});
+      return;
+    }
+    // Re-render BOTH copies (thread + owner DM) with the current answer matrix.
+    const updateBoth = (blocks: unknown[]): Promise<unknown>[] => {
+      const one = (ch: string, ts: string) =>
+        client.chat.update({ channel: ch, ts, text: "OpenCode question", blocks: blocks as never }).catch(() => {});
+      const u: Promise<unknown>[] = [];
+      if (ask.askTs) u.push(one(ask.channel, ask.askTs));
+      if (ask.dmTs && dmChannelId) u.push(one(dmChannelId, ask.dmTs));
+      return u;
+    };
+
+    if (v.a === -1) {
+      // Skip (reject): unblock the run, collapse both copies to a final line.
+      try {
+        await questionReject(entry.url, v.q);
+      } catch (err) {
+        logErr(`question reject failed: ${String((err as Error)?.message ?? err)}`);
+        await respond({ text: `Failed to skip the question: ${String(err)}`, response_type: "ephemeral" }).catch(() => {});
+        return;
+      }
+      await onQuestionResolved(v.q, "rejected");
+      return;
+    }
+
+    // Option tap: record the label for this question (single-select: one tap).
+    const label = ask.req.questions[v.i]?.options[v.a]?.label;
+    if (label == null) return;
+    ask.answers[v.i] = [label];
+    if (!ask.req.questions.every((_, qi) => ask.answers[qi]?.length)) {
+      // More questions open — re-render both copies (answered ones collapse).
+      await Promise.all(updateBoth(questionBlocks(ask.req, ask.answers)));
+      return;
+    }
+    // All answered — send the full matrix, then collapse both copies.
+    try {
+      await questionReply(entry.url, v.q, ask.answers);
+    } catch (err) {
+      logErr(`question reply failed: ${String((err as Error)?.message ?? err)}`);
+      await respond({ text: `Failed to send your answer: ${String(err)}`, response_type: "ephemeral" }).catch(() => {});
+      // Keep it tracked + re-render so the owner can retry or Skip.
+      await Promise.all(updateBoth(questionBlocks(ask.req, ask.answers)));
+      return;
+    }
+    await onQuestionResolved(v.q, "replied");
   });
 
   // RF1: "📄 View diff" button on completion DMs → post the session's diff

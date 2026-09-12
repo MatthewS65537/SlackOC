@@ -9,3 +9,4 @@ test/.fixtures/
 .DS_Store
 .env
 .env.*
+.dirac-cache/

@@ -7,6 +7,7 @@ import {
   agentsList,
   configGet,
   configProviders,
+  detectDefaultModel,
   sessionAbort,
   sessionCommand,
   sessionCreate,
@@ -281,23 +282,19 @@ registerCommand({
     const info = await configProviders(entry.client!);
     const ids = () =>
       info.providers.flatMap((p) => Object.keys(p.models).map((mid) => `${p.id}/${mid}`));
-    // Effective current model: the thread override wins; otherwise resolve the
-    // server's own default (config "model", else the first provider's default)
-    // so \model stars what a prompt would ACTUALLY use — a bare
-    // "(server default)" placeholder is useless and must never be shown.
+    // Effective current model: the thread override wins; otherwise the config
+    // "model"; otherwise the server's real default, resolved by live probe
+    // (cached per project dir) — so \model stars what a prompt would ACTUALLY
+    // use. A bare "(server default)" placeholder is useless and never shown.
     const effectiveModel = async (): Promise<string | undefined> => {
       if (ctx.thread?.model) return ctx.thread.model;
       let m: string | undefined;
       try {
         m = (await configGet(entry.client!)).model;
       } catch {
-        /* older server without GET /config — fall through to provider defaults */
+        /* older server without GET /config — fall through to the live probe */
       }
-      if (!m) {
-        const p0 = info.providers[0];
-        const mid = p0 ? (info.default[p0.id] ?? Object.keys(p0.models)[0]) : undefined;
-        m = p0 && mid ? `${p0.id}/${mid}` : undefined;
-      }
+      if (!m) m = await detectDefaultModel(entry.client!, dir);
       return m;
     };
     // ★ trails the line (user-mandated): start-of-line markers crowded the code
