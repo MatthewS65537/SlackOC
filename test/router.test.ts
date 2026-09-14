@@ -7,7 +7,7 @@ import type { RenderDeps } from "../src/slack/render.js";
 import type { ServerPool } from "../src/opencode/server.js";
 import type { SlackocConfig } from "../src/config.js";
 import { StateStore } from "../src/state.js";
-import { MAX_ATTACHMENT_BYTES, TARGET_IMAGE_BYTES } from "../src/image.js";
+import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_EDGE, TARGET_IMAGE_BYTES } from "../src/image.js";
 
 describe("claimEvent (Slack double-delivery dedup)", () => {
   it("claims a channel+ts exactly once", () => {
@@ -361,6 +361,37 @@ describe("attachments key off files presence, not subtype", () => {
     expect(file).toMatchObject({ type: "file", mime: "image/jpeg" });
     // data URI stays under the ~1.37MB envelope the target implies
     expect(String(file?.url).length).toBeLessThanOrEqual(Math.ceil((TARGET_IMAGE_BYTES * 4) / 3) + 32);
+    expect(log.posted.some((p) => p.includes("compressed"))).toBe(true);
+  });
+
+  it("big-pixel image under the byte cap is STILL compressed (the airouter 413 regression)", async () => {
+    // 2026-09-13 incident: a 694kB/3024x4032 JPEG receipt passed the 1MB byte
+    // gate untouched — but opencode re-encoded it to a 3.67MB PNG for the
+    // provider call (5.15MB body) and airouter 413'd. Small-bytes + big
+    // pixels here emulates "photo pixels, tiny file": a smooth 2000x2800 PNG
+    // is well under TARGET_IMAGE_BYTES yet far over the pixel ceiling.
+    // Solid-color compresses tiny under PNG while keeping 2000x2800px.
+    const img = new Jimp({ width: 2000, height: 2800, color: 0x336699ff });
+    const bigPixels = await img.getBuffer(JimpMime.png);
+    expect(bigPixels.length).toBeLessThan(TARGET_IMAGE_BYTES); // byte gate would have passed it
+    const decoded = await Jimp.read(bigPixels);
+    expect(Math.max(decoded.bitmap.width, decoded.bitmap.height)).toBeGreaterThan(MAX_IMAGE_EDGE);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => bigPixels.buffer.slice(bigPixels.byteOffset, bigPixels.byteOffset + bigPixels.byteLength),
+      })),
+    );
+    const log = blankLog();
+    const { client, bodies } = promptCapturingClient();
+    const d = makeDeps("router-att-pixels", fakePool(client), fakeRenderFull(log));
+
+    await handleIncomingMessage(imgMsg("C10", "910.300", "check this receipt"), d);
+
+    const file = (bodies[0]?.parts ?? []).find((p) => p.type === "file");
+    expect(file).toMatchObject({ type: "file", mime: "image/jpeg" }); // re-encoded, not passed through
     expect(log.posted.some((p) => p.includes("compressed"))).toBe(true);
   });
 });

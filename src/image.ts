@@ -28,6 +28,21 @@ const TARGETS = [
   { maxEdge: 500, quality: 50 },
 ];
 
+/**
+ * Hard pixel cap for inbound images, independent of byte size. opencode
+ * RE-ENCODES large-dimension images itself — photo content becomes PNG, and
+ * a 694kB JPEG receipt measured 3.67MB as PNG in the provider-bound body
+ * (5.15MB total → airouter 413, live 2026-09-13). Images at/below ~1568px
+ * pass through opencode with modest sizes (probe-verified). So the trigger
+ * is: bytes > TARGET_IMAGE_BYTES OR longest edge > MAX_IMAGE_EDGE.
+ */
+export const MAX_IMAGE_EDGE = 1568;
+
+/** Decode an image, or null when the bytes aren't a supported image. */
+export async function readImage(buf: Buffer) {
+  return Jimp.read(buf).catch(() => null);
+}
+
 export interface ShrinkResult {
   data: Buffer;
   mime: string;
@@ -44,9 +59,11 @@ export async function shrinkImage(
   mime: string,
   filename: string,
   maxBytes: number,
+  /** Pre-decoded image (router already read it for the pixel check). */
+  decoded?: Awaited<ReturnType<typeof readImage>>,
 ): Promise<ShrinkResult | null> {
   if (!mime.startsWith("image/")) return null;
-  const img = await Jimp.read(buf).catch(() => null);
+  const img = decoded ?? (await readImage(buf));
   if (!img) return null;
   for (const t of TARGETS) {
     const copy = img.clone();

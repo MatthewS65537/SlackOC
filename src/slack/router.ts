@@ -7,7 +7,14 @@ import { parseBackslash } from "../commands/parse.js";
 import "../commands/handlers.js"; // registers all commands on import
 import { SessionView, getView, reactLogged, type RenderDeps } from "./render.js";
 import { slackToPlain, truncate } from "../util.js";
-import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_DOWNLOAD_BYTES, TARGET_IMAGE_BYTES, shrinkImage } from "../image.js";
+import {
+  MAX_ATTACHMENT_BYTES,
+  MAX_IMAGE_DOWNLOAD_BYTES,
+  MAX_IMAGE_EDGE,
+  TARGET_IMAGE_BYTES,
+  readImage,
+  shrinkImage,
+} from "../image.js";
 
 /** Loose structural shape of a Bolt message/app_mention event we handle. */
 export interface SlackMsg {
@@ -189,9 +196,13 @@ async function downloadAttachments(
       const mime = f.mimetype ?? "application/octet-stream";
       const filename = f.name ?? "file";
       if (mime.startsWith("image/")) {
-        // Provider gateways 413 on large request bodies, so ANY image above
-        // the target gets JPEG-re-encoded to fit (not just >8MB ones — a 5MB
-        // image is a 6.7MB data URI). Undecodable/unshrinkable images skip+warn.
+        // Provider gateways 413 on large request bodies, and opencode itself
+        // re-encodes big-dimension images to PNG before calling the provider
+        // (a 694kB/4032px JPEG became a 3.67MB PNG → 5.15MB body → airouter
+        // 413, live-verified 2026-09-13). So the shrink trigger is not just
+        // bytes — ANY image past the vision-model pixel ceiling (1568px, or
+        // byte-heavy) gets JPEG-re-encoded to fit. Undecodable/unshrinkable
+        // images skip+warn.
         if (buf.length > MAX_IMAGE_DOWNLOAD_BYTES) {
           await d.render.post(
             msg.channel,
@@ -202,8 +213,10 @@ async function downloadAttachments(
           );
           continue;
         }
-        if (buf.length > TARGET_IMAGE_BYTES) {
-          const shrunk = await shrinkImage(buf, mime, filename, TARGET_IMAGE_BYTES);
+        const decoded = await readImage(buf);
+        const longest = decoded ? Math.max(decoded.bitmap.width, decoded.bitmap.height) : 0;
+        if (buf.length > TARGET_IMAGE_BYTES || longest > MAX_IMAGE_EDGE) {
+          const shrunk = await shrinkImage(buf, mime, filename, TARGET_IMAGE_BYTES, decoded ?? undefined);
           if (shrunk) {
             parts.push({
               mime: shrunk.mime,
