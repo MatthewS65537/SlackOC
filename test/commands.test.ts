@@ -253,8 +253,8 @@ describe("command registry (user-mandated surface)", () => {
 
   it("\\cd accepts ~ paths and rebinds the thread to a FRESH session in the new dir", async () => {
     const state = new StateStore(`${import.meta.dirname}/.fixtures/cd/state.json`);
-    const home = homedir();
-    const target = `${home}/Desktop`; // must exist on this machine
+    const home = homedir(); // guaranteed to exist on every machine — the test only proves ~ expansion
+    const target = home;
     const oldSessionId = "ses_oldoldold";
     state.setThread("C1:T1", { ...newThreadState(oldSessionId, "/old/dir"), hushed: true });
 
@@ -297,7 +297,7 @@ describe("command registry (user-mandated surface)", () => {
       } as never,
     } as unknown as CmdCtx;
 
-    await getCommand("cd")!.run(ctx, "~/Desktop");
+    await getCommand("cd")!.run(ctx, "~");
     expect(createdIn).toBe(target); // ~ expanded, no hard-coding
     const th = state.getThread("C1:T1");
     expect(th?.projectDir).toBe(target);
@@ -819,5 +819,301 @@ describe("command liveness ack (👀 → ✅/❌)", () => {
     await execute({ name: "zzzzzz", args: "" }, ackCtx(log, out));
     expect(log).toEqual([]);
     expect(out.join("\n")).toContain("Unknown command");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sessions: picker, summary, watch (docs/RESUME_SESSIONS.md implementation)
+
+import type { RenderDeps } from "../src/slack/render.js";
+import type { OcSession } from "../src/opencode/api.js";
+import { invalidatePickerCache, noteSessionActivity } from "../src/commands/picker.js";
+
+let pickerFixture = 0;
+
+function ocSess(id: string, dir: string, title: string, ageMs: number): OcSession {
+  const updated = Date.now() - ageMs;
+  return { id, directory: dir, title, time: { created: updated - 1000, updated } };
+}
+
+/** Stub server pool: `list` sessions are machine-global (spike 2); other session fakes configurable. */
+function poolWith(sessions: OcSession[], extra: Record<string, unknown> = {}): never {
+  return {
+    ensure: async (dir: string) => ({
+      dir,
+      client: {
+        session: {
+          list: async () => ({ data: sessions }),
+          ...extra,
+        },
+      },
+    }),
+    list: () => [],
+  } as never;
+}
+
+function fakeViewDeps(posted: string[], deleted: string[] = []): RenderDeps {
+  return {
+    post: async (_c, _t, text) => {
+      posted.push(text);
+      return { ts: `posted-${posted.length}` };
+    },
+    update: async () => {},
+    delete: async (_c, ts) => void deleted.push(ts),
+    react: async () => {},
+    unreact: async () => {},
+    upload: async () => {},
+  };
+}
+
+describe("sessions picker + resume (RESUME_SESSIONS phase 1)", () => {
+  it("\\sessions bare lists the current project with markers; `all` lists machine-wide", async () => {
+    const { invalidatePickerCache } = await import("../src/commands/picker.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/sessions-scope/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_mine", "/p"));
+    const out: string[] = [];
+    const mk = () => baseCtx(state, out, state.getThread("C1:T1"), {
+      pool: poolWith([ocSess("ses_mine", "/p", "Mine", 5_000), ocSess("ses_theirs", "/elsewhere", "Theirs", 1_000)]),
+    } as never);
+    await getCommand("sessions")!.run(mk(), "");
+    let text = out.at(-1)!;
+    expect(text).toContain("*Sessions in* `/p`");
+    expect(text).toContain("ses_mine".slice(4, 14));
+    expect(text).not.toContain("Theirs");
+    out.length = 0;
+    invalidatePickerCache("C1:T1");
+    await getCommand("sessions")!.run(mk(), "all");
+    text = out.at(-1)!;
+    expect(text).toContain("machine-wide");
+    expect(text).toContain("Theirs");
+    invalidatePickerCache("C1:T1");
+  });
+
+  it("\\sessions <filter> narrows machine-wide and caps with the (+N older) hint", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/sessions-filter/state.json`);
+    const many = Array.from({ length: 13 }, (_, i) => ocSess(`ses_f${String(i).padStart(2, "0")}`, "/p", `fix ${i}`, i * 1000));
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, { pool: poolWith(many) } as never);
+    await getCommand("sessions")!.run(ctx, "fix");
+    const text = out.at(-1)!;
+    expect(text).toContain("13 sessions");
+    expect(text).toContain("(+3 older");
+    invalidatePickerCache("C1:T1");
+  });
+
+  it("\\resume <#> binds the session the user actually saw, even after the order drifts", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/resume-stable/state.json`);
+    const a = ocSess("ses_aaa", "/p", "Alpha", 20_000);
+    const b = ocSess("ses_bbb", "/p", "Beta", 10_000);
+    const out: string[] = [];
+    const ctx1 = baseCtx(state, out, null, { pool: poolWith([a, b]) } as never);
+    await getCommand("sessions")!.run(ctx1, "all"); // displayed: 1=b, 2=a
+    // Server order now drifts — \resume 2 must still bind what "2" showed.
+    const ctx2 = baseCtx(state, out, null, {
+      pool: poolWith([b, a], { get: async () => ({ data: { id: "ses_aaa" } }) }),
+    } as never);
+    await getCommand("resume")!.run(ctx2, "2");
+    expect(state.getThread("C1:T1")?.sessionId).toBe("ses_aaa");
+    invalidatePickerCache("C1:T1");
+  });
+
+  it("\\resume on an expired list re-lists instead of guessing", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/resume-stale/state.json`);
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, { pool: poolWith([ocSess("ses_aaa", "/p", "Alpha", 10_000)]) } as never);
+    await getCommand("sessions")!.run(ctx, "all");
+    invalidatePickerCache("C1:T1");
+    await getCommand("resume")!.run(ctx, "1");
+    expect(out.at(-1)).toContain("expired");
+    expect(out.at(-1)).toContain("pick again");
+    expect(state.getThread("C1:T1")).toBeNull(); // nothing bound
+    invalidatePickerCache("C1:T1");
+  });
+
+  it("\\resume rebinding a watched session lifts the read-only gate", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/resume-unwatch/state.json`);
+    state.setThread("C1:T1", { sessionId: "ses_old", projectDir: "/p", verbose: "on", watchOnly: true, createdAt: 1, lastUsedAt: 1 });
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), {
+      pool: poolWith([ocSess("ses_target", "/p", "T", 1_000)], { get: async () => ({ data: { id: "ses_target" } }) }),
+    } as never);
+    await getCommand("resume")!.run(ctx, "ses_target");
+    expect(state.getThread("C1:T1")?.watchOnly).toBe(false);
+    expect(state.getThread("C1:T1")?.sessionId).toBe("ses_target");
+    invalidatePickerCache("C1:T1");
+  });
+
+  it("\\help groups watch/unwatch/history/summary under Monitoring", () => {
+    const monitoring = HELP_SECTIONS.find((s) => s.title === "Monitoring");
+    expect(monitoring?.names).toEqual(["watch", "unwatch", "history", "summary"]);
+  });
+});
+
+describe("\\history (RESUME_SESSIONS phase 2)", () => {
+  const transcript = [
+    { info: { id: "m1", sessionID: "s", role: "user" }, parts: [{ id: "p1", type: "text", text: "fix the login bug" }] },
+    {
+      info: { id: "m2", sessionID: "s", role: "assistant" },
+      parts: [
+        { id: "p2", type: "text", text: "Looking at the auth module.\n\nFound the wrong key." },
+        { id: "p3", type: "tool", tool: "read" },
+        { id: "p4", type: "tool", tool: "edit" },
+      ],
+    },
+    { info: { id: "m3", sessionID: "s", role: "user" }, parts: [{ id: "p5", type: "text", text: "add tests" }] },
+    { info: { id: "m4", sessionID: "s", role: "assistant" }, parts: [{ id: "p6", type: "text", text: "Added two cases." }] },
+  ];
+
+  it("digests the thread's session tail: you/agent lines + tool counts", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/history-digest/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_hist", "/p"));
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), {
+      pool: poolWith([], { messages: async () => ({ data: transcript }) }),
+    } as never);
+    await getCommand("history")!.run(ctx, "1");
+    const text = out.at(-1)!;
+    expect(text).toContain("*you* add tests");
+    expect(text).toContain("*agent* Added two cases.");
+    expect(text).not.toContain("fix the login bug"); // tail 1 turn only
+  });
+
+  it("targets a picker session and counts tool calls", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/history-target/state.json`);
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, {
+      pool: poolWith([ocSess("ses_target", "/elsewhere", "T", 1_000)], { messages: async () => ({ data: transcript }) }),
+    } as never);
+    await getCommand("history")!.run(ctx, "ses_target");
+    const text = out.join("\n");
+    expect(text).toContain("ses_target".slice(4, 14));
+    expect(text).toContain("2 tool calls");
+    invalidatePickerCache("C1:T1");
+  });
+
+  it("renderHistoryDigest: first line only for user, first paragraph for agent", async () => {
+    const { renderHistoryDigest } = await import("../src/commands/handlers.js");
+    const digest = renderHistoryDigest("ses_x", [
+      { info: { id: "m1", sessionID: "s", role: "user" }, parts: [{ id: "p1", type: "text", text: "line one\nline two" }] },
+      { info: { id: "m2", sessionID: "s", role: "assistant" }, parts: [{ id: "p2", type: "text", text: "para one\n\npara two" }] },
+    ], 10);
+    expect(digest).toContain("*you* line one");
+    expect(digest).not.toContain("line two");
+    expect(digest).toContain("*agent* para one");
+    expect(digest).not.toContain("para two");
+  });
+});
+
+describe("\\summary (RESUME_SESSIONS phase 2)", () => {
+  function summaryClient(opts: { summary?: string; tailIncomplete?: boolean } = {}) {
+    const calls: { abort: number; delete: number; promptBody?: Record<string, unknown> } = { abort: 0, delete: 0 };
+    const client = {
+      session: {
+        create: async () => ({ data: { id: "ses_throwaway" } }),
+        promptAsync: async (o: { body: Record<string, unknown> }) => {
+          calls.promptBody = o.body;
+          return { data: {} };
+        },
+        messages: async () => ({
+          data: opts.tailIncomplete
+            ? [
+                { info: { id: "m1", sessionID: "s", role: "user" }, parts: [{ id: "p1", type: "text", text: "hello" }] },
+                { info: { id: "m2", sessionID: "s", role: "assistant", time: { created: Date.now() } }, parts: [] },
+              ]
+            : [
+                { info: { id: "m1", sessionID: "s", role: "user" }, parts: [{ id: "p1", type: "text", text: "please refactor auth" }] },
+                { info: { id: "m2", sessionID: "s", role: "assistant", time: { completed: 1 } }, parts: [{ id: "p2", type: "text", text: "Done — extracted the token store." }] },
+              ],
+        }),
+        abort: async () => {
+          calls.abort += 1;
+          return { data: {} };
+        },
+        delete: async () => {
+          calls.delete += 1;
+          return { data: {} };
+        },
+      },
+    };
+    return { client, calls };
+  }
+
+  it("summarizes via a throwaway session and cleans it up (abort + delete)", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/summary-ok/state.json`);
+    state.setThread("C1:T1", { ...newThreadState("ses_target", "/p"), model: "prov/m" });
+    const out: string[] = [];
+    const { client, calls } = summaryClient({ summary: "S" });
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), { pool: poolWith([], client.session) } as never);
+    await getCommand("summary")!.run(ctx, "");
+    const text = out.join("\n");
+    expect(text).toContain("Summary of");
+    expect(text).toContain("Done — extracted the token store.");
+    expect(calls.abort).toBe(1);
+    expect(calls.delete).toBe(1);
+    // Thread's model override drives the throwaway run; transcript rides along.
+    expect(calls.promptBody?.model).toEqual({ providerID: "prov", modelID: "m" });
+    expect(JSON.stringify(calls.promptBody)).toContain("please refactor auth");
+  });
+
+  it("refuses while the target looks mid-run (incomplete recent assistant reply)", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/summary-busy/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_target", "/p"));
+    const out: string[] = [];
+    const { client, calls } = summaryClient({ tailIncomplete: true });
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), { pool: poolWith([], client.session) } as never);
+    await expect(getCommand("summary")!.run(ctx, "")).rejects.toThrow(/mid-run/);
+    expect(calls.abort).toBe(0); // never spawned
+  });
+});
+
+describe("\\watch / \\unwatch (RESUME_SESSIONS phase 3)", () => {
+  it("binds the thread read-only, attaches a live view, and writes NO pendingRun tombstone", async () => {
+    const { getView } = await import("../src/slack/render.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/watch-attach/state.json`);
+    const posted: string[] = [];
+    const deleted: string[] = [];
+    // Transcript: old completed content + a live post-attach assistant message
+    // (incomplete → the settle timer never fires mid-test).
+    const msgs = [
+      { info: { id: "m0", sessionID: "s", role: "user", time: { created: 1 } }, parts: [] },
+      { info: { id: "m1", sessionID: "s", role: "assistant", time: { created: 2, completed: 3 } }, parts: [{ id: "p0", type: "text", text: "old content" }] },
+      { info: { id: "m2", sessionID: "s", role: "assistant", time: { created: Date.now() } }, parts: [{ id: "p1", type: "text", text: "streaming…" }] },
+    ];
+    const ctx = baseCtx(state, [], null, {
+      pool: poolWith([ocSess("ses_watchme", "/comp/dir", "Live", 1_000)], { messages: async () => ({ data: msgs }) }),
+      render: fakeViewDeps(posted, deleted),
+    } as never);
+    await getCommand("watch")!.run(ctx, "ses_watchme");
+    await new Promise((r) => setTimeout(r, 20)); // let the immediate first poll land
+    const th = state.getThread("C1:T1");
+    expect(th?.watchOnly).toBe(true);
+    expect(th?.projectDir).toBe("/comp/dir");
+    expect(th?.pendingRun).toBeUndefined(); // the boot sweep must never ❌ this thread
+    expect(getView("ses_watchme")).toBeDefined();
+    expect(posted.join("\n")).toContain("watching");
+    await getCommand("unwatch")!.run({ ...ctx, thread: state.getThread("C1:T1") } as never, "");
+    expect(state.getThread("C1:T1")?.watchOnly).toBe(false);
+    expect(getView("ses_watchme")).toBeUndefined();
+    expect(deleted.length).toBeGreaterThan(0); // watching status line removed
+  });
+
+  it("refuses to watch a session bound to another thread (one view per session)", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/watch-conflict/state.json`);
+    state.setThread("C2:T9", newThreadState("ses_theirs", "/p"));
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, {
+      pool: poolWith([ocSess("ses_theirs", "/p", "Theirs", 1_000)]),
+      render: fakeViewDeps([]),
+    } as never);
+    await expect(getCommand("watch")!.run(ctx, "ses_theirs")).rejects.toThrow(/another thread/);
+    expect(state.getThread("C1:T1")).toBeNull();
+  });
+
+  it("\\unwatch without a watch says so and touches nothing", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/watch-none/state.json`);
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, { pool: poolWith([]) } as never);
+    await getCommand("unwatch")!.run(ctx, "");
+    expect(out.at(-1)).toContain("isn't watching");
   });
 });

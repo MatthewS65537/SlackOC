@@ -293,6 +293,7 @@ function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = nul
     react: async (name, add = true) => {
       await reactLogged(d.render, msg.channel, msg.ts, name, add);
     },
+    render: d.render,
   };
 }
 
@@ -313,6 +314,21 @@ const creatingThreads = new Map<string, Promise<ThreadState>>();
 async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: ImagePart[] = []): Promise<void> {
   const threadTs = threadRootTs(msg);
   const threadKey = d.state.threadKey(msg.channel, threadTs);
+
+  // \watch gate: this thread is mirroring a session driven on the computer —
+  // plain replies would interleave with the TUI's own turns. \ commands pass
+  // (execute() never reaches runPrompt); \resume is the takeover path.
+  const bound = d.state.getThread(threadKey);
+  if (bound?.watchOnly) {
+    await d.render.post(
+      msg.channel,
+      threadTs,
+      "👁 This thread is watch-only — the session is being driven on the computer. `\\resume` to take it over here, `\\unwatch` to stop mirroring.",
+      undefined,
+      { unfurl: false },
+    );
+    return;
+  }
 
   // 👀 liveness ack — the owner learns the bridge is up and saw their
   // message even if the run then takes minutes (or fails quietly downstream).

@@ -126,6 +126,21 @@ computer); replies in the thread stay read-only until the owner takes over.
    X's sessions or all local ones. If it's effectively global, machine scope collapses to
    a single call and the `MAX_DIRS` fan-out disappears.
 
+### Spike results (run 2026-09-16, opencode 1.18.31) — both resolved
+
+1. **Cross-process SSE does NOT propagate.** Two `opencode serve` processes (different
+   roots, shared storage): a session driven through process B produced a full event
+   stream on B's `/event` bus and *nothing* on A's (only `server.connected`/heartbeat).
+   ⇒ `\watch` uses the polling fallback: a 3s `sessionMessages` delta per watched
+   session feeding the same part-posting path (`SessionView.pollTranscript`). Reading
+   IS cross-process (A's `GET /session/:id/message` returned B's full transcript), which
+   is what makes polling viable.
+2. **`GET /session` is machine-global.** A server rooted at dir A listed a session
+   created under dir B; `?directory=` scopes it. ⇒ machine scope is a single call —
+   no `MAX_DIRS` fan-out, and `\sessions` bare scopes via the directory filter.
+   Note: no `status` field on `GET /session/:id` — running detection is the activity
+   map + recency, not a polled flag.
+
 ## Command surface after the feature
 
 | command | change |

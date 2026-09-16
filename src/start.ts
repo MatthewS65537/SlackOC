@@ -5,6 +5,7 @@ import { loadConfig, PID_PATH, CONFIG_PATH, STATE_PATH } from "./config.js";
 import { StateStore } from "./state.js";
 import { ServerPool } from "./opencode/server.js";
 import { permRespond, sessionDiff, pendingQuestions, questionReply, questionReject } from "./opencode/client.js";
+import { noteSessionActivity } from "./commands/picker.js";
 import {
   permissionBlocks,
   permissionResultText,
@@ -264,6 +265,16 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       }
       const sid = (props.sessionID as string | undefined) ?? (props.part as { sessionID?: string } | undefined)?.sessionID ?? (props.info as { sessionID?: string } | undefined)?.sessionID;
       if (!sid) return;
+      // Activity map BEFORE the view lookup: events for view-less sessions
+      // (e.g. a session whose thread was rebound) are dropped below, but their
+      // busy/idle transitions feed the picker's ▶ running marker.
+      if (eventType === "session.status") {
+        const st = (props.status as { type?: string } | undefined)?.type;
+        if (st === "busy" || st === "retry") noteSessionActivity(sid, true);
+        else if (st === "idle") noteSessionActivity(sid, false);
+      } else if (eventType === "session.idle") {
+        noteSessionActivity(sid, false);
+      }
       const view = getView(sid);
       if (view) await view.handle({ type: eventType, properties: props as never });
     } catch (err) {

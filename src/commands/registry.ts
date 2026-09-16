@@ -1,6 +1,7 @@
 import type { SlackocConfig } from "../config.js";
 import type { ServerPool } from "../opencode/server.js";
 import type { StateStore, ThreadState } from "../state.js";
+import type { RenderDeps } from "../slack/render.js";
 import type { ParsedCmd } from "./parse.js";
 
 export interface CmdCtx {
@@ -29,6 +30,11 @@ export interface CmdCtx {
    * contexts (tests) can omit it.
    */
   react?(name: string, add?: boolean): Promise<void>;
+  /**
+   * Raw render deps — only \watch needs them (it constructs a live SessionView).
+   * Optional everywhere else so non-Slack contexts (tests) can omit it.
+   */
+  render?: RenderDeps;
 }
 
 export interface CmdDef {
