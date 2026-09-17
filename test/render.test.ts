@@ -1375,3 +1375,218 @@ describe("SessionView contentBelow sink (#4)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// \watch mode: SessionView.attach() (docs/RESUME_SESSIONS.md phase 3)
+
+import { join } from "node:path";
+
+const WATCH_FIXTURES = join(import.meta.dirname ?? __dirname, ".fixtures", "watch");
+
+function watchView(
+  log: CallLog,
+  sessionId: string,
+  client: OCClient,
+  opts: { watchOnly?: boolean; threadKey?: string } = {},
+): { v: SessionView; state: StateStore } {
+  const threadKey = opts.threadKey ?? "C1:T1";
+  const state = new StateStore(join(WATCH_FIXTURES, `${sessionId}-${Math.random().toString(36).slice(2, 7)}`, "state.json"));
+  state.setThread(threadKey, {
+    sessionId,
+    projectDir: "/p",
+    verbose: "off",
+    watchOnly: opts.watchOnly ?? true,
+    createdAt: 1,
+    lastUsedAt: 1,
+  });
+  const v = new SessionView({
+    sessionId,
+    projectDir: "/p",
+    channel: "C1",
+    threadTs: "T1",
+    threadKey,
+    client,
+    deps: fakeDeps(log),
+    state,
+    threadState: state.getThread(threadKey)!,
+  });
+  return { v, state };
+}
+
+const OLD = 1_000; // created well before any attach (epoch-ish)
+
+describe("SessionView.attach (watch a computer-driven session)", () => {
+  it("posts the watching line, streams new parts via poll, and writes NO tombstone", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      let poll = 0;
+      const client = {
+        session: {
+          get: async () => {
+            throw new Error("no summary");
+          },
+          messages: async () => {
+            poll += 1;
+            if (poll === 1) {
+              return { data: [{ info: { id: "m1", role: "user", time: { created: OLD } }, parts: [] }] };
+            }
+            return {
+              data: [
+                { info: { id: "m1", role: "user", time: { created: OLD } }, parts: [] },
+                { info: { id: "m2", role: "user", time: { created: Date.now() } }, parts: [] },
+                {
+                  info: { id: "m3", role: "assistant", time: { created: Date.now() } },
+                  parts: [
+                    { id: "p-tool", type: "tool", tool: "read", callID: "c1", state: { status: "running", input: { filePath: "/p/x.ts" } } },
+                    { id: "p-text", type: "text", text: "live answer", time: { end: 1 } },
+                  ],
+                },
+              ],
+            };
+          },
+        },
+      } as never;
+      const { v, state } = watchView(log, "ses-watch-a", client);
+      await v.attach();
+      await vi.advanceTimersByTimeAsync(0); // immediate first poll — pre-attach only
+      expect(log.posted.filter((p) => p.includes("old content") || p.includes("live answer"))).toEqual([]);
+      expect(state.getThread("C1:T1")?.pendingRun).toBeUndefined(); // no tombstone — ever
+      await vi.advanceTimersByTimeAsync(3_000); // second poll — new content streams
+      expect(log.posted.join("\n")).toContain("live answer");
+      expect(log.posted.join("\n")).toContain("read");
+      // The watcher's status line ticks with a 👀 prefix, never "working…"
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(log.updates.join("\n")).toMatch(/👀/);
+      await v.stopWatching();
+      deleteView("ses-watch-a");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a completed tail settles into finalize: stats line, view dropped, gate lifted", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      // Snapshot memoized on FIRST poll (which happens after attach, so its
+      // timestamps are post-attach); identical on later polls → settle arms.
+      let snapshot: unknown[] | null = null;
+      const client = {
+        session: {
+          get: async () => {
+            throw new Error("no summary");
+          },
+          messages: async () => {
+            if (!snapshot) {
+              const now = Date.now();
+              snapshot = [
+                { info: { id: "m1", role: "user", time: { created: now - 1_000 } }, parts: [{ id: "pu", type: "text", text: "go", time: { end: 1 } }] },
+                {
+                  info: { id: "m2", role: "assistant", time: { created: now, completed: now + 1 } },
+                  parts: [{ id: "pa", type: "text", text: "finished answer", time: { end: 1 } }],
+                },
+              ];
+            }
+            return { data: snapshot };
+          },
+        },
+      } as never;
+      const { v, state } = watchView(log, "ses-watch-b", client);
+      await v.attach();
+      await vi.advanceTimersByTimeAsync(0); // poll 1: grew + completed
+      await vi.advanceTimersByTimeAsync(3_000); // poll 2: stable → arm settle
+      expect(log.posted.join("\n")).toContain("finished answer");
+      await vi.advanceTimersByTimeAsync(9_000); // settle (8s) → finalize
+      expect(log.posted.some((p) => p.includes("*p*"))).toBe(true); // stats line posted
+      expect(log.deleted.length).toBeGreaterThanOrEqual(1); // watching status line removed (finalize, + sink hops)
+      expect(getView("ses-watch-b")).toBeUndefined();
+      expect(state.getThread("C1:T1")?.watchOnly).toBe(false); // gate lifted with the view
+      deleteView("ses-watch-b");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("attaching to an idle session detaches quietly instead of hanging at ⏳", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      const client = {
+        session: {
+          get: async () => {
+            throw new Error("no summary");
+          },
+          messages: async () => ({
+            data: [
+              { info: { id: "m1", role: "user", time: { created: OLD } }, parts: [] },
+              { info: { id: "m2", role: "assistant", time: { created: OLD, completed: OLD + 1 } }, parts: [{ id: "p1", type: "text", text: "ancient", time: { end: 1 } }] },
+            ],
+          }),
+        },
+      } as never;
+      const { v, state } = watchView(log, "ses-watch-c", client);
+      await v.attach();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(3_000); // poll 2: nothing new → arm settle
+      await vi.advanceTimersByTimeAsync(9_000); // settle → quiet detach
+      expect(log.posted.join("\n")).toContain("Nothing running");
+      expect(log.posted.join("\n")).not.toContain("ancient"); // history is \history's job
+      expect(getView("ses-watch-c")).toBeUndefined();
+      expect(state.getThread("C1:T1")?.watchOnly).toBe(false);
+      deleteView("ses-watch-c");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("beginPrompt on a watching view stops the poll (Slack took over)", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      let polls = 0;
+      const client = {
+        session: {
+          get: async () => {
+            throw new Error("no summary");
+          },
+          messages: async () => {
+            polls += 1;
+            return { data: [] };
+          },
+        },
+      } as never;
+      const { v } = watchView(log, "ses-watch-d", client, { watchOnly: false });
+      await v.attach();
+      await vi.advanceTimersByTimeAsync(0);
+      const before = polls;
+      await v.beginPrompt("111.222"); // \resume takeover → tombstone written now
+      expect(v.isActive).toBe(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(polls).toBe(before); // poll loop stopped
+      deleteView("ses-watch-d");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stopWatching removes the status line, drops the view, lifts the gate, posts the reason", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      const client = { session: { get: async () => { throw new Error("x"); }, messages: async () => ({ data: [] }) } } as never;
+      const { v, state } = watchView(log, "ses-watch-e", client);
+      await v.attach();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getView("ses-watch-e")).toBeDefined();
+      await v.stopWatching("👁 watch ended");
+      expect(getView("ses-watch-e")).toBeUndefined();
+      expect(state.getThread("C1:T1")?.watchOnly).toBe(false);
+      expect(log.deleted.length).toBe(1); // the watching status line
+      expect(log.posted.at(-1)).toContain("watch ended");
+      deleteView("ses-watch-e");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

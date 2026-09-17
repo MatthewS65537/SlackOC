@@ -16,6 +16,12 @@ export interface ThreadState {
   /** \notify toggle: when true, run completions are DM'd to the owner */
   notify?: boolean;
   /**
+   * \watch mode: the thread mirrors a session driven OUTSIDE Slack (TUI/IDE on
+   * the computer). Plain replies are rejected (read-only until \resume takes
+   * the session over); \ commands still work.
+   */
+  watchOnly?: boolean;
+  /**
    * Run in flight when the bridge was stopped (persisted so a restart can
    * resolve the orphaned ⏳/✅ lifecycle instead of leaving it frozen forever).
    */

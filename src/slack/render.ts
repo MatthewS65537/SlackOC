@@ -3,7 +3,7 @@ import { sessionGet, sessionMessages } from "../opencode/client.js";
 import type { StateStore, ThreadState, VerboseMode } from "../state.js";
 import { viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
-import { chunkText, dur, mdToMrkdwn, money, shortPath, tok, truncate } from "../util.js";
+import { chunkText, dur, mdToMrkdwn, money, shortId, shortPath, tok, truncate } from "../util.js";
 import { queueDepth } from "./queue.js";
 
 export interface RenderDeps {
@@ -269,6 +269,21 @@ export class SessionView {
   private static readonly IDLE_GRACE_MS = 8_000;
   /** ts of user messages awaiting ✅/❌ — resolved at finalize. */
   private readonly pendingUserMsgs: string[] = [];
+  /**
+   * \watch mode: this view mirrors a session driven OUTSIDE Slack (TUI/IDE).
+   * Cross-process SSE does NOT propagate (live-verified 2026-09-16: a session
+   * driven by another opencode process emits nothing on this server's /event
+   * bus), so delivery is a transcript poll instead of the SSE handlers.
+   */
+  private attached = false;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private pollInFlight = false;
+  /** Transcript length at the previous poll — growth gates the settle timer. */
+  private lastTranscriptSize = 0;
+  /** Settles a completed/dormant watch into finalize (or a quiet detach). */
+  private settleTimer: NodeJS.Timeout | null = null;
+  /** True once the watcher posted at least one post-attach part. */
+  private streamedAny = false;
 
   constructor(opts: SessionViewOpts) {
     this.sessionId = opts.sessionId;
@@ -390,6 +405,10 @@ export class SessionView {
    * back-to-back prompts on an active session.
    */
   async beginPrompt(userMsgTs: string): Promise<void> {
+    // A prompt through this thread means Slack is taking the watched session
+    // over — stop the transcript poll and let the SSE handlers own delivery
+    // (the runPrompt watchOnly gate has already been passed by \resume).
+    if (this.attached) this.stopPolling();
     const wasActive = this.active;
     this.active = true;
     this.outstandingPrompts += 1;
@@ -425,6 +444,177 @@ export class SessionView {
       clearTimeout(this.idleGrace);
       this.idleGrace = null;
     }
+  }
+
+  /**
+   * \watch: attach this view to a session NOT driven by Slack. Posts the
+   * watching status line, starts the 1s ticker, and polls the transcript —
+   * SSE events for a TUI-driven session never reach this process (spike 1).
+   * Deliberately NOT beginPrompt: no pendingRun tombstone (the boot interrupt
+   * sweep must never ❌ this thread's unrelated messages), no user-message
+   * lifecycle, and `runStartedAt` = attach time so finalize's delivery
+   * backstop only posts content created after attaching — history is
+   * \history's job, not the watcher's.
+   */
+  async attach(): Promise<void> {
+    this.attached = true;
+    this.active = true; // \status "runs in flight" + the idle reaper's busy check
+    this.runStartedAt = Date.now();
+    this.lastEventAt = this.runStartedAt;
+    this.activity = "driven on the computer…";
+    const { ts } = await this.deps.post(
+      this.channel,
+      this.threadTs,
+      `👀 watching \`${shortId(this.sessionId)}\` — driven on the computer…`,
+      undefined,
+      { unfurl: false },
+    );
+    this.statusTs = ts;
+    this.startTicker();
+    this.pollTimer = setInterval(() => void this.pollTranscript(), SessionView.POLL_MS);
+    this.pollTimer.unref();
+    void this.pollTranscript(); // first pass immediately, not one tick late
+  }
+
+  private static readonly POLL_MS = 3_000;
+  /** A completed tail finalizes this long after the transcript stops growing. */
+  private static readonly WATCH_SETTLE_MS = 8_000;
+
+  private cancelSettle(): void {
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = null;
+    }
+  }
+
+  /** Tear down watch polling (not the view) — Slack is taking the session over. */
+  private stopPolling(): void {
+    this.attached = false;
+    this.cancelSettle();
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
+  /**
+   * Delta-poll the transcript and post what's new through the same rendering
+   * path the SSE handlers use (postedPartIds/postedToolStarts dedup makes the
+   * two delivery paths mutually safe). Also detects run completion: when the
+   * tail message is a completed assistant message and the transcript has
+   * stopped growing, settle → finalize with the usual stats line — or, when
+   * nothing streamed at all, a quiet detach (attaching to an idle session).
+   */
+  private async pollTranscript(): Promise<void> {
+    if (this.finalized || !this.attached || this.pollInFlight) return;
+    // Self-guard: a view dropped from the registry (rebind, teardown, another
+    // thread's \resume) must not keep polling and posting into its old thread.
+    if (getView(this.sessionId) !== this) {
+      this.stopPolling();
+      return;
+    }
+    this.pollInFlight = true;
+    try {
+      const msgs = await sessionMessages(this.client, this.sessionId);
+      if (this.finalized || !this.attached) return;
+      const grew = msgs.length !== this.lastTranscriptSize;
+      const firstPoll = this.lastTranscriptSize === 0;
+      this.lastTranscriptSize = msgs.length;
+      if (grew && !firstPoll) this.cancelSettle(); // fresh activity always outvotes a pending settle
+
+      let newToolLines: string[] = [];
+      for (const m of msgs) {
+        const created = m.info?.time?.created ?? 0;
+        if (created < this.runStartedAt - 2_000) continue; // pre-attach history is \history's job
+        if (m.info?.role === "user") {
+          this.activityUpdate("new prompt on the computer…");
+          continue;
+        }
+        if (m.info?.role !== "assistant") continue;
+        const done = !!m.info.time?.completed;
+        for (const p of m.parts ?? []) {
+          if (p.type === "text") {
+            const text = (p as { text?: string }).text ?? "";
+            if (!text.trim() || this.postedPartIds.has(p.id)) continue;
+            // Stream while incomplete; post leftovers once the message completes.
+            if (!p.time?.end && !done) {
+              this.pendingText.set(p.id, text);
+              this.activityUpdate("typing…");
+              continue;
+            }
+            this.pendingText.delete(p.id);
+            this.postedPartIds.add(p.id);
+            this.streamedAny = true;
+            await this.postThreadText(text);
+          } else if (p.type === "tool") {
+            const callId = p.callID ?? p.id;
+            const st = p.state ?? {};
+            if ((st.status === "running" || st.status === "completed") && !this.postedToolStarts.has(callId)) {
+              this.postedToolStarts.add(callId);
+              this.toolCalls += 1;
+              this.activityUpdate(`tool: ${this.toolTitle(p)}`);
+              if (st.status === "running") newToolLines.push(this.toolLine(p, this.toolTitle(p)));
+            }
+          } else if (p.type === "file") {
+            await this.postFilePart(p).catch(() => {});
+            this.streamedAny = true;
+          }
+        }
+      }
+      if (newToolLines.length) {
+        this.toolBuf.push(...newToolLines);
+        await this.flushTools();
+      }
+
+      const tail = msgs.at(-1);
+      const tailCreated = tail?.info?.time?.created ?? 0;
+      const tailDone = tail?.info?.role === "assistant" && !!tail.info.time?.completed;
+      const postAttach = tailCreated >= this.runStartedAt - 2_000;
+      if (!postAttach || (tailDone && !grew) || (!tailDone && !grew && !firstPoll && tailCreated < this.runStartedAt)) {
+        // Either the streamed run completed, or nothing has happened since
+        // attach (idle session) — settle and end the watch either way.
+        if (!this.settleTimer) {
+          this.settleTimer = setTimeout(() => {
+            this.settleTimer = null;
+            void (this.streamedAny
+              ? this.finalize()
+              : this.stopWatching(
+                  `:eye_in_speech_bubble: Nothing running in \`${shortId(this.sessionId)}\` right now — \`\\watch\` again when it starts.`,
+                ));
+          }, SessionView.WATCH_SETTLE_MS);
+          this.settleTimer.unref();
+        }
+      }
+    } catch (err) {
+      // The server for this project died mid-watch: the pool's death hook
+      // finalizes this view with a visible reason — swallow poll errors here.
+      logErr(`watch poll failed (${this.sessionId}): ${String((err as Error)?.message ?? err)}`);
+    } finally {
+      this.pollInFlight = false;
+    }
+  }
+
+  /**
+   * End a watch without the run-summary machinery: remove the status line,
+   * drop the view, ungate the thread. Used by \unwatch and the idle-attach
+   * settle. Idempotent with finalize() (whichever ran first wins).
+   */
+  async stopWatching(reason?: string): Promise<void> {
+    if (this.finalized) return;
+    this.stopPolling();
+    this.active = false;
+    if (this.ticker) {
+      clearInterval(this.ticker);
+      this.ticker = null;
+    }
+    if (this.statusTs) {
+      await this.deps.delete(this.channel, this.statusTs).catch(() => {});
+      this.statusTs = null;
+    }
+    const cur = this.state.getThread(this.threadKey);
+    if (cur) this.state.setThread(this.threadKey, { ...cur, watchOnly: false });
+    deleteView(this.sessionId);
+    if (reason) await this.deps.post(this.channel, this.threadTs, reason, undefined, { unfurl: false }).catch(() => {});
   }
 
   /**
@@ -625,6 +815,9 @@ export class SessionView {
   private statusText(): string {
     const glass = this.tickSeen % 2 ? ":hourglass_flowing_sand:" : ":hourglass:";
     const elapsed = dur(Date.now() - this.runStartedAt);
+    // Watching mirrors someone else's driving — a distinct prefix so the line
+    // never reads as if Slack started this run.
+    if (this.attached) return `👀 ${this.activity || "watching…"} (${elapsed})`;
     // Post-stall, the watchdog's "no updates for 3m" nudge owns the diagnosis —
     // the ticker just keeps the line visibly alive (distinct wording on purpose).
     if (this.stalled) return `${glass} still working… (${elapsed}) — \`\\stop\` to cancel`;
@@ -915,9 +1108,18 @@ export class SessionView {
     if (this.finalized) return;
     this.finalized = true;
     this.active = false;
+    // A watched run just ended — stop the poll and ungate the thread in the
+    // same breath (watchOnly must never outlive its view).
+    const wasWatch = this.attached;
+    this.stopPolling();
     // Run completed normally — it is no longer an interruption candidate.
+    // One write: clear any tombstone, and lift the watch gate when this was a
+    // watched run (watchOnly must never outlive its view). A second spread of
+    // `cur` here would resurrect a just-cleared tombstone — hence single write.
     const cur = this.state.getThread(this.threadKey);
-    if (cur?.pendingRun) this.state.setThread(this.threadKey, { ...cur, pendingRun: undefined });
+    if (cur && (cur.pendingRun || wasWatch)) {
+      this.state.setThread(this.threadKey, { ...cur, pendingRun: undefined, watchOnly: wasWatch ? false : cur.watchOnly });
+    }
     if (this.ticker) {
       clearInterval(this.ticker);
       this.ticker = null;

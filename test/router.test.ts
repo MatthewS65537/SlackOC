@@ -432,3 +432,56 @@ describe("eyes liveness ack", () => {
     expect(log.posted.some((p) => p.includes("spawn blew up"))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// \watch gate: a watchOnly thread rejects plain replies (RESUME_SESSIONS phase 3)
+
+describe("watchOnly gate", () => {
+  it("rejects plain replies with the takeover hint — no 👀, no prompt, no session create", async () => {
+    let prompts = 0;
+    let created = 0;
+    const client = {
+      session: {
+        promptAsync: async () => {
+          prompts += 1;
+          return { data: {} };
+        },
+        create: async () => {
+          created += 1;
+          return { data: { id: "sess-new" } };
+        },
+      },
+    };
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps("router-watchgate", fakePool(client), fakeRender(log));
+    d.state.setThread("C9:960.001", { sessionId: "sess-watch", projectDir: "/p", verbose: "on", watchOnly: true, createdAt: 1, lastUsedAt: 1 });
+
+    await handleIncomingMessage(ownerMsg("C9", "960.002", "960.001", "hello"), d);
+
+    expect(prompts).toBe(0);
+    expect(created).toBe(0);
+    expect(log.reacted).toEqual([]); // rejected before the liveness ack
+    expect(log.posted.join("\n")).toContain("watch-only");
+    expect(log.posted.join("\n")).toContain("\\resume");
+  });
+
+  it("stops gating once \\resume (or anything) cleared watchOnly", async () => {
+    const client = {
+      session: {
+        promptAsync: async () => ({ data: {} }),
+        messages: async () => ({ data: [] }),
+        get: async () => {
+          throw new Error("no summary");
+        },
+      },
+    };
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps("router-watchgate-off", fakePool(client), fakeRender(log));
+    d.state.setThread("C9:970.001", { sessionId: "sess-now-mine", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 });
+
+    await handleIncomingMessage(ownerMsg("C9", "970.002", "970.001", "hello"), d);
+
+    expect(log.posted.join("\n")).not.toContain("watch-only");
+    expect(log.reacted).toContainEqual(["970.002", "eyes"]);
+  });
+});
