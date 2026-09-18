@@ -55,7 +55,11 @@ curl -fsSL "$TARBALL_URL" -o "$WORK/slackoc.tar.gz" || fail "download failed: $T
 if [ -n "$CHECKSUM_URL" ]; then
   curl -fsSL "$CHECKSUM_URL" -o "$WORK/SHA256SUMS.txt" || fail "checksum download failed: $CHECKSUM_URL"
   EXPECTED="$(awk '{print $1; exit}' "$WORK/SHA256SUMS.txt")"
-  ACTUAL="$( (shasum -a 256 2>/dev/null || sha256sum) "$WORK/slackoc.tar.gz" | awk '{print $1}' )"
+  if command -v shasum >/dev/null 2>&1; then
+    ACTUAL="$(shasum -a 256 "$WORK/slackoc.tar.gz" | awk '{print $1}')"
+  else
+    ACTUAL="$(sha256sum "$WORK/slackoc.tar.gz" | awk '{print $1}')"
+  fi
   [ "$EXPECTED" = "$ACTUAL" ] || fail "checksum mismatch — expected ${EXPECTED}, got ${ACTUAL}"
   echo "✓ checksum verified"
 fi
