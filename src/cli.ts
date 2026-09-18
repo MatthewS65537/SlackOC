@@ -1,6 +1,7 @@
 import { runInit, type InitOptions } from "./init.js";
 import { runDoctor } from "./doctor.js";
 import { startBridge, stopBridge } from "./start.js";
+import { daemonInstall, daemonStatus, daemonUninstall, installedWorkdir } from "./daemon.js";
 import { parseFlags } from "./args.js";
 import { VERSION } from "./version.js";
 
@@ -14,6 +15,10 @@ Usage:
       --dir <path>          non-interactive: default project dir
   slackoc start             start the bridge (runs in foreground)
   slackoc stop              SIGTERM the running bridge
+  slackoc daemon install    run the bridge as a user service (launchd/systemd)
+      --dir <path>          project dir the service binds (default: cwd)
+  slackoc daemon status     is the service loaded/active?
+  slackoc daemon uninstall  remove the service
   slackoc doctor            sanity-check tokens + OpenCode install
   slackoc help              this text
   slackoc --version
@@ -45,6 +50,23 @@ async function main(): Promise<void> {
       parseFlags(rest, []);
       await stopBridge();
       break;
+    case "daemon": {
+      const sub = rest[0];
+      const flags = parseFlags(rest.slice(1), ["dir"]);
+      if (sub === "install") {
+        process.exitCode = await daemonInstall(flags.dir ?? process.cwd());
+      } else if (sub === "uninstall") {
+        process.exitCode = await daemonUninstall();
+      } else if (sub === "status") {
+        const wd = installedWorkdir();
+        if (wd) console.log(`workdir: ${wd}`);
+        process.exitCode = await daemonStatus();
+      } else {
+        console.error("usage: slackoc daemon install [--dir <path>] | status | uninstall");
+        process.exitCode = 2;
+      }
+      break;
+    }
     case "doctor":
       parseFlags(rest, []);
       process.exitCode = await runDoctor();

@@ -49,6 +49,7 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 - **Alive-at-a-glance** — every accepted prompt stamps a 👀 on your message within a second (cleared when ✅/❌ lands), so a dead bridge can never look identical to a slow one
  - **Lost-message catch-up** — Slack discards Socket Mode envelopes it can't deliver (restart gap, network flap, zombie connection) without replaying them; every minute the bridge re-reads active threads from `conversations.replies` and routes anything it missed, so a delivery gap costs latency, never the message itself. Socket connect/disconnect/ping-timeout evidence lands in `\logs`
  - **Post-mortem-able logs** — every log line also lands in a size-rotated `~/.config/slackoc/bridge.log`, so a crash or a 429 storm from before this boot is recoverable; `\logs --follow` tails it live from Slack
+ - **Runs as a service** — `slackoc daemon install` registers a user-level launchd/systemd unit (no sudo) that keeps the bridge alive across reboots and logouts; `daemon status` / `daemon uninstall` manage it
 - **Instant `\` commands, even mid-run** — outbound Slack calls ride a per-channel queue where interactive traffic (command answers, approval prompts, acks) jumps ahead of background stream traffic; a busy run never delays `\help` & co.
 - **Progress bar pinned to the bottom** — the ⏳ indicator re-homes itself below every streamed message, so a long-running task's live status is always the last thing on screen
 - **Multi-project** — not locked to one folder: `\projects`, `\cd /path`, `\new /path`
@@ -62,7 +63,7 @@ Backslash commands run inside Slack but are invisible to the workspace — they 
 1. Install (Node ≥ 20): `curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash` — and have `opencode` ≥ 1.18 on your box.
 2. `slackoc init` — guided: create the Slack app from the bundled manifest, install it, paste the bot token (`xoxb-`) and app-level token (`xapp-`), enter your Slack member ID. Both tokens are validated live against Slack; the member ID is verified (`users:read` scope — already in the manifest). Non-interactive flags for CI: `--bot-token --app-token --owner [--dir]`
 3. `slackoc doctor` — sanity check
-4. `slackoc start` — bridge online
+4. `slackoc start` — bridge online (foreground), or `slackoc daemon install` to run it as a user service (launchd on macOS, systemd user unit on Linux) that survives logout and restarts — no sudo
 5. Open Slack → DM your bot → prompt
 
 Details & troubleshooting: [docs/SETUP.md](docs/SETUP.md).
