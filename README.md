@@ -47,7 +47,8 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 - **Status board in your pocket** — `\status` lists runs in flight (elapsed, queued, thread links); markdown tables from the model render as aligned code blocks
 - **Restart-safe** — a run interrupted by a bridge restart gets its ❌ and a clear notice instead of a frozen "working…" message
 - **Alive-at-a-glance** — every accepted prompt stamps a 👀 on your message within a second (cleared when ✅/❌ lands), so a dead bridge can never look identical to a slow one
-- **Lost-message catch-up** — Slack discards Socket Mode envelopes it can't deliver (restart gap, network flap, zombie connection) without replaying them; every minute the bridge re-reads active threads from `conversations.replies` and routes anything it missed, so a delivery gap costs latency, never the message itself. Socket connect/disconnect/ping-timeout evidence lands in `\logs`
+ - **Lost-message catch-up** — Slack discards Socket Mode envelopes it can't deliver (restart gap, network flap, zombie connection) without replaying them; every minute the bridge re-reads active threads from `conversations.replies` and routes anything it missed, so a delivery gap costs latency, never the message itself. Socket connect/disconnect/ping-timeout evidence lands in `\logs`
+ - **Post-mortem-able logs** — every log line also lands in a size-rotated `~/.config/slackoc/bridge.log`, so a crash or a 429 storm from before this boot is recoverable; `\logs --follow` tails it live from Slack
 - **Instant `\` commands, even mid-run** — outbound Slack calls ride a per-channel queue where interactive traffic (command answers, approval prompts, acks) jumps ahead of background stream traffic; a busy run never delays `\help` & co.
 - **Progress bar pinned to the bottom** — the ⏳ indicator re-homes itself below every streamed message, so a long-running task's live status is always the last thing on screen
 - **Multi-project** — not locked to one folder: `\projects`, `\cd /path`, `\new /path`
@@ -84,6 +85,7 @@ Each thread answers proactively once it has a session — invite the bot to any 
 | `\diff` `\cmd …` | diff summary (`\diff full` adds the unified diff, snippet when long) / OpenCode native command passthrough |
 | `\notify on\|off` | DM the owner when runs in this thread finish (failures + permission asks always DM) |
 | `\logs [filter]` | recent bridge log lines, optionally substring-filtered (`\logs error`) — remote debugging without the console |
+| `\logs --follow [filter]` | stream new log lines into the thread for 30s (`tail -f` from your phone); the persistent rotated log lives at `~/.config/slackoc/bridge.log` |
 | `\restart` | restart this project's opencode server (wedged-run rescue — threads keep their sessions) |
 
 ## Security model

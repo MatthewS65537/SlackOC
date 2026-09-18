@@ -1,19 +1,78 @@
 /**
- * In-memory ring buffer of recent bridge log lines. Lets `\logs` answer
- * "what is the bridge doing?" from Slack when the console is out of reach
- * (the common case for remote deployments). Oldest lines drop out.
+ * Bridge log: an in-memory ring buffer (lets `\logs` answer "what is the
+ * bridge doing?" from Slack) plus an optional persistent file with size
+ * rotation (lets a crash or a yesterday's 429 storm be post-mortemed).
+ * File logging is opt-in via enableFileLog() — the bridge enables it at
+ * boot; tests enable it against a fixture path.
  */
 
-// via bolt (the direct dep) — importing @slack/logger directly would be a phantom dep.
+import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { LogLevel, type Logger } from "@slack/bolt";
+import { CONFIG_DIR } from "./config.js";
+
+export const LOG_PATH = join(CONFIG_DIR, "bridge.log");
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+const LOG_BACKUPS = 2; // bridge.log.1, bridge.log.2
 
 const CAP = 200;
 const buf: string[] = [];
+let fileLog: string | null = null;
+let totalPushed = 0;
+
+/** Start appending to a persistent log file (default: ~/.config/slackoc/bridge.log). */
+export function enableFileLog(path: string = LOG_PATH): void {
+  fileLog = path;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    /* best-effort — a missing dir just means no file log */
+  }
+}
+
+/** The active file-log path, or null when file logging is off. */
+export function fileLogPath(): string | null {
+  return fileLog;
+}
+
+/** Rotate bridge.log → .1 → .2 once it crosses the size cap. */
+function rotateIfNeeded(): void {
+  if (!fileLog) return;
+  if (!existsSync(fileLog) || statSync(fileLog).size < LOG_MAX_BYTES) return;
+  for (let i = LOG_BACKUPS; i >= 1; i--) {
+    const from = i === 1 ? fileLog : `${fileLog}.${i - 1}`;
+    if (existsSync(from)) renameSync(from, `${fileLog}.${i}`);
+  }
+}
 
 export function pushLog(line: string): void {
-  const stamped = `${new Date().toISOString().slice(11, 19)} ${line}`;
+  const now = new Date();
+  const stamped = `${now.toISOString().slice(11, 19)} ${line}`;
   buf.push(stamped);
   if (buf.length > CAP) buf.shift();
+  totalPushed++;
+  if (fileLog) {
+    try {
+      rotateIfNeeded();
+      // Full ISO stamp in the file — a post-mortem spanning days needs dates.
+      appendFileSync(fileLog, `${now.toISOString().replace(/\.\d{3}Z$/, "Z")} ${line}\n`);
+    } catch {
+      /* disk errors must never kill the bridge */
+    }
+  }
+}
+
+/** Total lines pushed since boot — the cursor for `\logs --follow`. */
+export function logCount(): number {
+  return totalPushed;
+}
+
+/** Lines pushed after `cursor` (bounded by the 200-line ring). */
+export function newLogsSince(cursor: number): string[] {
+  const oldest = totalPushed - buf.length + 1; // 1-based index of buf[0]
+  const start = Math.max(cursor + 1, oldest);
+  if (start > totalPushed) return [];
+  return buf.slice(start - oldest);
 }
 
 /**
@@ -70,4 +129,5 @@ export function ringLogger(name = "slack"): Logger {
 /** Test hook. */
 export function clearLogs(): void {
   buf.length = 0;
+  totalPushed = 0;
 }

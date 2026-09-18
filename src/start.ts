@@ -21,7 +21,7 @@ import type { RenderDeps } from "./slack/render.js";
 import { sweepMissedMessages, type CatchupDeps } from "./slack/catchup.js";
 import { GhostDetector } from "./ghosts.js";
 import { enqueue } from "./slack/queue.js";
-import { logErr, pushLog, ringLogger } from "./log.js";
+import { enableFileLog, logErr, pushLog, ringLogger } from "./log.js";
 import { normalizePermission, type OcPermission, type OcQuestionRequest } from "./opencode/api.js";
 
 export interface StartOpts {
@@ -50,6 +50,9 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     logErr(`uncaught exception: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
     process.exit(1);
   });
+  // Persistent log (rotated bridge.log in the config dir) — crashes, ghost
+  // incidents, and 429 storms from before this boot become post-mortem-able.
+  enableFileLog();
   const config = loadConfig();
   if (!config) {
     console.error(`No config at ${CONFIG_PATH} — run \`slackoc init\` first.`);

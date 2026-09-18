@@ -1,6 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { LogLevel } from "@slack/bolt";
-import { clearLogs, logErr, pushLog, recentLogs, ringLogger } from "../src/log.js";
+import {
+  clearLogs,
+  enableFileLog,
+  fileLogPath,
+  logCount,
+  logErr,
+  newLogsSince,
+  pushLog,
+  recentLogs,
+  ringLogger,
+} from "../src/log.js";
+
+// Per-suite fixture dir (the shared .fixtures root races between suites).
+const FIXTURES = join(import.meta.dirname ?? __dirname, ".fixtures", "log");
+const LOG_FILE = join(FIXTURES, "bridge.log");
 
 describe("bridge log ring buffer (\\logs)", () => {
   it("keeps the most recent lines and caps at 200", () => {
@@ -64,5 +80,73 @@ describe("ringLogger (bolt/socket diagnostics → \\logs)", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe("persistent file log (D8)", () => {
+  it("is off by default and appends full-ISO-stamped lines when enabled", () => {
+    rmSync(FIXTURES, { recursive: true, force: true });
+    clearLogs();
+    expect(fileLogPath()).toBeNull();
+    pushLog("no file yet");
+    expect(existsSync(LOG_FILE)).toBe(false);
+
+    mkdirSync(FIXTURES, { recursive: true });
+    enableFileLog(LOG_FILE);
+    expect(fileLogPath()).toBe(LOG_FILE);
+    pushLog("hello file");
+    const content = readFileSync(LOG_FILE, "utf8");
+    // Full ISO date in the file (post-mortems span days), compact HH:MM:SS in the ring.
+    expect(content).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z hello file\n$/);
+    expect(recentLogs(1)[0]).toMatch(/^\d{2}:\d{2}:\d{2} hello file$/);
+  });
+
+  it("rotates .log → .1 → .2 once the size cap is crossed", () => {
+    rmSync(FIXTURES, { recursive: true, force: true });
+    clearLogs();
+    mkdirSync(FIXTURES, { recursive: true });
+    enableFileLog(LOG_FILE);
+    pushLog("seed");
+    // Pad past the 5MB cap in one write instead of 5MB of log lines.
+    writeFileSync(LOG_FILE, "x".repeat(5 * 1024 * 1024 + 1));
+    pushLog("after rotation");
+    expect(existsSync(`${LOG_FILE}.1`)).toBe(true);
+    const fresh = readFileSync(LOG_FILE, "utf8");
+    expect(fresh).toContain("after rotation");
+    expect(fresh.length).toBeLessThan(1024);
+    expect(readFileSync(`${LOG_FILE}.1`, "utf8")).toBe("x".repeat(5 * 1024 * 1024 + 1));
+  });
+
+  it("survives a missing directory (best-effort, never throws)", () => {
+    rmSync(FIXTURES, { recursive: true, force: true });
+    enableFileLog(join(FIXTURES, "bridge.log"));
+    expect(() => pushLog("still fine")).not.toThrow();
+    expect(recentLogs(1)[0]).toContain("still fine");
+  });
+});
+
+describe("follow cursor (\\logs --follow)", () => {
+  it("newLogsSince returns only lines pushed after the cursor", () => {
+    clearLogs();
+    for (let i = 0; i < 5; i++) pushLog(`a${i}`);
+    const cursor = logCount();
+    expect(newLogsSince(cursor)).toEqual([]);
+    pushLog("b0");
+    pushLog("b1");
+    const fresh = newLogsSince(cursor);
+    expect(fresh).toHaveLength(2);
+    expect(fresh[0]).toContain("b0");
+    expect(fresh[1]).toContain("b1");
+    // A stale cursor before the ring window still returns what the ring holds.
+    expect(newLogsSince(0).length).toBe(7);
+  });
+
+  it("clearLogs resets the cursor", () => {
+    clearLogs();
+    pushLog("x");
+    expect(logCount()).toBe(1);
+    clearLogs();
+    expect(logCount()).toBe(0);
+    expect(newLogsSince(0)).toEqual([]);
   });
 });

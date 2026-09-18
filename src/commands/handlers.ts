@@ -25,7 +25,7 @@ import { chunkText, dur, esc, mdToMrkdwn, shortId, shortPath, truncate } from ".
 import type { ThreadState, VerboseMode } from "../state.js";
 import { deleteView, getView, SessionView, describeActiveRuns, finalizeViewsForProject } from "../slack/render.js";
 import { droppedOpCount, oldestPendingAgeMs, queueDepth } from "../slack/queue.js";
-import { recentLogs } from "../log.js";
+import { fileLogPath, logCount, newLogsSince, recentLogs } from "../log.js";
 import { createTwoFilesPatch } from "diff";
 
 function requireThread(ctx: CmdCtx): NonNullable<CmdCtx["thread"]> {
@@ -264,17 +264,46 @@ registerCommand({
 
 registerCommand({
   name: "logs",
-  usage: "\\logs [filter]",
-  summary: "Recent bridge log lines; optional substring filter (`\\logs error`)",
+  usage: "\\logs [filter] | \\logs --follow [filter]",
+  summary: "Recent bridge log lines; `--follow` streams new lines for 30s",
+  detail: "Substrate is the in-memory ring; the persistent file (rotated) lives at the path shown with `--follow`.",
   async run(ctx, args) {
-    const filter = args.trim().toLowerCase();
-    const all = recentLogs(50);
-    const lines = filter ? all.filter((l) => l.toLowerCase().includes(filter)) : all;
-    if (!lines.length) {
-      await ctx.postToThread(filter ? `(no bridge log lines matching \`${args.trim()}\` since this boot)` : "(no bridge log lines captured since this boot)");
+    let follow = false;
+    let rest = args.trim();
+    if (rest.startsWith("--follow")) {
+      follow = true;
+      rest = rest.slice("--follow".length).trim();
+    }
+    const filter = rest.toLowerCase();
+    const match = (l: string) => !filter || l.toLowerCase().includes(filter);
+
+    if (!follow) {
+      const all = recentLogs(50);
+      const lines = all.filter(match);
+      if (!lines.length) {
+        await ctx.postToThread(filter ? `(no bridge log lines matching \`${rest}\` since this boot)` : "(no bridge log lines captured since this boot)");
+        return;
+      }
+      for (const chunk of chunkText(`\`\`\`\n${lines.join("\n")}\n\`\`\``)) await ctx.postToThread(chunk);
       return;
     }
-    for (const chunk of chunkText(`\`\`\`\n${lines.join("\n")}\n\`\`\``)) await ctx.postToThread(chunk);
+
+    // Follow: recent context, then stream new lines ~1/s for 30s.
+    const path = fileLogPath();
+    const recent = recentLogs(10).filter(match);
+    const head = `📡 Following bridge log for 30s${filter ? ` (filter: \`${rest}\`)` : ""}${path ? ` — file: \`${path}\`` : ""}\n\`\`\`\n${recent.join("\n")}\n\`\`\``;
+    for (const chunk of chunkText(head)) await ctx.postToThread(chunk);
+    let cursor = logCount();
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const fresh = newLogsSince(cursor).filter(match);
+      cursor = logCount();
+      if (fresh.length) {
+        for (const chunk of chunkText(`\`\`\`\n${fresh.join("\n")}\n\`\`\``)) await ctx.postToThread(chunk);
+      }
+    }
+    await ctx.postToThread("⏹ Follow ended (30s).");
   },
 });
 
