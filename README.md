@@ -48,6 +48,8 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 - **Restart-safe** — a run interrupted by a bridge restart gets its ❌ and a clear notice instead of a frozen "working…" message
 - **Alive-at-a-glance** — every accepted prompt stamps a 👀 on your message within a second (cleared when ✅/❌ lands), so a dead bridge can never look identical to a slow one
 - **Lost-message catch-up** — Slack discards Socket Mode envelopes it can't deliver (restart gap, network flap, zombie connection) without replaying them; every minute the bridge re-reads active threads from `conversations.replies` and routes anything it missed, so a delivery gap costs latency, never the message itself. Socket connect/disconnect/ping-timeout evidence lands in `\logs`
+- **Instant `\` commands, even mid-run** — outbound Slack calls ride a per-channel queue where interactive traffic (command answers, approval prompts, acks) jumps ahead of background stream traffic; a busy run never delays `\help` & co.
+- **Progress bar pinned to the bottom** — the ⏳ indicator re-homes itself below every streamed message, so a long-running task's live status is always the last thing on screen
 - **Multi-project** — not locked to one folder: `\projects`, `\cd /path`, `\new /path`
 - **Native command passthrough** — `\cmd <opencode command>`, plus model (`\model <#>`) and agent (`\agent <#|name>`) swaps
 - **Owner-only security** — the bot obeys exactly one paired Slack user ID; everyone else is ignored

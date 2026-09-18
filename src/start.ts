@@ -88,32 +88,35 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     logLevel: LogLevel.INFO,
   });
 
-  // All outbound Slack calls go through the shared FIFO (slack/queue.ts):
-  // ~1/s pacing, Retry-After backoff, and a per-op timeout so one stalled
-  // call can never freeze everything queued behind it.
+  // All outbound Slack calls go through the per-channel, two-tier queue
+  // (slack/queue.ts): ~1/s pacing per channel lane, interactive ops ahead of
+  // background stream traffic, a shared 429 brake, and a per-op timeout so
+  // one stalled call can never freeze its lane.
   let dmChannelId: string | null = null; // owner DM channel, opened post-auth
   let teamUrl: string | undefined; // for thread permalinks in DMs
   const render: RenderDeps = {
     post: async (channel, threadTs, text, blocks, opts) => {
-      const r = await enqueue(() =>
-        app.client.chat.postMessage({
-          channel,
-          thread_ts: threadTs,
-          text,
-          mrkdwn: true,
-          ...(blocks ? { blocks } : {}),
-          // System chatter (tool lines, status, summaries) stays compact —
-          // no big link preview cards. Answer text keeps previews (default).
-          ...(opts?.unfurl === false ? { unfurl_links: false, unfurl_media: false } : {}),
-        }),
+      const r = await enqueue(
+        () =>
+          app.client.chat.postMessage({
+            channel,
+            thread_ts: threadTs,
+            text,
+            mrkdwn: true,
+            ...(blocks ? { blocks } : {}),
+            // System chatter (tool lines, status, summaries) stays compact —
+            // no big link preview cards. Answer text keeps previews (default).
+            ...(opts?.unfurl === false ? { unfurl_links: false, unfurl_media: false } : {}),
+          }),
+        { channel, lane: opts?.lane },
       );
       return { ts: r.ts as string };
     },
     update: async (channel, ts, text) => {
-      await enqueue(() => app.client.chat.update({ channel, ts, text }));
+      await enqueue(() => app.client.chat.update({ channel, ts, text }), { channel });
     },
     delete: async (channel, ts) => {
-      await enqueue(() => app.client.chat.delete({ channel, ts }));
+      await enqueue(() => app.client.chat.delete({ channel, ts }), { channel });
     },
     // Reactions don't order with messages, so they bypass the FIFO: the 👀
     // liveness ack and the ✅/❌ outcome land instantly instead of queueing
@@ -125,19 +128,21 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     unreact: async (channel, ts, name) => {
       await app.client.reactions.remove({ channel, timestamp: ts, name });
     },
-    upload: async ({ channelId, threadTs, filename, content, file, comment }) => {
-      await enqueue(() =>
-        app.client.filesUploadV2({
-          channel_id: channelId,
-          thread_ts: threadTs,
-          filename,
-          ...(file ? { file } : { content: content ?? "" }),
-          initial_comment: comment,
-          title: filename,
-        }),
+    upload: async ({ channelId, threadTs, filename, content, file, comment, lane }) => {
+      await enqueue(
+        () =>
+          app.client.filesUploadV2({
+            channel_id: channelId,
+            thread_ts: threadTs,
+            filename,
+            ...(file ? { file } : { content: content ?? "" }),
+            initial_comment: comment,
+            title: filename,
+          }),
+        { channel: channelId, lane },
       );
     },
-    dm: async (channel, threadTs, text, blocks) => {
+    dm: async (channel, threadTs, text, blocks, opts) => {
       if (!dmChannelId) throw new Error("owner DM channel unavailable");
       // Hand-rolled permalink to the thread, so a DM is one tap from context.
       const link = teamUrl ? `\n<${teamUrl}archives/${channel}/p${threadTs.replace(".", "")}|view thread>` : "";
@@ -151,13 +156,15 @@ export async function startBridge(opts: StartOpts): Promise<void> {
             : b,
         );
       }
-      const r = await enqueue(() =>
-        app.client.chat.postMessage({
-          channel: dmChannelId!,
-          text: `${text}${link}`,
-          mrkdwn: true,
-          ...(outBlocks ? { blocks: outBlocks } : {}),
-        }),
+      const r = await enqueue(
+        () =>
+          app.client.chat.postMessage({
+            channel: dmChannelId!,
+            text: `${text}${link}`,
+            mrkdwn: true,
+            ...(outBlocks ? { blocks: outBlocks } : {}),
+          }),
+        { channel: dmChannelId!, lane: opts?.lane },
       );
       return { ts: r.ts as string };
     },
@@ -294,11 +301,11 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     const [channel, threadTs] = bound.key.split(":") as [string, string];
     const header = `:rotating_light: *OpenCode wants permission* — ${perm.type}:${perm.title}`;
     const blocks = permissionBlocks(perm) as never;
-    // Through the FIFO: a raw post here would both bypass pacing (429 risk)
-    // and allow this message to overtake posts queued ahead of it.
+    // Interactive lane: the run is BLOCKED on this ask — the owner is
+    // actively waiting on it, so it jumps ahead of background stream traffic.
     let askTs: string | null = null;
     try {
-      askTs = (await render.post(channel, threadTs, header, blocks, { unfurl: false })).ts;
+      askTs = (await render.post(channel, threadTs, header, blocks, { unfurl: false, lane: "interactive" })).ts;
     } catch {
       /* thread ask failed — DM below may still reach the owner */
     }
@@ -306,7 +313,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     // this is the only notification that a run is blocked waiting for approval.
     let dmTs: string | null = null;
     try {
-      dmTs = (await render.dm?.(channel, threadTs, header, blocks))?.ts ?? null;
+      dmTs = (await render.dm?.(channel, threadTs, header, blocks, { lane: "interactive" }))?.ts ?? null;
     } catch {
       pushLog(`permission DM failed (${perm.id}): DM channel unavailable`);
     }
@@ -355,15 +362,16 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     const [channel, threadTs] = bound.key.split(":") as [string, string];
     const header = `❓ *OpenCode has a question* — ${req.questions.length} to answer`;
     const blocks = questionBlocks(req, []) as never;
+    // Interactive lane: the run is BLOCKED on this question (like permissions).
     let askTs: string | null = null;
     try {
-      askTs = (await render.post(channel, threadTs, header, blocks, { unfurl: false })).ts;
+      askTs = (await render.post(channel, threadTs, header, blocks, { unfurl: false, lane: "interactive" })).ts;
     } catch {
       /* thread ask failed — DM below may still reach the owner */
     }
     let dmTs: string | null = null;
     try {
-      dmTs = (await render.dm?.(channel, threadTs, header, blocks))?.ts ?? null;
+      dmTs = (await render.dm?.(channel, threadTs, header, blocks, { lane: "interactive" }))?.ts ?? null;
     } catch {
       pushLog(`question DM failed (${req.id}): DM channel unavailable`);
     }
@@ -658,20 +666,33 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       const entry = await pool.ensure(bound.thread.projectDir);
       const diffs = await sessionDiff(entry.client!, sessionId);
       if (!diffs.length) {
-        await enqueue(() => app.client.chat.postMessage({ channel: dmChannelId!, text: "(no tracked edits in that session)" }));
+        // Interactive: the owner just tapped the button and is waiting.
+        await enqueue(() => app.client.chat.postMessage({ channel: dmChannelId!, text: "(no tracked edits in that session)" }), {
+          channel: dmChannelId!,
+          lane: "interactive",
+        });
         return;
       }
       const body2 = buildUnifiedDiff(diffs);
       const summary = formatDiffSummary(diffs);
-      await enqueue(() =>
-        app.client.chat.postMessage({
-          channel: dmChannelId!,
-          text: body2 && body2.length <= 3500 ? `${summary}\n\`\`\`diff\n${body2}\n\`\`\`` : summary,
-        }),
+      await enqueue(
+        () =>
+          app.client.chat.postMessage({
+            channel: dmChannelId!,
+            text: body2 && body2.length <= 3500 ? `${summary}\n\`\`\`diff\n${body2}\n\`\`\`` : summary,
+          }),
+        { channel: dmChannelId!, lane: "interactive" },
       );
       if (body2 && body2.length > 3500) {
-        await enqueue(() =>
-          app.client.filesUploadV2({ channel_id: dmChannelId!, filename: `session-${sessionId.slice(4, 14)}.diff`, content: body2.slice(0, 200_000), title: "session diff" }),
+        await enqueue(
+          () =>
+            app.client.filesUploadV2({
+              channel_id: dmChannelId!,
+              filename: `session-${sessionId.slice(4, 14)}.diff`,
+              content: body2.slice(0, 200_000),
+              title: "session diff",
+            }),
+          { channel: dmChannelId!, lane: "interactive" },
         );
       }
     } catch (err) {
@@ -696,8 +717,11 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       const out: SlackMsg[] = [];
       let cursor: string | undefined;
       do {
-        const r = (await enqueue(() =>
-          app.client.conversations.replies({ channel, ts: rootTs, oldest, inclusive: false, limit: 100, ...(cursor ? { cursor } : {}) }),
+        // Background: the 60s sweep can fan out across ~10 threads — it must
+        // never hold up commands/prompts in their channels (issue #5).
+        const r = (await enqueue(
+          () => app.client.conversations.replies({ channel, ts: rootTs, oldest, inclusive: false, limit: 100, ...(cursor ? { cursor } : {}) }),
+          { channel, lane: "background" },
         )) as { messages?: unknown[]; response_metadata?: { next_cursor?: string } };
         out.push(...((r.messages ?? []) as SlackMsg[]));
         cursor = r.response_metadata?.next_cursor || undefined;
@@ -741,7 +765,8 @@ export async function startBridge(opts: StartOpts): Promise<void> {
           threadTs,
           ":warning: bridge restarted — the run in progress here was interrupted. Resend your prompt to retry.",
           undefined,
-          { unfurl: false },
+          // Interactive: the owner needs this notice NOW, not behind a backlog.
+          { unfurl: false, lane: "interactive" },
         )
         .catch(() => {});
       state.clearPendingRun(key);

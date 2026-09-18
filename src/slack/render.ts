@@ -4,7 +4,8 @@ import type { StateStore, ThreadState, VerboseMode } from "../state.js";
 import { viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
 import { chunkText, dur, mdToMrkdwn, money, shortId, shortPath, tok, truncate } from "../util.js";
-import { queueDepth } from "./queue.js";
+import { laneDepth } from "./queue.js";
+import type { SlackLane } from "./queue.js";
 
 export interface RenderDeps {
   post(
@@ -12,7 +13,7 @@ export interface RenderDeps {
     threadTs: string,
     text: string,
     blocks?: unknown[],
-    opts?: { unfurl?: boolean },
+    opts?: { unfurl?: boolean; lane?: SlackLane },
   ): Promise<{ ts: string }>;
   update(channel: string, ts: string, text: string): Promise<void>;
   delete(channel: string, ts: string): Promise<void>;
@@ -26,13 +27,14 @@ export interface RenderDeps {
     /** Binary payloads (images) — takes precedence over `content`. */
     file?: Buffer;
     comment?: string;
+    lane?: SlackLane;
   }): Promise<void>;
   /**
    * DM the owner about something that happened in (channel, threadTs) — the
    * remote pager: failures always, completions when \notify is on, permission
    * asks mirrored with their buttons. Absent when DMs are unavailable.
    */
-  dm?(channel: string, threadTs: string, text: string, blocks?: unknown[]): Promise<{ ts: string }>;
+  dm?(channel: string, threadTs: string, text: string, blocks?: unknown[], opts?: { lane?: SlackLane }): Promise<{ ts: string }>;
 }
 
 const registry = new Map<string, SessionView>();
@@ -237,12 +239,21 @@ export class SessionView {
   private tickInFlight = false;
   /**
    * Set by any thread-content post while a run is active. Slack can't reorder
-   * messages, so once content lands BELOW the live-status line the next tick
-   * re-posts the status at the bottom (delete + post) instead of updating in
-   * place — keeping the indicator visible on long tool-heavy runs (issue #4).
+   * messages, so once content lands BELOW the live-status line the bar is
+   * re-posted at the bottom (delete + post) — STRICT bottom (issue #6): every
+   * content post schedules a sink via maybeSink(), coalesced by sinkInFlight.
    * Cleared on a successful sink and reset per run in beginPrompt.
    */
   private contentBelow = false;
+  /** Serializes sink rounds — at most one post→adopt→delete in flight. */
+  private sinkInFlight = false;
+  /**
+   * Circuit breaker for the strict sink: when this channel's lane is deep in
+   * queued work (a torrent run), skip the sink attempt — the bar trails until
+   * the next content post instead of burying the lane (and the run's final
+   * summary) behind dozens of stale sink pairs.
+   */
+  private static readonly SINK_MAX_LANE_DEPTH = 8;
   /**
    * Set by the watchdog after a true stall: the ticker keeps re-rendering a
    * "still working" stall line (instead of the stale activity) until any SSE
@@ -361,8 +372,11 @@ export class SessionView {
   async start(): Promise<void> {
     if (this.statusTs) return;
     this.lastSection = null;
+    // Interactive: the run's ack message — the user is staring at the thread
+    // waiting for it; it must not queue behind background stream traffic.
     const { ts } = await this.deps.post(this.channel, this.threadTs, ":hourglass: OpenCode is on it…", undefined, {
       unfurl: false,
+      lane: "interactive",
     });
     this.statusTs = ts;
   }
@@ -430,12 +444,15 @@ export class SessionView {
       this.state.setThread(this.threadKey, { ...cur, pendingRun: { userMsgTs: tombstones, statusTs: this.statusTs ?? undefined } });
     }
     if (wasActive) {
+      // Interactive: this ack directly answers the user's just-sent message.
       await this.deps
         .post(this.channel, this.threadTs, ":hourglass: Queued — runs after the current task.", undefined, {
           unfurl: false,
+          lane: "interactive",
         })
         .catch(() => {});
       this.contentBelow = true; // the ack landed below the status line
+      this.maybeSink();
     }
   }
 
@@ -772,44 +789,81 @@ export class SessionView {
 
   private tick(): void {
     if (this.finalized || this.statusTs == null || this.tickInFlight) return;
-    // Yield when the FIFO has real work queued: a command reply / ack / content
-    // post ahead of us is more time-sensitive than a status re-render, and the
-    // next beat is 1s away regardless. The ticker's OWN in-flight update is
-    // already drained out of the queue by the time this runs, so this only
-    // fires for OTHER work — exactly the contention we want to shed (issue #3).
-    if (queueDepth() > 0) return;
-    this.tickInFlight = true;
-    this.tickSeen += 1;
-    const text = this.statusText();
-    if (this.contentBelow) {
-      // Content landed below the status line. Slack can't reorder messages, so
-      // re-post the status at the BOTTOM (delete the old one only after the new
-      // one is live) to keep the indicator visible (issue #4). On a failed post
-      // we keep the old status + the flag and retry on the next beat.
-      const oldTs = this.statusTs;
-      void this.deps
-        .post(this.channel, this.threadTs, text, undefined, { unfurl: false })
-        .then(({ ts }) => {
-          // finalize() may have run while the post was in flight (it clears the
-          // ticker and deletes the then-current statusTs). If so, the message we
-          // just posted is an orphan — delete it rather than re-adopting it.
-          if (this.finalized) return this.deps.delete(this.channel, ts).catch(() => {});
-          this.statusTs = ts;
-          this.contentBelow = false;
-          return this.deps.delete(this.channel, oldTs).catch(() => {});
-        })
-        .catch(() => {})
-        .finally(() => {
-          this.tickInFlight = false;
-        });
+    // The sink owns the beat whenever the bar isn't at the bottom (issue #6):
+    // re-homing it IS this second's refresh — a same-second re-render on top
+    // would double-post. Sinks are never gated on queue depth; the round-1 #4
+    // design gated them inside the ticker, so any sustained queue traffic
+    // pinned the bar to the top for the whole run.
+    if (this.contentBelow || this.sinkInFlight) {
+      this.maybeSink();
       return;
     }
+    // Yield when THIS channel's lane has real work queued: a command reply /
+    // content post ahead of us is more time-sensitive than a status
+    // re-render, and the next beat is 1s away regardless (issue #3). Only the
+    // plain re-render yields — the sink above never does.
+    if (laneDepth(this.channel) > 0) return;
+    this.tickInFlight = true;
+    this.tickSeen += 1;
     void this.deps
-      .update(this.channel, this.statusTs, text)
+      .update(this.channel, this.statusTs, this.statusText())
       .catch(() => {})
       .finally(() => {
         this.tickInFlight = false;
       });
+  }
+
+  /**
+   * Re-home the live-status message to the bottom of the thread (STRICT,
+   * issue #6 — user decision over a 4s throttle). Every content post lands
+   * below the bar, so each schedules this: post a fresh status at the bottom,
+   * adopt its ts, delete the old one. Coalesced by sinkInFlight (bursts chain
+   * back-to-back rounds via the finally re-check, never overlapping); the
+   * lane-depth circuit breaker makes torrents trail the bar instead of
+   * burying the lane in stale sink pairs. On a failed post the old status and
+   * the flag stay — the next content post (or tick) retries.
+   */
+  private maybeSink(): void {
+    if (this.finalized || this.statusTs == null || this.sinkInFlight || !this.contentBelow) return;
+    if (laneDepth(this.channel) > SessionView.SINK_MAX_LANE_DEPTH) return;
+    this.sinkInFlight = true;
+    // The flag is CONSUMED up front so content landing mid-flight re-arms it
+    // for the chase below (clearing it at completion would clobber exactly
+    // that evidence and strand the bar above newer content).
+    this.contentBelow = false;
+    this.tickSeen += 1; // a sink is a visible refresh — keep the glass alternating
+    const text = this.statusText();
+    const oldTs = this.statusTs;
+    void this.deps
+      .post(this.channel, this.threadTs, text, undefined, { unfurl: false })
+      .then(({ ts }) => {
+        // finalize() may have run while the post was in flight (it deletes the
+        // then-current statusTs). If so, the message we just posted is an
+        // orphan — delete it rather than re-adopting it.
+        if (this.finalized) return this.deps.delete(this.channel, ts).catch(() => {});
+        this.statusTs = ts;
+        // The crash-recovery tombstone must point at the LIVE bar: a bridge
+        // death after a sink would otherwise leave the boot interrupt sweep
+        // deleting a stale ts and missing this one (orphaned "still working").
+        this.syncTombstoneStatusTs();
+        return this.deps.delete(this.channel, oldTs).catch(() => {});
+      })
+      .catch(() => {
+        this.contentBelow = true; // the sink failed — retry on a later beat/post
+      })
+      .finally(() => {
+        this.sinkInFlight = false;
+        // Content landed while we were re-homing — keep chasing (strict bottom).
+        this.maybeSink();
+      });
+  }
+
+  /** Keep the interrupt sweep's tombstone pointed at the live status message. */
+  private syncTombstoneStatusTs(): void {
+    if (this.statusTs == null) return;
+    const cur = this.state.getThread(this.threadKey);
+    if (!cur?.pendingRun || cur.pendingRun.statusTs === this.statusTs) return;
+    this.state.setThread(this.threadKey, { ...cur, pendingRun: { ...cur.pendingRun, statusTs: this.statusTs } });
   }
 
   private statusText(): string {
@@ -864,7 +918,11 @@ export class SessionView {
       undefined,
       { unfurl: s === "tools" ? false : undefined },
     );
-    this.contentBelow = true; // content landed below the live-status line
+    // Mark the bar as above-content — the SINK is scheduled by the outermost
+    // content emitter (postThreadText / handleTool / postFilePart / queued
+    // ack) after its LAST message, so the bar re-homes cleanly below a whole
+    // logical step instead of splitting a tools→answer pair mid-flight.
+    this.contentBelow = true;
   }
 
   /** Emit buffered tool lines as a single tools-section message (atomic with the divider). */
@@ -974,6 +1032,7 @@ export class SessionView {
           this.toolBuf.push(this.toolLine(part, title));
           if (this.toolBuf.length >= 8 || this.toolBuf.join("\n").length > 2000) {
             await this.flushTools();
+            this.maybeSink(); // tool lines landed below the bar — re-home it
           }
         }
         return;
@@ -999,6 +1058,7 @@ export class SessionView {
             } else {
               await this.postSection("tools", `\`\`\`${out.slice(0, 3700)}\`\`\``);
             }
+            this.maybeSink(); // output landed below the bar — re-home it
           }
         }
         return;
@@ -1011,6 +1071,7 @@ export class SessionView {
           await this.flushTools(); // buffered start lines precede the failure
           // tool failures belong in the tools section
           await this.postSection("tools", `⚠️ ${title} failed: ${truncate(errText ?? "unknown", 400)}`);
+          this.maybeSink(); // the failure line landed below the bar — re-home it
         }
         return;
       }
@@ -1055,6 +1116,10 @@ export class SessionView {
           undefined,
           { unfurl: false },
         )
+        .then(() => {
+          this.contentBelow = true; // the error notice landed below the bar
+          this.maybeSink();
+        })
         .catch(() => {});
       return;
     }
@@ -1065,7 +1130,10 @@ export class SessionView {
     // Divider must precede the upload — post it with a tiny banner comment as
     // its own message when a section flip is due (uploads can't join text).
     const divider = this.enterSection("response");
-    if (divider) await this.deps.post(this.channel, this.threadTs, divider, undefined, { unfurl: false });
+    if (divider) {
+      await this.deps.post(this.channel, this.threadTs, divider, undefined, { unfurl: false });
+      this.contentBelow = true; // the divider landed below the bar
+    }
     await this.deps.upload({
       channelId: this.channel,
       threadTs: this.threadTs,
@@ -1074,6 +1142,7 @@ export class SessionView {
       comment: `:framed_picture: ${filename} received.`,
     });
     this.contentBelow = true; // the upload landed below the live-status line
+    this.maybeSink(); // last message of this emit step — re-home the bar now
   }
 
   async postThreadText(text: string): Promise<void> {
@@ -1092,7 +1161,10 @@ export class SessionView {
     await this.postSection("response", first);
     for (const chunk of chunks) {
       await this.deps.post(this.channel, this.threadTs, chunk);
+      this.contentBelow = true; // continuation chunk landed below the bar
     }
+    // Last message of this emit step — strict bottom: the bar chases now.
+    this.maybeSink();
   }
 
   async finalize(err?: string): Promise<void> {

@@ -285,10 +285,12 @@ function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = nul
     bridgeInfo: d.bridgeInfo,
     threadUrl: d.threadUrl,
     postToThread: async (extra) => {
-      await d.render.post(msg.channel, threadTs, extra, undefined, { unfurl: false });
+      // Interactive: command replies are what the user is actively waiting
+      // for — they jump ahead of queued background stream traffic (issue #5).
+      await d.render.post(msg.channel, threadTs, extra, undefined, { unfurl: false, lane: "interactive" });
     },
     uploadToThread: async (filename, content) => {
-      await d.render.upload({ channelId: msg.channel, threadTs, filename, content });
+      await d.render.upload({ channelId: msg.channel, threadTs, filename, content, lane: "interactive" });
     },
     react: async (name, add = true) => {
       await reactLogged(d.render, msg.channel, msg.ts, name, add);
@@ -351,12 +353,13 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: 
   let ackTs: string | null = null;
   if (!thread || !getView(thread.sessionId)) {
     try {
+      // Interactive: this is the prompt's ack — the user is watching for it.
       const ack = await d.render.post(
         msg.channel,
         threadTs,
         ":hourglass: OpenCode is on it…",
         undefined,
-        { unfurl: false },
+        { unfurl: false, lane: "interactive" },
       );
       ackTs = ack.ts;
     } catch {
@@ -430,7 +433,7 @@ async function failBoot(msg: SlackMsg, d: BridgeDeps, ackTs: string | null, err:
       threadRootTs(msg),
       `:x: prompt failed: ${truncate(String((err as Error)?.message ?? err), 200)}`,
       undefined,
-      { unfurl: false },
+      { unfurl: false, lane: "interactive" },
     )
     .catch(() => {});
 }

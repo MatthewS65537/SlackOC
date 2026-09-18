@@ -24,7 +24,7 @@ import { invalidatePickerCache, pickerList, pickerResolve, renderPickerList, typ
 import { chunkText, dur, esc, mdToMrkdwn, shortId, shortPath, truncate } from "../util.js";
 import type { ThreadState, VerboseMode } from "../state.js";
 import { deleteView, getView, SessionView, describeActiveRuns, finalizeViewsForProject } from "../slack/render.js";
-import { droppedOpCount, queueDepth } from "../slack/queue.js";
+import { droppedOpCount, oldestPendingAgeMs, queueDepth } from "../slack/queue.js";
 import { recentLogs } from "../log.js";
 import { createTwoFilesPatch } from "diff";
 
@@ -182,7 +182,10 @@ registerCommand({
     }
     const qd = queueDepth();
     const dropped = droppedOpCount();
-    if (qd || dropped) lines.push(`*Slack queue:* ${qd} pending · ${dropped} dropped`);
+    // Oldest-op age is the queue-health signal: a high number = the bridge is
+    // behind (a torrent run or a slow Slack); a low one = replies are snappy.
+    const oldest = qd ? oldestPendingAgeMs() : 0;
+    if (qd || dropped) lines.push(`*Slack queue:* ${qd} pending${oldest ? ` (oldest ${dur(oldest)})` : ""} · ${dropped} dropped`);
     await ctx.postToThread(lines.join("\n"));
   },
 });

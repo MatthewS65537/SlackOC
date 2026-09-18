@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { homedir } from "node:os";
 import { getCommand, allCommands, execute, registerCommand, type CmdCtx } from "../src/commands/registry.js";
 import { newThreadState, HELP_SECTIONS } from "../src/commands/handlers.js";
@@ -759,6 +759,27 @@ describe("remote-work round 3 (Sep 2026)", () => {
     const ctx = baseCtx(state, out, null, { pool: { list: () => [] } as never });
     await getCommand("status")!.run(ctx, "");
     expect(out.join("\n")).not.toContain("Runs in flight");
+  });
+
+  it("\\status shows the Slack queue line with the oldest pending op's age (C2)", async () => {
+    const { enqueue, _resetQueueForTests, queueDepth } = await import("../src/slack/queue.js");
+    vi.useFakeTimers();
+    _resetQueueForTests();
+    try {
+      // A stuck op occupies C9's drain; a second op queues behind it.
+      void enqueue(() => new Promise(() => {}), { channel: "C9" }).catch(() => {});
+      void enqueue(() => Promise.resolve(), { channel: "C9" }).catch(() => {});
+      await vi.advanceTimersByTimeAsync(1_000); // drain picks the stuck op; pending op ages ≥1s
+      expect(queueDepth()).toBe(1);
+      const state = new StateStore(`${import.meta.dirname}/.fixtures/status-queue/state.json`);
+      const out: string[] = [];
+      const ctx = baseCtx(state, out, null, { pool: { list: () => [] } as never });
+      await getCommand("status")!.run(ctx, "");
+      expect(out.join("\n")).toMatch(/\*Slack queue:\* 1 pending \(oldest .+?\) · 0 dropped/);
+    } finally {
+      _resetQueueForTests();
+      vi.useRealTimers();
+    }
   });
 
   it("\\logs [filter] narrows the ring buffer (RQ4)", async () => {

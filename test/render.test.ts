@@ -65,6 +65,7 @@ interface ViewOpts {
   verbose?: "off" | "on" | "full";
   client?: OCClient;
   statusTs?: string;
+  deps?: RenderDeps;
 }
 
 function makeView(log: CallLog, sessionId: string, opts: ViewOpts = {}): SessionView {
@@ -76,7 +77,7 @@ function makeView(log: CallLog, sessionId: string, opts: ViewOpts = {}): Session
     threadTs: "T1",
     threadKey: "C1:T1",
     client: opts.client ?? ({} as never),
-    deps: fakeDeps(log),
+    deps: opts.deps ?? fakeDeps(log),
     state,
     threadState: { sessionId, projectDir: "/p", verbose: opts.verbose ?? "off", createdAt: 1, lastUsedAt: 1 },
     statusTs: opts.statusTs,
@@ -907,6 +908,30 @@ describe("SessionView pendingRun tombstone (interrupt sweep)", () => {
     expect(state.getThread("C1:T1")?.pendingRun?.userMsgTs).toEqual(["111.960", "111.961"]);
     deleteView("sess-pr-b");
   });
+
+  it("a status sink keeps the tombstone pointed at the LIVE bar (C1: #6 bookkeeping)", async () => {
+    vi.useFakeTimers();
+    _resetQueueForTests();
+    try {
+      const log = blank();
+      const { state, v } = seededView(log, "sess-pr-sink");
+      await v.beginPrompt("111.sink");
+      expect(state.getThread("C1:T1")?.pendingRun?.statusTs).toBe("status-1");
+      // Content lands below the bar → strict sink re-homes it → the tombstone
+      // must track the NEW ts or a crash would orphan the live bar.
+      await v.handle({
+        type: "message.part.updated",
+        properties: { part: { id: "p1", messageID: "m1", type: "text", text: "answer", time: { end: 1 } } },
+      } as never);
+      await vi.advanceTimersByTimeAsync(0); // sink round: post → adopt → sync tombstone → delete old
+      expect(state.getThread("C1:T1")?.pendingRun?.statusTs).toBe("status-3");
+      expect(log.deleted).toContain("status-1");
+      deleteView("sess-pr-sink");
+    } finally {
+      _resetQueueForTests();
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("SessionView event pipeline errors surface visibly", () => {
@@ -1278,22 +1303,22 @@ describe("SessionView postThreadText trim (#1)", () => {
   });
 });
 
-// ─── #3: tick() yields when the FIFO has work ───────────────────────────────
+// ─── #3: tick() yields when the channel lane has work ──────────────────────
 
-describe("SessionView tick yields to queue (#3)", () => {
-  it("tick() does not update when queueDepth() > 0", async () => {
+describe("SessionView tick yields to its channel lane (#3)", () => {
+  it("tick() does not re-render when this channel's lane has queued work", async () => {
     vi.useFakeTimers();
     _resetQueueForTests();
     const queueMod = await import("../src/slack/queue.js");
-    const spy = vi.spyOn(queueMod, "queueDepth").mockReturnValue(1);
+    const spy = vi.spyOn(queueMod, "laneDepth").mockReturnValue(1);
     try {
       const log = blank();
       const v = makeView(log, "sess-qdepth-a", { verbose: "on" });
       await v.beginPrompt("111.qd1");
-      // Advance one tick — should be skipped because queueDepth() returns 1
+      // Advance one tick — skipped because laneDepth() returns 1
       await vi.advanceTimersByTimeAsync(1_100);
       expect(log.updates).toEqual([]);
-      // Now let the queue drain
+      // Lane drains — the re-render resumes on the next beat
       spy.mockReturnValue(0);
       await vi.advanceTimersByTimeAsync(1_100);
       expect(log.updates.length).toBeGreaterThanOrEqual(1);
@@ -1306,71 +1331,161 @@ describe("SessionView tick yields to queue (#3)", () => {
   });
 });
 
-// ─── #4: contentBelow sink (status re-posts at bottom) ─────────────────────
+// ─── #6: strict-bottom sink (status re-homes below EVERY content post) ─────
 
-describe("SessionView contentBelow sink (#4)", () => {
-  it("after content posts below the status, the next tick re-posts status at the bottom and deletes the old", async () => {
+/** A text part that posts immediately through the event chain. */
+function textPart(id: string, text: string) {
+  return {
+    type: "message.part.updated",
+    properties: { part: { id, messageID: `${id}-msg`, type: "text", text, time: { end: 1 } } },
+  } as never;
+}
+
+/**
+ * Deps where every hourglass-text post after the initial ack waits on a
+ * manual gate — lets a test land more content while a sink is in flight.
+ */
+function gateableStatusPosts(log: CallLog): { deps: RenderDeps; release: () => Promise<void>; maxActive: () => number } {
+  let open: () => void = () => {};
+  let gate = newPromise();
+  function newPromise(): Promise<void> {
+    return new Promise<void>((r) => (open = r));
+  }
+  let active = 0;
+  let max = 0;
+  const deps = fakeDeps(log);
+  const basePost = deps.post;
+  deps.post = async (c, t, text, blocks, opts) => {
+    if (text.includes(":hourglass") && log.posted.length > 0) {
+      active += 1;
+      max = Math.max(max, active);
+      await gate;
+      active -= 1;
+    }
+    return basePost(c, t, text, blocks, opts);
+  };
+  return {
+    deps,
+    release: async () => {
+      open();
+      // Let the released chain reach the NEXT sink's gate before proceeding —
+      // each sink round is post→adopt→delete, all microtasks with fake timers.
+      await vi.advanceTimersByTimeAsync(0);
+    },
+    maxActive: () => max,
+  };
+}
+
+describe("SessionView strict-bottom sink (#6)", () => {
+  it("a content post re-homes the status bar to the bottom immediately — no tick, no idle-queue gate", async () => {
     vi.useFakeTimers();
+    _resetQueueForTests();
     try {
       const log = blank();
-      const v = makeView(log, "sess-sink-a", { verbose: "on" });
-      await v.beginPrompt("111.sink1");
-      // The status message was posted (status-1)
-      expect(log.posted.length).toBe(1);
-      const oldStatusTs = log.posted[0] ? "status-1" : null;
-
-      // Post some content (a tool line) which sets contentBelow = true
-      await v.handle({
-        type: "message.part.updated",
-        properties: { part: { id: "s1", type: "tool", tool: "bash", callID: "s1c", state: { status: "running", input: { command: "ls" } } } },
-      } as never);
-      // Tool lines are buffered — flush via finalize to trigger postSection
-      // Actually, let's use a text part which posts immediately
-      deleteView("sess-sink-a");
-
-      const log2 = blank();
-      const v2 = makeView(log2, "sess-sink-b", { verbose: "on" });
-      await v2.beginPrompt("111.sink2");
-      // Post a text part — this goes through postThreadText → postSection → sets contentBelow
-      await v2.handle({
-        type: "message.part.updated",
-        properties: { part: { id: "t1", messageID: "tm", type: "text", text: "some answer", time: { end: 1 } } },
-      } as never);
-      // The content post should have set contentBelow
-      // Now advance one tick — the sink should post a new status + delete the old
-      await vi.advanceTimersByTimeAsync(1_100);
-      // The sink posts a new status message and deletes the old one
-      expect(log2.posted.length).toBeGreaterThanOrEqual(2); // original status + content + new status
-      expect(log2.deleted.length).toBe(1); // old status deleted
-      // The new status should be the last posted message
-      const lastPosted = log2.posted.at(-1);
-      expect(lastPosted).toMatch(/:hourglass/);
+      const v = makeView(log, "sess-sink-b", { verbose: "on" });
+      await v.beginPrompt("111.sink2");
+      expect(log.posted).toHaveLength(1); // the initial status ack
+      await v.handle(textPart("t1", "some answer"));
+      // Flush the sink chain (post → adopt → delete). NO clock advance: this
+      // is the #4/#3 regression — the sink must not wait for a quiet tick.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(log.posted).toHaveLength(3); // ack + content + re-homed bar
+      expect(log.posted[1]).toContain("some answer");
+      expect(log.posted.at(-1)).toMatch(/:hourglass/); // bar is bottom-most
+      expect(log.deleted).toEqual(["status-1"]);
       deleteView("sess-sink-b");
     } finally {
+      _resetQueueForTests();
       vi.useRealTimers();
     }
   });
 
-  it("finalize clears contentBelow so no further sink posts occur", async () => {
+  it("back-to-back content coalesces to one sink round at a time, and the bar catches the last post", async () => {
     vi.useFakeTimers();
+    _resetQueueForTests();
+    try {
+      const log = blank();
+      const gated = gateableStatusPosts(log);
+      const v = makeView(log, "sess-sink-c", { verbose: "on", deps: gated.deps });
+      await v.beginPrompt("111.sink3");
+      await v.handle(textPart("t1", "answer one")); // sink round 1 starts, gated mid-flight
+      await v.handle(textPart("t2", "answer two")); // its maybeSink() no-ops behind the in-flight round
+      expect(gated.maxActive()).toBe(1); // never two overlapping status posts
+      await gated.release(); // round 1 adopts; contentBelow re-armed → round 2 follows
+      await vi.advanceTimersByTimeAsync(0);
+      const bars = log.posted.filter((p) => p.includes(":hourglass"));
+      expect(bars).toHaveLength(3); // ack + 2 chase rounds (one after each content)
+      expect(log.posted.at(-1)).toMatch(/:hourglass/); // ends strictly at the bottom
+      expect(gated.maxActive()).toBe(1);
+      deleteView("sess-sink-c");
+    } finally {
+      _resetQueueForTests();
+      vi.useRealTimers();
+    }
+  });
+
+  it("the lane-depth circuit breaker defers the sink while the lane is deep in queued work", async () => {
+    vi.useFakeTimers();
+    _resetQueueForTests();
+    const queueMod = await import("../src/slack/queue.js");
+    const spy = vi.spyOn(queueMod, "laneDepth").mockReturnValue(9); // > SINK_MAX_LANE_DEPTH (8)
+    try {
+      const log = blank();
+      const v = makeView(log, "sess-sink-brk", { verbose: "on" });
+      await v.beginPrompt("111.brk");
+      await v.handle(textPart("t1", "answer one"));
+      await vi.advanceTimersByTimeAsync(2_000); // ticks fire; every sink attempt hits the breaker
+      expect(log.posted.filter((p) => p.includes(":hourglass"))).toHaveLength(1); // ack only — no sink
+      // The lane drains — the NEXT content post re-homes the bar.
+      spy.mockReturnValue(0);
+      await v.handle(textPart("t2", "answer two"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(log.posted.filter((p) => p.includes(":hourglass"))).toHaveLength(2);
+      expect(log.posted.at(-1)).toMatch(/:hourglass/);
+      deleteView("sess-sink-brk");
+    } finally {
+      spy.mockRestore();
+      _resetQueueForTests();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a sink post landing after finalize deletes itself (orphan guard)", async () => {
+    vi.useFakeTimers();
+    _resetQueueForTests();
+    try {
+      const log = blank();
+      const gated = gateableStatusPosts(log);
+      const v = makeView(log, "sess-sink-orph", { verbose: "on", deps: gated.deps });
+      await v.beginPrompt("111.orph");
+      await v.handle(textPart("t1", "answer")); // sink starts, gated mid-flight
+      await v.finalize(); // deletes the old bar, posts the summary (status-3, not gated)
+      await gated.release(); // the mid-flight post lands NOW (status-4) — stale
+      expect(log.deleted).toEqual(["status-1", "status-4"]); // old bar (finalize) + orphan (guard)
+      deleteView("sess-sink-orph");
+    } finally {
+      _resetQueueForTests();
+      vi.useRealTimers();
+    }
+  });
+
+  it("no sink posts happen after finalize (the pre-finalize chase already settled)", async () => {
+    vi.useFakeTimers();
+    _resetQueueForTests();
     try {
       const log = blank();
       const v = makeView(log, "sess-sink-d", { verbose: "on" });
       await v.beginPrompt("111.sink4");
-      // Post content to set contentBelow
-      await v.handle({
-        type: "message.part.updated",
-        properties: { part: { id: "t3", messageID: "tm3", type: "text", text: "content", time: { end: 1 } } },
-      } as never);
-      // Finalize — clears the ticker and sets finalized
+      await v.handle(textPart("t3", "content"));
+      await vi.advanceTimersByTimeAsync(0); // the sink round completes BEFORE finalize
+      const barsBefore = log.posted.filter((p) => p.includes(":hourglass")).length;
+      expect(barsBefore).toBe(2); // ack + re-homed bar (strict bottom at work)
       await v.finalize();
-      // Advance well past a tick interval — no further sink posts should occur
       await vi.advanceTimersByTimeAsync(3_000);
-      // Only the initial status + content + finalize summary were posted; no extra sink re-posts
-      const statusPosts = log.posted.filter((p) => p.includes(":hourglass"));
-      expect(statusPosts.length).toBe(1); // just the original beginPrompt status
+      expect(log.posted.filter((p) => p.includes(":hourglass"))).toHaveLength(barsBefore);
       deleteView("sess-sink-d");
     } finally {
+      _resetQueueForTests();
       vi.useRealTimers();
     }
   });
