@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { App, LogLevel } from "@slack/bolt";
+import { App, LogLevel, type RespondFn } from "@slack/bolt";
 import { loadConfig, PID_PATH, CONFIG_PATH, STATE_PATH } from "./config.js";
 import { StateStore } from "./state.js";
 import { ServerPool } from "./opencode/server.js";
@@ -12,7 +12,6 @@ import {
   questionBlocks,
   VIEW_DIFF_ACTION,
   type PermButtonValue,
-  type QuestionButtonValue,
 } from "./slack/blocks.js";
 import { handleIncomingMessage, type BridgeDeps, type SlackMsg } from "./slack/router.js";
 import { buildUnifiedDiff, formatDiffSummary } from "./commands/handlers.js";
@@ -241,15 +240,23 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   /** Live permission asks, so an answer can update BOTH the thread and DM copies. */
   const permAsks = new Map<string, { channel: string; threadTs: string; askTs: string | null; dmTs: string | null }>();
 
-  /**
-   * Live question asks. `req` is the full stored ask (options resolved from
-   * here, not from the button value); `answers` accumulates one label-array
-   * per question as the owner taps — when every question has one, we reply.
-   */
-  const quesAsks = new Map<
-    string,
-    { req: OcQuestionRequest; answers: string[][]; channel: string; threadTs: string; askTs: string | null; dmTs: string | null }
-  >();
+   /**
+    * Live question asks. `req` is the full stored ask (options resolved from
+    * here, not from the button value); `answers` accumulates one label-array
+    * per question; `finalized` marks which questions are locked in (a
+    * multi-select's toggles don't count until submitted). When every question
+    * is finalized, we reply.
+    */
+   type QuestionAsk = {
+     req: OcQuestionRequest;
+     answers: string[][];
+     finalized: boolean[];
+     channel: string;
+     threadTs: string;
+     askTs: string | null;
+     dmTs: string | null;
+   };
+   const quesAsks = new Map<string, QuestionAsk>();
 
   async function onPoolEvent(dir: string, eventType: string, props: Record<string, unknown>): Promise<void> {
     try {
@@ -378,7 +385,15 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     } catch {
       pushLog(`question DM failed (${req.id}): DM channel unavailable`);
     }
-    quesAsks.set(req.id, { req, answers: req.questions.map(() => []), channel, threadTs, askTs, dmTs });
+    quesAsks.set(req.id, {
+      req,
+      answers: req.questions.map(() => []),
+      finalized: req.questions.map(() => false),
+      channel,
+      threadTs,
+      askTs,
+      dmTs,
+    });
     if (quesAsks.size > 200) {
       const first = quesAsks.keys().next().value;
       if (first) quesAsks.delete(first);
@@ -574,49 +589,83 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   // question) or Skip. Labels are resolved from the stored ask, so the button
   // value stays tiny. When every question is answered we send the full matrix;
   // the SSE question.replied/rejected echo then collapses both copies too.
-  app.action("question", async ({ ack, body, action, client, respond }) => {
-    await ack();
+  // Re-render BOTH copies (thread + owner DM) of a live ask with fresh blocks.
+  const renderAskBoth = (
+    ask: { channel: string; askTs: string | null; dmTs: string | null },
+    blocks: unknown[],
+  ): Promise<unknown>[] => {
+    const one = (ch: string, ts: string) =>
+      app.client.chat.update({ channel: ch, ts, text: "OpenCode question", blocks: blocks as never }).catch(() => {});
+    const u: Promise<unknown>[] = [];
+    if (ask.askTs) u.push(one(ask.channel, ask.askTs));
+    if (ask.dmTs && dmChannelId) u.push(one(dmChannelId, ask.dmTs));
+    return u;
+  };
+
+  // If every question is finalized, send the answer matrix and resolve the ask;
+  // otherwise re-render both copies. "failed" = the reply errored (re-rendered
+  // so the owner can retry or Skip) — the caller surfaces the ephemeral notice.
+  const submitAskIfComplete = async (ask: QuestionAsk, url: string): Promise<"replied" | "incomplete" | "failed"> => {
+    if (!ask.req.questions.every((_, qi) => ask.finalized[qi])) {
+      await Promise.all(renderAskBoth(ask, questionBlocks(ask.req, ask.answers, ask.finalized)));
+      return "incomplete";
+    }
+    try {
+      await questionReply(url, ask.req.id, ask.answers);
+    } catch (err) {
+      logErr(`question reply failed: ${String((err as Error)?.message ?? err)}`);
+      await Promise.all(renderAskBoth(ask, questionBlocks(ask.req, ask.answers, ask.finalized)));
+      return "failed";
+    }
+    await onQuestionResolved(ask.req.id, "replied");
+    return "replied";
+  };
+
+  // Shared owner/bound/ask/entry guard for the question action handlers.
+  const questionGuard = async (
+    body: { user: { id: string } },
+    raw: string | undefined,
+    respond: RespondFn,
+  ): Promise<{ v: { s: string; q: string; i: number; a?: number }; ask: QuestionAsk; url: string } | null> => {
     if (body.user.id !== config.ownerSlackUserId) {
       await respond({ text: "Only the paired owner can answer OpenCode questions.", response_type: "ephemeral" }).catch(() => {});
-      return;
+      return null;
     }
-    const raw = (action as { value?: string }).value;
-    if (!raw) return;
-    let v: QuestionButtonValue;
+    if (!raw) return null;
+    let parsed: { s: string; q: string; i: number; a?: number };
     try {
-      v = JSON.parse(raw) as QuestionButtonValue;
+      parsed = JSON.parse(raw) as { s: string; q: string; i: number; a?: number };
     } catch {
-      return;
+      return null;
     }
-    const bound = state.findThreadBySession(v.s);
+    const bound = state.findThreadBySession(parsed.s);
     if (!bound) {
       await respond({ text: "That session is no longer tracked here.", response_type: "ephemeral" }).catch(() => {});
-      return;
+      return null;
     }
-    const ask = quesAsks.get(v.q);
+    const ask = quesAsks.get(parsed.q);
     if (!ask) {
       await respond({ text: "That question is no longer tracked here.", response_type: "ephemeral" }).catch(() => {});
-      return;
+      return null;
     }
     const entry = await pool.ensure(bound.thread.projectDir);
     if (!entry.url) {
       await respond({ text: "The OpenCode server isn't ready yet — try again in a moment.", response_type: "ephemeral" }).catch(() => {});
-      return;
+      return null;
     }
-    // Re-render BOTH copies (thread + owner DM) with the current answer matrix.
-    const updateBoth = (blocks: unknown[]): Promise<unknown>[] => {
-      const one = (ch: string, ts: string) =>
-        client.chat.update({ channel: ch, ts, text: "OpenCode question", blocks: blocks as never }).catch(() => {});
-      const u: Promise<unknown>[] = [];
-      if (ask.askTs) u.push(one(ask.channel, ask.askTs));
-      if (ask.dmTs && dmChannelId) u.push(one(dmChannelId, ask.dmTs));
-      return u;
-    };
+    return { v: parsed, ask, url: entry.url };
+  };
+
+  app.action("question", async ({ ack, body, action, respond }) => {
+    await ack();
+    const g = await questionGuard(body, (action as { value?: string }).value, respond);
+    if (!g) return;
+    const { v, ask, url } = g;
 
     if (v.a === -1) {
       // Skip (reject): unblock the run, collapse both copies to a final line.
       try {
-        await questionReject(entry.url, v.q);
+        await questionReject(url, v.q);
       } catch (err) {
         logErr(`question reject failed: ${String((err as Error)?.message ?? err)}`);
         await respond({ text: `Failed to skip the question: ${String(err)}`, response_type: "ephemeral" }).catch(() => {});
@@ -626,26 +675,110 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       return;
     }
 
-    // Option tap: record the label for this question (single-select: one tap).
-    const label = ask.req.questions[v.i]?.options[v.a]?.label;
-    if (label == null) return;
-    ask.answers[v.i] = [label];
-    if (!ask.req.questions.every((_, qi) => ask.answers[qi]?.length)) {
-      // More questions open — re-render both copies (answered ones collapse).
-      await Promise.all(updateBoth(questionBlocks(ask.req, ask.answers)));
+    const q = ask.req.questions[v.i!];
+    const label = q?.options[v.a!]?.label;
+    if (!q || label == null) return;
+
+    if (q.multiple) {
+      // Multi-select: toggle this option in/out; "Submit selection" finalizes.
+      const cur = ask.answers[v.i!]!;
+      const idx = cur.indexOf(label);
+      if (idx >= 0) cur.splice(idx, 1);
+      else cur.push(label);
+      await Promise.all(renderAskBoth(ask, questionBlocks(ask.req, ask.answers, ask.finalized)));
       return;
     }
-    // All answered — send the full matrix, then collapse both copies.
+
+    // Single-select: one tap locks the answer, then submit-if-complete.
+    ask.answers[v.i!] = [label];
+    ask.finalized[v.i!] = true;
+    const r = await submitAskIfComplete(ask, url);
+    if (r === "failed") {
+      await respond({ text: "Failed to send your answer — try again or Skip.", response_type: "ephemeral" }).catch(() => {});
+    }
+  });
+
+  app.action("qsubmit", async ({ ack, body, action, respond }) => {
+    await ack();
+    const g = await questionGuard(body, (action as { value?: string }).value, respond);
+    if (!g) return;
+    const { v, ask, url } = g;
+    if (!ask.answers[v.i!]?.length) {
+      await respond({ text: "Pick at least one option before submitting.", response_type: "ephemeral" }).catch(() => {});
+      return;
+    }
+    ask.finalized[v.i!] = true;
+    const r = await submitAskIfComplete(ask, url);
+    if (r === "failed") {
+      await respond({ text: "Failed to send your answer — try again or Skip.", response_type: "ephemeral" }).catch(() => {});
+    }
+  });
+
+  app.action("qtext", async ({ ack, body, action, client, respond }) => {
+    await ack();
+    const g = await questionGuard(body, (action as { value?: string }).value, respond);
+    if (!g) return;
+    const { v, ask } = g;
+    const q = ask.req.questions[v.i!];
+    if (!q) return;
+    // Open a modal; the answer comes back through the qtext_submit view.
+    // (trigger_id lives on the BlockAction body, not the DialogSubmit variant.)
+    const triggerId = (body as { trigger_id?: string }).trigger_id;
+    if (!triggerId) return;
+    await client.views
+      .open({
+        trigger_id: triggerId,
+        view: {
+          type: "modal",
+          callback_id: "qtext_submit",
+          title: { type: "plain_text", text: q.header },
+          blocks: [
+            {
+              type: "input",
+              block_id: "qtext_input",
+              label: { type: "plain_text", text: q.question },
+              optional: false,
+              element: {
+                type: "plain_text_input",
+                action_id: "qtext_field",
+                placeholder: { type: "plain_text", text: "Type your answer…" },
+              },
+            },
+          ],
+          private_metadata: JSON.stringify({ s: v.s, q: v.q, i: v.i }),
+        },
+      })
+      .catch((err) => logErr(`question modal failed: ${String((err as Error)?.message ?? err)}`));
+  });
+
+  app.view("qtext_submit", async ({ ack, body, view, respond }) => {
+    await ack();
+    if (body.user.id !== config.ownerSlackUserId) {
+      await respond({ text: "Only the paired owner can answer OpenCode questions.", response_type: "ephemeral" }).catch(() => {});
+      return;
+    }
+    let v: { s: string; q: string; i: number };
     try {
-      await questionReply(entry.url, v.q, ask.answers);
-    } catch (err) {
-      logErr(`question reply failed: ${String((err as Error)?.message ?? err)}`);
-      await respond({ text: `Failed to send your answer: ${String(err)}`, response_type: "ephemeral" }).catch(() => {});
-      // Keep it tracked + re-render so the owner can retry or Skip.
-      await Promise.all(updateBoth(questionBlocks(ask.req, ask.answers)));
+      v = JSON.parse(view.private_metadata ?? "") as { s: string; q: string; i: number };
+    } catch {
       return;
     }
-    await onQuestionResolved(v.q, "replied");
+    const text = String(view.state?.values?.qtext_input?.qtext_field?.value ?? "").trim();
+    if (!text) {
+      await respond({ text: "Answer can't be empty.", response_type: "ephemeral" }).catch(() => {});
+      return;
+    }
+    const bound = state.findThreadBySession(v.s);
+    const ask = quesAsks.get(v.q);
+    if (!bound || !ask) return;
+    const entry = await pool.ensure(bound.thread.projectDir);
+    if (!entry.url) return;
+    ask.answers[v.i] = [text];
+    ask.finalized[v.i] = true;
+    const r = await submitAskIfComplete(ask, entry.url);
+    if (r === "failed") {
+      await respond({ text: "Failed to send your answer — try again or Skip.", response_type: "ephemeral" }).catch(() => {});
+    }
   });
 
   // RF1: "📄 View diff" button on completion DMs → post the session's diff

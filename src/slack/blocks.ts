@@ -78,49 +78,94 @@ export interface QuestionButtonValue {
   a: number; // option index, or -1 for Skip (reject)
 }
 
+/** Payload for the multi-select "Submit selection" and free-text buttons. */
+export interface QuestionActionValue {
+  s: string; // sessionId
+  q: string; // requestId
+  i: number; // question index
+}
+
 /**
  * Block Kit for a parked question. `answers` is the current matrix (one
- * label-array per question, in order) so already-answered questions collapse
- * to a ✅ line while the rest keep their buttons — regenerated in place on
- * every tap, the same technique the permission result update uses.
+ * label-array per question, in order); `finalized` marks which questions are
+ * locked in (single-select tap, multi-select submit, or free-text entry) —
+ * finalized questions collapse to a ✅ line while the rest keep their buttons.
+ * Regenerated in place on every tap, the same technique the permission result
+ * update uses. Defaults `finalized` to "has an answer" so single-select callers
+ * (and tests) can omit it.
  */
-export function questionBlocks(req: OcQuestionRequest, answers: string[][]): unknown[] {
+export function questionBlocks(req: OcQuestionRequest, answers: string[][], finalized?: boolean[]): unknown[] {
   const n = req.questions.length;
+  const done = finalized ?? answers.map((a) => a.length > 0);
   const blocks: unknown[] = [
     { type: "section", text: { type: "mrkdwn", text: "❓ *OpenCode has a question*" } },
   ];
   req.questions.forEach((q, qi) => {
-    const picked = answers[qi];
-    if (picked && picked.length) {
+    if (done[qi]) {
       blocks.push({
         type: "section",
-        text: { type: "mrkdwn", text: `✅ *Q${qi + 1}/${n} — ${esc(q.header)}*: ${esc(picked.join(", "))}` },
+        text: { type: "mrkdwn", text: `✅ *Q${qi + 1}/${n} — ${esc(q.header)}*: ${esc((answers[qi] ?? []).join(", "))}` },
       });
       return;
     }
+    const picked = answers[qi] ?? [];
     const lines = [`*Q${qi + 1}/${n} — ${esc(q.header)}*`, esc(q.question)];
     q.options.forEach((o, oi) => {
       lines.push(`${oi + 1}. ${esc(o.label)}${o.description ? ` — ${esc(o.description)}` : ""}`);
     });
     blocks.push({ type: "section", text: { type: "mrkdwn", text: lines.join("\n") } });
     // One button per option; Slack caps an actions row at 5, so pathological
-    // >5-option questions spill into additional rows.
-    const buttons = q.options.map((o, oi) => ({
-      type: "button",
-      text: { type: "plain_text", text: o.label },
-      action_id: "question",
-      value: JSON.stringify({ s: req.sessionID, q: req.id, i: qi, a: oi } satisfies QuestionButtonValue),
-    }));
-    for (let start = 0; start < buttons.length; start += 5) {
+    // >5-option questions spill into additional rows. Multi-select highlights
+    // already-toggled options (primary) and appends a "Submit selection" row;
+    // free-text appends a "Type your answer…" row that opens a modal.
+    const optionButtons = q.options.map((o, oi) => {
+      const b: Record<string, unknown> = {
+        type: "button",
+        text: { type: "plain_text", text: o.label },
+        action_id: "question",
+        value: JSON.stringify({ s: req.sessionID, q: req.id, i: qi, a: oi } satisfies QuestionButtonValue),
+      };
+      if (q.multiple && picked.includes(o.label)) b.style = "primary";
+      return b;
+    });
+    for (let start = 0; start < optionButtons.length; start += 5) {
       blocks.push({
         type: "actions",
         block_id: `ques_${req.id}_${qi}_${Math.floor(start / 5)}`,
-        elements: buttons.slice(start, start + 5),
+        elements: optionButtons.slice(start, start + 5),
+      });
+    }
+    if (q.multiple) {
+      blocks.push({
+        type: "actions",
+        block_id: `ques_submit_${req.id}_${qi}`,
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "Submit selection" },
+            style: "primary",
+            action_id: "qsubmit",
+            value: JSON.stringify({ s: req.sessionID, q: req.id, i: qi } satisfies QuestionActionValue),
+          },
+        ],
+      });
+    } else if (q.custom) {
+      blocks.push({
+        type: "actions",
+        block_id: `ques_text_${req.id}_${qi}`,
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "✍️ Type your answer…" },
+            action_id: "qtext",
+            value: JSON.stringify({ s: req.sessionID, q: req.id, i: qi } satisfies QuestionActionValue),
+          },
+        ],
       });
     }
   });
   // Skip (reject) row — only while something is still open.
-  if (req.questions.some((q, qi) => !(answers[qi]?.length))) {
+  if (req.questions.some((_, qi) => !done[qi])) {
     blocks.push({
       type: "actions",
       block_id: `ques_skip_${req.id}`,

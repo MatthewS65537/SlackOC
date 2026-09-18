@@ -192,3 +192,75 @@ describe("questionBlocks", () => {
     expect(qSection).toContain("Vue — Progressive");
   });
 });
+
+// ─── questionBlocks: multi-select + free-text (D6) ───────────────────────────
+
+type El = { type: string; text?: { text: string }; action_id?: string; value?: string; style?: string };
+type Block = { type: string; block_id?: string; elements?: El[] };
+const rows = (blocks: unknown[]) => blocks.filter((b) => (b as Block).type === "actions") as Block[];
+
+describe("questionBlocks multi-select", () => {
+  const multiReq = () =>
+    makeReq({ questions: [{ question: "Pick toppings?", header: "Toppings", multiple: true, options: [{ label: "Pepperoni", description: "" }, { label: "Mushroom", description: "" }, { label: "Olives", description: "" }] }] });
+
+  it("renders option buttons plus a 'Submit selection' row (qsubmit)", () => {
+    const blocks = questionBlocks(multiReq(), []);
+    const actionRows = rows(blocks);
+    // 3 options in one row + a submit row + skip row = 3 action rows
+    expect(actionRows.length).toBe(3);
+    const submit = actionRows.find((r) => r.block_id === "ques_submit_q-1_0");
+    expect(submit).toBeDefined();
+    expect(submit!.elements![0]!.text!.text).toBe("Submit selection");
+    expect(submit!.elements![0]!.action_id).toBe("qsubmit");
+    const sv = JSON.parse(submit!.elements![0]!.value!) as { s: string; q: string; i: number };
+    expect(sv).toEqual({ s: "sess-1", q: "q-1", i: 0 });
+    // Option buttons still use the "question" action id.
+    const optRow = actionRows.find((r) => r.block_id === "ques_q-1_0_0");
+    expect(optRow!.elements!.every((e) => e.action_id === "question")).toBe(true);
+  });
+
+  it("highlights toggled options (primary) but stays open until finalized", () => {
+    const blocks = questionBlocks(multiReq(), [["Pepperoni", "Olives"]], [false]);
+    const optRow = rows(blocks).find((r) => r.block_id === "ques_q-1_0_0")!;
+    const byLabel = (l: string) => optRow.elements!.find((e) => e.text!.text === l)!;
+    expect(byLabel("Pepperoni").style).toBe("primary");
+    expect(byLabel("Olives").style).toBe("primary");
+    expect(byLabel("Mushroom").style).toBeUndefined();
+    // Not finalized → still shows the submit row and the skip row.
+    expect(rows(blocks).some((r) => r.block_id === "ques_submit_q-1_0")).toBe(true);
+    expect(rows(blocks).some((r) => r.block_id === "ques_skip_q-1")).toBe(true);
+  });
+
+  it("collapses to a ✅ line once finalized (even with a partial selection)", () => {
+    const blocks = questionBlocks(multiReq(), [["Pepperoni"]], [true]);
+    expect(blocks.length).toBe(2); // header + ✅ (no buttons, no skip)
+    const done = (blocks[1] as { text: { text: string } }).text.text;
+    expect(done).toContain("✅");
+    expect(done).toContain("Pepperoni");
+  });
+});
+
+describe("questionBlocks free-text", () => {
+  const customReq = () =>
+    makeReq({ questions: [{ question: "Any notes for the reviewer?", header: "Notes", custom: true, options: [] }] });
+
+  it("renders a 'Type your answer…' button (qtext) with no option buttons", () => {
+    const blocks = questionBlocks(customReq(), []);
+    const actionRows = rows(blocks);
+    // qtext row + skip row = 2 (no option buttons — options is empty)
+    expect(actionRows.length).toBe(2);
+    const textRow = actionRows.find((r) => r.block_id === "ques_text_q-1_0");
+    expect(textRow).toBeDefined();
+    expect(textRow!.elements![0]!.text!.text).toBe("✍️ Type your answer…");
+    expect(textRow!.elements![0]!.action_id).toBe("qtext");
+    const tv = JSON.parse(textRow!.elements![0]!.value!) as { s: string; q: string; i: number };
+    expect(tv).toEqual({ s: "sess-1", q: "q-1", i: 0 });
+  });
+
+  it("collapses once finalized with the typed answer", () => {
+    const blocks = questionBlocks(customReq(), [["ship it"]], [true]);
+    const done = (blocks[1] as { text: { text: string } }).text.text;
+    expect(done).toContain("✅");
+    expect(done).toContain("ship it");
+  });
+});
