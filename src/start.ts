@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
-import { App, LogLevel, type RespondFn } from "@slack/bolt";
+import { App, LogLevel, SocketModeReceiver, type RespondFn } from "@slack/bolt";
 import { loadConfig, PID_PATH, CONFIG_PATH, STATE_PATH } from "./config.js";
 import { StateStore } from "./state.js";
 import { ServerPool } from "./opencode/server.js";
-import { permRespond, sessionDiff, pendingQuestions, questionReply, questionReject } from "./opencode/client.js";
+import { permRespond, sessionDiff, sessionMessages, pendingQuestions, pendingPermissions, questionReply, questionReject } from "./opencode/client.js";
 import { noteSessionActivity } from "./commands/picker.js";
 import {
   permissionBlocks,
@@ -15,13 +16,15 @@ import {
 } from "./slack/blocks.js";
 import { handleIncomingMessage, type BridgeDeps, type SlackMsg } from "./slack/router.js";
 import { buildUnifiedDiff, formatDiffSummary } from "./commands/handlers.js";
-import { finalizeViewsForProject, getView, hasActiveViewForProject, reconcileStaleViews } from "./slack/render.js";
+import { finalizeViewsForProject, getView, hasActiveViewForProject, reconcileStaleViews, setProjectConnectionState, describeActiveRuns, deleteView } from "./slack/render.js";
 import type { RenderDeps } from "./slack/render.js";
 import { sweepMissedMessages, type CatchupDeps } from "./slack/catchup.js";
 import { GhostDetector } from "./ghosts.js";
 import { enqueue } from "./slack/queue.js";
+import { slackWebClientOptions, SLACK_UPLOAD_TIMEOUT_MS } from "./slack/transport.js";
+import { boundedShutdown, startManagedRuntime, stopManagedService } from "./service.js";
 import { enableFileLog, logErr, pushLog, ringLogger } from "./log.js";
-import { normalizePermission, type OcPermission, type OcQuestionRequest } from "./opencode/api.js";
+import { normalizePermission, type OcPermission, type OcQuestionRequest, type OcMessageInfo } from "./opencode/api.js";
 
 export interface StartOpts {
   cwd: string;
@@ -35,20 +38,6 @@ const RECONCILE_INTERVAL_MS = 60_000;
 const RECONCILE_STALE_MS = 120_000;
 
 export async function startBridge(opts: StartOpts): Promise<void> {
-  // A stray async bug must never silently kill the one process whose whole
-  // job is answering Slack (Node's default for unhandled rejections is to
-  // crash). Surface it in \logs and keep serving.
-  process.on("unhandledRejection", (err) => {
-    logErr(`unhandled rejection: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
-  });
-  // A SYNC throw through the event loop leaves the process in an undefined
-  // state — die LOUDLY instead: the stack lands in bridge.log via logErr (a
-  // detached daemon must be noticed, not limp half-wedged). After exit the
-  // pidfile is stale; claimPidfile replaces it on the next start.
-  process.on("uncaughtException", (err) => {
-    logErr(`uncaught exception: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
-    process.exit(1);
-  });
   // Persistent log (rotated bridge.log in the config dir) — crashes, ghost
   // incidents, and 429 storms from before this boot become post-mortem-able.
   enableFileLog();
@@ -73,6 +62,41 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  const runtime = startManagedRuntime();
+  const cleanup: Array<() => void | Promise<unknown>> = [];
+  const lifetime = new AbortController();
+  let stopping = false;
+  const finishShutdown = boundedShutdown(async () => {
+    console.error("\nslackoc stopping…");
+    for (const { sessionId } of describeActiveRuns()) deleteView(sessionId);
+    await Promise.allSettled(cleanup.map((close) => Promise.resolve().then(close)));
+  }, (code) => {
+    runtime.close();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    process.off("uncaughtException", onException);
+    process.off("unhandledRejection", onRejection);
+    if (readPid(PID_PATH) === process.pid) rmSync(PID_PATH, { force: true });
+    process.exit(code);
+  });
+  const shutdown = (code = 0) => {
+    stopping = true;
+    lifetime.abort(new Error("bridge stopping"));
+    return finishShutdown(code);
+  };
+  const onSignal = () => { void shutdown(); };
+  const onException = (err: Error) => {
+    logErr(`uncaught exception: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
+    void shutdown(1);
+  };
+  const onRejection = (err: unknown) => {
+    logErr(`unhandled rejection: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  process.on("uncaughtException", onException);
+  process.on("unhandledRejection", onRejection);
+  try {
   const state = new StateStore(STATE_PATH);
   // The launch cwd owns the default project on EVERY start. currentProjectDir
   // persists across runs (set by \cd / \new / \project), so it must not be
@@ -80,15 +104,27 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   // the default mid-run; existing threads keep their own bound dir.
   state.setCurrentProject(opts.cwd);
 
+  const clientOptions: typeof slackWebClientOptions = {
+    ...slackWebClientOptions,
+    fetch: (url, init) => slackWebClientOptions.fetch!(url, {
+      ...init, signal: AbortSignal.any([lifetime.signal, ...(init?.signal ? [init.signal] : [])]),
+    }),
+  };
+  const receiver = new SocketModeReceiver({
+    appToken: config.slackAppToken, logger: ringLogger(), logLevel: LogLevel.INFO,
+    installerOptions: { clientOptions },
+  });
   const app = new App({
     token: config.slackBotToken,
-    appToken: config.slackAppToken,
+    receiver,
     socketMode: true,
+    clientOptions,
     // Socket layer diagnostics (connect/disconnect/ping timeouts) go to \logs,
     // not an unwatched console — the first thing to check when inbound stops.
     logger: ringLogger(),
     logLevel: LogLevel.INFO,
   });
+  cleanup.push(() => app.stop());
 
   // All outbound Slack calls go through the per-channel, two-tier queue
   // (slack/queue.ts): ~1/s pacing per channel lane, interactive ops ahead of
@@ -98,6 +134,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   let teamUrl: string | undefined; // for thread permalinks in DMs
   const render: RenderDeps = {
     post: async (channel, threadTs, text, blocks, opts) => {
+      if (stopping) throw new Error("bridge stopping");
       const r = await enqueue(
         () =>
           app.client.chat.postMessage({
@@ -141,7 +178,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
             initial_comment: comment,
             title: filename,
           }),
-        { channel: channelId, lane },
+        { channel: channelId, lane, timeoutMs: SLACK_UPLOAD_TIMEOUT_MS, retryRateLimits: false },
       );
     },
     dm: async (channel, threadTs, text, blocks, opts) => {
@@ -172,16 +209,17 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     },
   };
 
-  // Seen permission IDs so duplicates (SSE reconnect replays, plus our own
-  // answer echoing back as permission.replied) don't repost the same ask.
-  const seenPerms = new Set<string>();
-  /** Pending permission-ask nudges — cleared when the owner answers. */
+  // Resolved IDs are tombstones for this bridge lifetime, not delivery dedup.
+  // Keep them even after removing the live ask so old polls/replays cannot revive it.
+  const resolvedPerms = new Set<string>();
+  const resolvedQuestions = new Set<string>();
   const permNudges = new Map<string, NodeJS.Timeout>();
-  // Same dedupe/nudge pattern for the question tool (issue #2): a parked
-  // question blocks its run server-side, so a missed/replayed ask must not
-  // repost, and a sitting ask gets the same two 3-min nudges as permissions.
-  const seenQuestions = new Set<string>();
   const quesNudges = new Map<string, NodeJS.Timeout>();
+  const interactionVersions = new Map<string, number>();
+  const interactionSweeps = new Map<string, { flight: Promise<void>; requested: boolean }>();
+  const interactionChanged = (dir: string): void => {
+    interactionVersions.set(dir, (interactionVersions.get(dir) ?? 0) + 1);
+  };
 
   const pool = new ServerPool(
     (dir, eventType, props) => {
@@ -206,16 +244,18 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     // the 60s sweep (RB2).
     (dir, gapMs) => {
       pushLog(`SSE resumed for ${dir} after ${Math.round(gapMs / 1000)}s — reconciling runs`);
-      void reconcileStaleViews(0, dir).then((n) => {
+      void sweepInteractions(dir).then(() => reconcileStaleViews(0, dir)).then((n) => {
         if (n) pushLog(`reconciler finalized ${n} stale run(s) for ${dir}`);
-      });
+      }).catch(err => logErr(`resume recovery failed: ${String(err)}`));
     },
     // A server just became ready: sweep for parked questions that outlived a
     // bridge restart and re-post the asks for bound sessions (issue #2).
     (dir, baseUrl) => {
       void sweepQuestions(dir, baseUrl);
     },
+    { isBusy: hasActiveViewForProject, onConnectionState: setProjectConnectionState },
   );
+  cleanup.push(() => pool.close());
 
   // Idle-server reaper: an untouched opencode serve stays resident forever on
   // an always-on box. Stop servers idle >30 min with no active views; they
@@ -225,6 +265,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     if (n) pushLog(`idle reaper: stopped ${n} idle opencode server(s)`);
   }, REAPER_INTERVAL_MS);
   reaper.unref();
+  cleanup.push(() => clearInterval(reaper));
 
   // Stale-run reconciler (RB2): a run whose completion events were all lost
   // (SSE gap) receives no further signals and would hang at ⏳ forever. Every
@@ -236,9 +277,29 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     });
   }, RECONCILE_INTERVAL_MS);
   reconciler.unref();
+  cleanup.push(() => clearInterval(reconciler));
 
-  /** Live permission asks, so an answer can update BOTH the thread and DM copies. */
-  const permAsks = new Map<string, { channel: string; threadTs: string; askTs: string | null; dmTs: string | null }>();
+  type Delivery = { status: "new" | "in-flight" | "delivered" | "rejected" | "uncertain"; attempts: number };
+  type InteractionAsk = {
+    id: string;
+    sessionId: string;
+    projectDir: string;
+    channel: string;
+    threadTs: string;
+    askTs: string | null;
+    dmTs: string | null;
+    threadDelivery: Delivery;
+    dmDelivery: Delivery;
+    deliveryFlight?: Promise<void>;
+    resolvedText?: string;
+    nudgeStarted: boolean;
+  };
+  type PermissionAsk = InteractionAsk & { perm: OcPermission };
+  const permAsks = new Map<string, PermissionAsk>();
+  cleanup.push(() => {
+    for (const t of permNudges.values()) clearTimeout(t);
+    for (const t of quesNudges.values()) clearTimeout(t);
+  });
 
    /**
     * Live question asks. `req` is the full stored ask (options resolved from
@@ -247,23 +308,30 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     * multi-select's toggles don't count until submitted). When every question
     * is finalized, we reply.
     */
-   type QuestionAsk = {
+   type QuestionAsk = InteractionAsk & {
      req: OcQuestionRequest;
      answers: string[][];
      finalized: boolean[];
-     channel: string;
-     threadTs: string;
-     askTs: string | null;
-     dmTs: string | null;
    };
    const quesAsks = new Map<string, QuestionAsk>();
 
   async function onPoolEvent(dir: string, eventType: string, props: Record<string, unknown>): Promise<void> {
     try {
+      if (stopping) return;
+      if (eventType === "message.updated" && props.info) {
+        state.reconcilePromptAcceptance(dir, props.info as OcMessageInfo);
+      }
+      if (eventType === "permission.replied") {
+        const id = String(props.requestID ?? props.permissionID ?? props.id ?? "");
+        interactionChanged(dir);
+        if (id) await onPermissionResolved(id, props.sessionID as string | undefined);
+        return;
+      }
       // Both event names: ≤1.18.25 emits permission.updated, ≥1.18.2x emits
       // permission.asked (auto-update renamed it). The adapter normalizes the
       // differing payloads onto one OcPermission the rest of the flow consumes.
       if (eventType === "permission.updated" || eventType === "permission.asked") {
+        interactionChanged(dir);
         await onPermission(normalizePermission(props));
         return;
       }
@@ -272,12 +340,14 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       // reaches the view's default: drop — the run would hang with no way to
       // answer. replied/rejected echoes resolve the posted copies idempotently.
       if (eventType === "question.asked") {
+        interactionChanged(dir);
         await onQuestion(props as unknown as OcQuestionRequest);
         return;
       }
       if (eventType === "question.replied" || eventType === "question.rejected") {
         const rid = (props.requestID as string | undefined) ?? (props.id as string | undefined);
-        if (rid) await onQuestionResolved(rid, eventType === "question.rejected" ? "rejected" : "replied");
+        interactionChanged(dir);
+        if (rid) await onQuestionResolved(rid, eventType === "question.rejected" ? "rejected" : "replied", props.sessionID as string | undefined);
         return;
       }
       const sid = (props.sessionID as string | undefined) ?? (props.part as { sessionID?: string } | undefined)?.sessionID ?? (props.info as { sessionID?: string } | undefined)?.sessionID;
@@ -299,177 +369,228 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     }
   }
 
-  async function onPermission(perm: OcPermission): Promise<void> {
-    if (!perm?.id || seenPerms.has(perm.id)) return;
-    seenPerms.add(perm.id);
-    if (seenPerms.size > 500) {
-      const first = seenPerms.values().next().value;
-      if (first) seenPerms.delete(first);
-    }
-    const bound = state.findThreadBySession(perm.sessionID);
-    if (!bound) return; // permission for a session not driven from Slack — ignore
+  type InteractionKind = "permission" | "question";
+  function newAsk(id: string, sessionId: string): InteractionAsk | undefined {
+    const bound = state.findThreadBySession(sessionId);
+    // Do not dedupe an unbound boot ask: a later binding/poll may recover it.
+    if (!bound) return;
     const [channel, threadTs] = bound.key.split(":") as [string, string];
-    const header = `:rotating_light: *OpenCode wants permission* — ${perm.type}:${perm.title}`;
-    const blocks = permissionBlocks(perm) as never;
-    // Interactive lane: the run is BLOCKED on this ask — the owner is
-    // actively waiting on it, so it jumps ahead of background stream traffic.
-    let askTs: string | null = null;
-    try {
-      askTs = (await render.post(channel, threadTs, header, blocks, { unfurl: false, lane: "interactive" })).ts;
-    } catch {
-      /* thread ask failed — DM below may still reach the owner */
-    }
-    // Mirror the ask (buttons included) into the owner's DMs — on a phone,
-    // this is the only notification that a run is blocked waiting for approval.
-    let dmTs: string | null = null;
-    try {
-      dmTs = (await render.dm?.(channel, threadTs, header, blocks, { lane: "interactive" }))?.ts ?? null;
-    } catch {
-      pushLog(`permission DM failed (${perm.id}): DM channel unavailable`);
-    }
-    permAsks.set(perm.id, { channel, threadTs, askTs, dmTs });
-    if (permAsks.size > 200) {
-      const first = permAsks.keys().next().value;
-      if (first) permAsks.delete(first);
-    }
-    // Nudge twice (3 min apart) if the ask sits unanswered; cleared on answer.
+    return { id, sessionId, projectDir: bound.thread.projectDir, channel, threadTs,
+      askTs: null, dmTs: null, nudgeStarted: false,
+      threadDelivery: { status: "new", attempts: 0 }, dmDelivery: { status: "new", attempts: 0 } };
+  }
+
+  function isPending(ask: InteractionAsk, kind: InteractionKind): boolean {
+    return !stopping && !ask.resolvedText &&
+      (kind === "question" ? quesAsks.get(ask.id) : permAsks.get(ask.id)) === ask;
+  }
+
+  // Only explicit rejection proves a post had no effect. Transport timeouts,
+  // connection errors, HTTP 5xx, and internal Slack errors retain uncertainty.
+  function rejectedPost(err: unknown): boolean {
+    const e = err as { code?: string; statusCode?: number; data?: { error?: string } };
+    if (e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429) return true;
+    return e?.code === "slack_webapi_platform_error" && new Set([
+      "missing_scope", "invalid_auth", "token_revoked", "token_expired", "account_inactive",
+      "channel_not_found", "not_in_channel", "is_archived", "no_permission", "restricted_action",
+      "msg_too_long", "invalid_blocks", "invalid_arguments", "no_text",
+    ]).has(e.data?.error ?? "");
+  }
+
+  async function collapseCopy(channel: string, ts: string, text: string): Promise<void> {
+    if (stopping) return;
+    await enqueue(async () => {
+      if (!stopping) await app.client.chat.update({ channel, ts, text,
+        blocks: [{ type: "section", text: { type: "mrkdwn", text } }] });
+    }, { channel, lane: "interactive" }).catch(err => pushLog(`interaction update failed: ${String(err)}`));
+  }
+
+  function armInteractionNudge(ask: InteractionAsk, kind: InteractionKind): void {
+    if (!isPending(ask, kind) || ask.nudgeStarted || (!ask.askTs && !ask.dmTs)) return;
+    ask.nudgeStarted = true;
+    const nudges = kind === "question" ? quesNudges : permNudges;
     const nudge = (remaining: number): void => {
-      permNudges.set(
-        perm.id,
-        setTimeout(() => {
-          if (!seenPerms.has(perm.id)) {
-            permNudges.delete(perm.id);
-            return;
-          }
-          void render
-            .post(channel, threadTs, ":alarm_clock: Still waiting on this permission — Approve or Deny above.", undefined, {
-              unfurl: false,
-            })
-            .catch(() => {});
-          if (remaining > 0) nudge(remaining - 1);
-          else permNudges.delete(perm.id);
-        }, 180_000),
-      );
+      if (!isPending(ask, kind)) return;
+      const timer = setTimeout(() => {
+        nudges.delete(ask.id);
+        if (!isPending(ask, kind)) return;
+        const where = ask.askTs ? "above" : "in your DM";
+        const action = kind === "question" ? "pick an option or Skip" : "Approve or Deny";
+        void enqueue(async () => {
+          if (!isPending(ask, kind)) return; // It may resolve/stop while queued.
+          await app.client.chat.postMessage({ channel: ask.channel, thread_ts: ask.threadTs,
+            text: `:alarm_clock: Still waiting on this ${kind} — ${action} ${where}.`,
+            mrkdwn: true, unfurl_links: false, unfurl_media: false });
+        }, { channel: ask.channel }).catch(() => {});
+        if (remaining > 0) nudge(remaining - 1);
+      }, 180_000);
+      timer.unref();
+      nudges.set(ask.id, timer);
     };
     nudge(1);
   }
 
-  /**
-   * A parked question (issue #2). Mirrors onPermission: dedupe, find the bound
-   * thread, post the interactive blocks to the thread + owner DM, track both
-   * copies, and nudge twice if it sits unanswered. The run is BLOCKED
-   * server-side until the owner taps an option or Skip.
-   */
-  async function onQuestion(req: OcQuestionRequest): Promise<void> {
-    if (!req?.id || seenQuestions.has(req.id)) return;
-    seenQuestions.add(req.id);
-    if (seenQuestions.size > 500) {
-      const first = seenQuestions.values().next().value;
-      if (first) seenQuestions.delete(first);
-    }
-    const bound = state.findThreadBySession(req.sessionID);
-    if (!bound) return; // question for a session not driven from Slack — ignore
-    const [channel, threadTs] = bound.key.split(":") as [string, string];
-    const header = `❓ *OpenCode has a question* — ${req.questions.length} to answer`;
-    const blocks = questionBlocks(req, []) as never;
-    // Interactive lane: the run is BLOCKED on this question (like permissions).
-    let askTs: string | null = null;
-    try {
-      askTs = (await render.post(channel, threadTs, header, blocks, { unfurl: false, lane: "interactive" })).ts;
-    } catch {
-      /* thread ask failed — DM below may still reach the owner */
-    }
-    let dmTs: string | null = null;
-    try {
-      dmTs = (await render.dm?.(channel, threadTs, header, blocks, { lane: "interactive" }))?.ts ?? null;
-    } catch {
-      pushLog(`question DM failed (${req.id}): DM channel unavailable`);
-    }
-    quesAsks.set(req.id, {
-      req,
-      answers: req.questions.map(() => []),
-      finalized: req.questions.map(() => false),
-      channel,
-      threadTs,
-      askTs,
-      dmTs,
-    });
-    if (quesAsks.size > 200) {
-      const first = quesAsks.keys().next().value;
-      if (first) quesAsks.delete(first);
-    }
-    const nudge = (remaining: number): void => {
-      quesNudges.set(
-        req.id,
-        setTimeout(() => {
-          if (!seenQuestions.has(req.id)) {
-            quesNudges.delete(req.id);
-            return;
+  function deliverAsk(ask: InteractionAsk, kind: InteractionKind, header: string,
+    blocks: () => unknown[], retry: boolean): Promise<void> {
+    if (ask.deliveryFlight) return ask.deliveryFlight;
+    ask.deliveryFlight = Promise.resolve().then(async () => {
+      for (const destination of ["thread", "dm"] as const) {
+        if (!isPending(ask, kind)) break;
+        // A boot ask can precede DM availability; this is known not to have sent.
+        if (destination === "dm" && !dmChannelId) continue;
+        const delivery = destination === "thread" ? ask.threadDelivery : ask.dmDelivery;
+        if (delivery.status !== "new" && !(retry && delivery.status === "rejected" && delivery.attempts < 3)) continue;
+        delivery.status = "in-flight";
+        delivery.attempts++;
+        const postedBlocks = blocks();
+        let ts: string;
+        try {
+          const result = destination === "thread"
+            ? await render.post(ask.channel, ask.threadTs, header, postedBlocks, { unfurl: false, lane: "interactive" })
+            : await render.dm!(ask.channel, ask.threadTs, header, postedBlocks, { lane: "interactive" });
+          ts = result.ts;
+          delivery.status = "delivered";
+          if (destination === "thread") ask.askTs = ts; else ask.dmTs = ts;
+        } catch (err) {
+          delivery.status = rejectedPost(err) ? "rejected" : "uncertain";
+          pushLog(`${kind} ${destination} delivery ${delivery.status} (${ask.id}): ${String(err)}`);
+          continue;
+        }
+        if (stopping) break;
+        const channel = destination === "thread" ? ask.channel : dmChannelId!;
+        // Resolution can precede a post response. Collapse that late copy too,
+        // without re-registering the ask or recreating its nudge.
+        if (ask.resolvedText) await collapseCopy(channel, ts, ask.resolvedText);
+        else if (isPending(ask, kind)) {
+          if (destination === "thread") getView(ask.sessionId)?.contentPosted();
+          // Partial multi-select/custom answers may change while the DM posts.
+          if (JSON.stringify(postedBlocks) !== JSON.stringify(blocks())) {
+            await enqueue(async () => {
+              if (isPending(ask, kind)) await app.client.chat.update({ channel, ts, text: header, blocks: blocks() as never });
+            }, { channel, lane: "interactive" }).catch(() => {});
           }
-          void render
-            .post(channel, threadTs, ":alarm_clock: Still waiting on this question — pick an option or Skip above.", undefined, {
-              unfurl: false,
-            })
-            .catch(() => {});
-          if (remaining > 0) nudge(remaining - 1);
-          else quesNudges.delete(req.id);
-        }, 180_000),
-      );
-    };
-    nudge(1);
+        }
+      }
+      armInteractionNudge(ask, kind);
+    }).finally(() => { ask.deliveryFlight = undefined; });
+    return ask.deliveryFlight;
   }
 
-  /**
-   * A parked question resolved (owner tapped, or an SSE replied/rejected echo).
-   * Idempotent: clears tracking + nudges and collapses both copies to a final
-   * line. Safe to call from the action handler AND the SSE echo.
-   */
-  async function onQuestionResolved(requestId: string, kind: "replied" | "rejected"): Promise<void> {
-    const nudge = quesNudges.get(requestId);
-    if (nudge) {
-      clearTimeout(nudge);
-      quesNudges.delete(requestId);
+  async function onPermission(perm: OcPermission, retry = false): Promise<void> {
+    if (stopping || !perm?.id || resolvedPerms.has(perm.id)) return;
+    let ask = permAsks.get(perm.id);
+    if (!ask) {
+      const base = newAsk(perm.id, perm.sessionID);
+      if (!base) return;
+      ask = { ...base, perm };
+      permAsks.set(perm.id, ask);
+      interactionChanged(ask.projectDir);
     }
-    const ask = quesAsks.get(requestId);
-    quesAsks.delete(requestId);
-    const line =
-      kind === "rejected"
-        ? ":arrow_forward: Skipped — OpenCode continuing."
-        : ":white_check_mark: Answered — OpenCode continuing.";
-    const updateOne = (ch: string, ts: string): Promise<unknown> =>
-      render.update(ch, ts, line).catch(() => {});
-    const updates: Promise<unknown>[] = [];
-    if (ask?.askTs) updates.push(updateOne(ask.channel, ask.askTs));
-    if (ask?.dmTs && dmChannelId) updates.push(updateOne(dmChannelId, ask.dmTs));
+    getView(ask.sessionId)?.setWaiting(perm.id, "permission", true);
+    await deliverAsk(ask, "permission", `:rotating_light: *OpenCode wants permission* — ${perm.type}:${perm.title}`,
+      () => permissionBlocks(perm), retry);
+  }
+
+  async function onQuestion(req: OcQuestionRequest, retry = false): Promise<void> {
+    if (stopping || !req?.id || resolvedQuestions.has(req.id)) return;
+    let ask = quesAsks.get(req.id);
+    if (!ask) {
+      const base = newAsk(req.id, req.sessionID);
+      if (!base) return;
+      ask = { ...base, req, answers: req.questions.map(() => []), finalized: req.questions.map(() => false) };
+      quesAsks.set(req.id, ask); // Buttons are usable BEFORE either post awaits.
+      interactionChanged(ask.projectDir);
+    }
+    const pending = ask;
+    getView(ask.sessionId)?.setWaiting(req.id, "question", true);
+    await deliverAsk(ask, "question", `❓ *OpenCode has a question* — ${req.questions.length} to answer`,
+      () => questionBlocks(pending.req, pending.answers, pending.finalized), retry);
+  }
+
+  async function resolveInteraction(kind: InteractionKind, id: string, text: string,
+    sessionId?: string, knownAsk?: InteractionAsk): Promise<void> {
+    const asks = kind === "question" ? quesAsks : permAsks;
+    const resolved = kind === "question" ? resolvedQuestions : resolvedPerms;
+    const nudges = kind === "question" ? quesNudges : permNudges;
+    const ask = asks.get(id) ?? knownAsk;
+    resolved.add(id);
+    if (ask) ask.resolvedText = text;
+    asks.delete(id);
+    const timer = nudges.get(id);
+    if (timer) clearTimeout(timer);
+    nudges.delete(id);
+    const sid = ask?.sessionId ?? sessionId;
+    if (sid) getView(sid)?.setWaiting(id, kind, false);
+    const dir = ask?.projectDir ?? (sid ? state.findThreadBySession(sid)?.thread.projectDir : undefined);
+    if (dir) interactionChanged(dir);
+    const updates: Promise<void>[] = [];
+    if (ask?.askTs) updates.push(collapseCopy(ask.channel, ask.askTs, text));
+    if (ask?.dmTs && dmChannelId) updates.push(collapseCopy(dmChannelId, ask.dmTs, text));
     await Promise.all(updates);
   }
 
-  /**
-   * Boot recovery (issue #2): a parked question outlived a bridge restart (the
-   * opencode server is a detached child that can survive an unclean bridge
-   * death). When a server first becomes ready, list its pending questions and
-   * re-post the asks for bound sessions. onQuestion dedupes (seenQuestions)
-   * and skips unbound sessions itself, so this just fans out.
-   */
+  function onQuestionResolved(id: string, kind: "replied" | "rejected", sessionId?: string): Promise<void> {
+    return resolveInteraction("question", id, kind === "rejected"
+      ? ":arrow_forward: Skipped — OpenCode continuing."
+      : ":white_check_mark: Answered — OpenCode continuing.", sessionId);
+  }
+
+  function onPermissionResolved(id: string, sessionId?: string,
+    text = ":white_check_mark: Permission resolved — OpenCode continuing.", knownAsk?: PermissionAsk): Promise<void> {
+    return resolveInteraction("permission", id, text, sessionId, knownAsk);
+  }
+
+  // Keep the onReady hook's signature; boot, resume, and periodic recovery all
+  // share the same identity-checked, per-directory flight (including permissions).
   async function sweepQuestions(dir: string, baseUrl: string): Promise<void> {
-    let list: OcQuestionRequest[];
-    try {
-      list = await pendingQuestions(baseUrl);
-    } catch (err) {
-      pushLog(`question sweep failed for ${dir}: ${String((err as Error)?.message ?? err)}`);
-      return;
-    }
-    for (const req of list) {
-      await onQuestion(req);
-    }
+    if (pool.get(dir)?.baseUrl === baseUrl) await sweepInteractions(dir);
+  }
+
+  function sweepInteractions(dir: string): Promise<void> {
+    const entry = pool.get(dir);
+    if (!entry?.baseUrl || stopping) return Promise.resolve();
+    const key = entry.dir;
+    const existing = interactionSweeps.get(key);
+    if (existing) { existing.requested = true; return existing.flight; }
+    const sweep = { requested: false, flight: null as unknown as Promise<void> };
+    sweep.flight = Promise.resolve().then(async () => {
+      do {
+        sweep.requested = false;
+        const current = pool.get(key);
+        if (!current?.baseUrl || stopping) return;
+        const version = interactionVersions.get(key) ?? 0;
+        const [questions, permissions] = await Promise.allSettled([
+          pendingQuestions(current.baseUrl), pendingPermissions(current.baseUrl),
+        ]);
+        if (stopping || pool.get(key) !== current || (interactionVersions.get(key) ?? 0) !== version) continue;
+        // Apply all local changes without yielding; delivery promises finish
+        // afterward and check ask identity/resolution before adopting late work.
+        const work: Promise<void>[] = [];
+        if (questions.status === "fulfilled") {
+          const ids = new Set(questions.value.map(q => q.id));
+          for (const [id, ask] of quesAsks) if (ask.projectDir === key && !ids.has(id)) work.push(onQuestionResolved(id, "replied"));
+          for (const q of questions.value) work.push(onQuestion(q, true));
+        } else pushLog(`question sweep failed for ${key}: ${String(questions.reason)}`);
+        if (permissions.status === "fulfilled") {
+          const ids = new Set(permissions.value.map(p => p.id));
+          for (const [id, ask] of permAsks) if (ask.projectDir === key && !ids.has(id)) work.push(onPermissionResolved(id));
+          for (const p of permissions.value) work.push(onPermission(p, true));
+        } else pushLog(`permission sweep failed for ${key}: ${String(permissions.reason)}`);
+        await Promise.all(work);
+      } while (sweep.requested && !stopping);
+    }).catch(err => logErr(`interaction sweep failed for ${key}: ${String(err)}`))
+      .finally(() => { if (interactionSweeps.get(key) === sweep) interactionSweeps.delete(key); });
+    interactionSweeps.set(key, sweep);
+    return sweep.flight;
   }
 
   const botAuth = await app.client.auth.test().catch((err) => {
     console.error("Slack auth.test failed — check SLACK_BOT_TOKEN:", err);
     return null;
   });
+  if (stopping) return;
   if (!botAuth) {
-    process.exitCode = 1;
+    await shutdown(1);
     return;
   }
 
@@ -486,6 +607,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   } catch (err) {
     pushLog(`owner DM channel unavailable: ${String((err as Error)?.message ?? err)}`);
   }
+  if (stopping) return;
 
   const bridge: BridgeDeps = {
     config,
@@ -494,6 +616,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     render,
     botUserId,
     cwd: opts.cwd,
+    isStopping: () => stopping,
     bridgeInfo: { startedAt: Date.now(), dmAvailable: () => dmChannelId !== null },
     threadUrl: (key) => {
       const [channel, threadTs] = key.split(":");
@@ -507,6 +630,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   const ghost = new GhostDetector();
 
   app.event("message", async ({ event }) => {
+    if (stopping) return;
     const e = event as unknown as import("./slack/router.js").SlackMsg;
     pushLog(`in: message ${e.channel}:${e.ts}${e.thread_ts ? " (reply)" : ""}${e.subtype ? ` subtype=${e.subtype}` : ""}`);
     ghost.noteLive();
@@ -523,6 +647,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     }
   });
   app.event("app_mention", async ({ event }) => {
+    if (stopping) return;
     const e = event as unknown as import("./slack/router.js").SlackMsg;
     pushLog(`in: app_mention ${e.channel}:${e.ts}`);
     ghost.noteLive();
@@ -531,6 +656,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
 
   app.action("perm", async ({ ack, body, action, client, respond }) => {
     await ack();
+    if (stopping) return;
     if (body.user.id !== config.ownerSlackUserId) {
       await respond({ text: "Only the paired owner can approve OpenCode actions.", response_type: "ephemeral" }).catch(() => {});
       return;
@@ -548,7 +674,10 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       await respond({ text: "That session is no longer tracked here.", response_type: "ephemeral" }).catch(() => {});
       return;
     }
+    if (stopping || resolvedPerms.has(v.p)) return;
+    const ask = permAsks.get(v.p);
     const entry = await pool.ensure(bound.thread.projectDir);
+    if (stopping || resolvedPerms.has(v.p)) return;
     try {
       await permRespond(entry.client!, v.s, v.p, v.r);
     } catch (err) {
@@ -556,33 +685,18 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       await respond({ text: `Failed to reply to OpenCode: ${String(err)}`, response_type: "ephemeral" }).catch(() => {});
       return;
     }
-    // Keep the answered id in seenPerms: an SSE replay of the ask must not re-post it.
-    const pending = permNudges.get(v.p);
-    if (pending) {
-      clearTimeout(pending);
-      permNudges.delete(v.p);
-    }
     // Update BOTH copies of the ask (thread + owner DM) to the result, no
     // matter which button was tapped. Fall back to the clicked message when
     // the ask wasn't tracked (bridge restarted between ask and answer).
     const result = permissionResultText(v.r, body.user.id);
-    const updateOne = (ch: string, ts: string): Promise<unknown> =>
-      client.chat
-        .update({ channel: ch, ts, text: result, blocks: [{ type: "section", text: { type: "mrkdwn", text: result } }] })
-        .catch(() => {});
-    const ask = permAsks.get(v.p);
-    permAsks.delete(v.p);
-    const updates: Promise<unknown>[] = [];
-    if (ask?.askTs) updates.push(updateOne(ask.channel, ask.askTs));
-    if (ask?.dmTs && dmChannelId) updates.push(updateOne(dmChannelId, ask.dmTs));
-    if (!updates.length) {
+    await onPermissionResolved(v.p, v.s, result, ask);
+    if (!ask?.askTs && !ask?.dmTs) {
       const ch = (body as unknown as { channel?: { id: string } }).channel?.id;
       const ts =
         (body as unknown as { container?: { message_ts?: string } }).container?.message_ts ??
         (body as unknown as { message?: { ts?: string } }).message?.ts;
-      if (ch && ts) updates.push(updateOne(ch, ts));
+      if (ch && ts) await collapseCopy(ch, ts, result);
     }
-    await Promise.all(updates);
   });
 
   // Question tool (issue #2): owner taps an option (single-select, one tap per
@@ -606,6 +720,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   // otherwise re-render both copies. "failed" = the reply errored (re-rendered
   // so the owner can retry or Skip) — the caller surfaces the ephemeral notice.
   const submitAskIfComplete = async (ask: QuestionAsk, url: string): Promise<"replied" | "incomplete" | "failed"> => {
+    if (!isPending(ask, "question")) return "incomplete";
     if (!ask.req.questions.every((_, qi) => ask.finalized[qi])) {
       await Promise.all(renderAskBoth(ask, questionBlocks(ask.req, ask.answers, ask.finalized)));
       return "incomplete";
@@ -614,7 +729,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       await questionReply(url, ask.req.id, ask.answers);
     } catch (err) {
       logErr(`question reply failed: ${String((err as Error)?.message ?? err)}`);
-      await Promise.all(renderAskBoth(ask, questionBlocks(ask.req, ask.answers, ask.finalized)));
+      if (isPending(ask, "question")) await Promise.all(renderAskBoth(ask, questionBlocks(ask.req, ask.answers, ask.finalized)));
       return "failed";
     }
     await onQuestionResolved(ask.req.id, "replied");
@@ -644,11 +759,12 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       return null;
     }
     const ask = quesAsks.get(parsed.q);
-    if (!ask) {
+    if (!ask || ask.sessionId !== parsed.s || !isPending(ask, "question")) {
       await respond({ text: "That question is no longer tracked here.", response_type: "ephemeral" }).catch(() => {});
       return null;
     }
     const entry = await pool.ensure(bound.thread.projectDir);
+    if (!isPending(ask, "question")) return null;
     if (!entry.url) {
       await respond({ text: "The OpenCode server isn't ready yet — try again in a moment.", response_type: "ephemeral" }).catch(() => {});
       return null;
@@ -658,6 +774,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
 
   app.action("question", async ({ ack, body, action, respond }) => {
     await ack();
+    if (stopping) return;
     const g = await questionGuard(body, (action as { value?: string }).value, respond);
     if (!g) return;
     const { v, ask, url } = g;
@@ -700,6 +817,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
 
   app.action("qsubmit", async ({ ack, body, action, respond }) => {
     await ack();
+    if (stopping) return;
     const g = await questionGuard(body, (action as { value?: string }).value, respond);
     if (!g) return;
     const { v, ask, url } = g;
@@ -716,6 +834,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
 
   app.action("qtext", async ({ ack, body, action, client, respond }) => {
     await ack();
+    if (stopping) return;
     const g = await questionGuard(body, (action as { value?: string }).value, respond);
     if (!g) return;
     const { v, ask } = g;
@@ -753,6 +872,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
 
   app.view("qtext_submit", async ({ ack, body, view, respond }) => {
     await ack();
+    if (stopping) return;
     if (body.user.id !== config.ownerSlackUserId) {
       await respond({ text: "Only the paired owner can answer OpenCode questions.", response_type: "ephemeral" }).catch(() => {});
       return;
@@ -770,9 +890,9 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     }
     const bound = state.findThreadBySession(v.s);
     const ask = quesAsks.get(v.q);
-    if (!bound || !ask) return;
+    if (!bound || !ask || ask.sessionId !== v.s || !isPending(ask, "question")) return;
     const entry = await pool.ensure(bound.thread.projectDir);
-    if (!entry.url) return;
+    if (!entry.url || !isPending(ask, "question")) return;
     ask.answers[v.i] = [text];
     ask.finalized[v.i] = true;
     const r = await submitAskIfComplete(ask, entry.url);
@@ -786,6 +906,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   // .diff snippet upload to the DM).
   app.action(VIEW_DIFF_ACTION, async ({ ack, body, action, respond }) => {
     await ack();
+    if (stopping) return;
     if (body.user.id !== config.ownerSlackUserId) {
       await respond({ text: "Only the paired owner can view diffs here.", response_type: "ephemeral" }).catch(() => {});
       return;
@@ -828,7 +949,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
               content: body2.slice(0, 200_000),
               title: "session diff",
             }),
-          { channel: dmChannelId!, lane: "interactive" },
+          { channel: dmChannelId!, lane: "interactive", timeoutMs: SLACK_UPLOAD_TIMEOUT_MS, retryRateLimits: false },
         );
       }
     } catch (err) {
@@ -837,21 +958,15 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     }
   });
 
-  await app.start();
-
-  // Missed-message catch-up (see slack/catchup.ts): Slack discards socket-mode
-  // envelopes it can't deliver and never replays them — a restart gap, network
-  // flap, or zombie connection otherwise leaves a thread permanently silent
-  // while outbound posts still work. This backstop bounds the damage to
-  // ≤ ~1 min of latency: bound threads are re-read from conversations.replies
-  // past their watermark and unprocessed owner messages route through the
-  // exact same handler as live socket deliveries.
+  // Fair, bounded history recovery for retained threads. Older threads rotate
+  // more slowly; a confirmed cursor is distinct from the newest live event.
   const catchupDeps: CatchupDeps = {
     state,
     ownerSlackUserId: config.ownerSlackUserId,
-    fetchReplies: async (channel, rootTs, oldest): Promise<SlackMsg[]> => {
+    fetchReplies: async (channel, rootTs, oldest, { maxPages }) => {
       const out: SlackMsg[] = [];
       let cursor: string | undefined;
+      let pagesUsed = 0;
       do {
         // Background: the 60s sweep can fan out across ~10 threads — it must
         // never hold up commands/prompts in their channels (issue #5).
@@ -860,14 +975,41 @@ export async function startBridge(opts: StartOpts): Promise<void> {
           { channel, lane: "background" },
         )) as { messages?: unknown[]; response_metadata?: { next_cursor?: string } };
         out.push(...((r.messages ?? []) as SlackMsg[]));
+        pagesUsed++;
         cursor = r.response_metadata?.next_cursor || undefined;
-      } while (cursor);
-      return out.sort((a, b) => (a.ts < b.ts ? -1 : 1));
+      } while (cursor && pagesUsed < maxPages && !stopping);
+      return { messages: out.sort((a, b) => a.ts.localeCompare(b.ts)), hasMore: !!cursor, pagesUsed };
     },
-    dispatch: (m) => handleIncomingMessage(m, bridge),
+    dispatch: (m) => stopping ? Promise.resolve("retry" as const) : handleIncomingMessage(m, bridge),
   };
-  const runCatchup = async (boot = false): Promise<void> => {
+  let catchupFlight: Promise<void> | undefined;
+  let catchupRequested = false;
+  let receiptOffset = 0;
+  const runCatchup = (boot = false): Promise<void> => {
+    if (stopping) return Promise.resolve();
+    if (catchupFlight) { catchupRequested = true; return catchupFlight; }
+    catchupFlight = (async () => {
+    do {
+    catchupRequested = false;
     try {
+      // Exact user-message IDs prove acceptance after an HTTP timeout or crash.
+      // Check the stored session, which may differ from the thread's new binding.
+      const pending = state.messageReceipts().filter(r => r.disposition === "uncertain" && r.submission);
+      const groups = [...new Map(pending.map(r => [r.submission!.sessionId, r.submission!])).values()];
+      for (let i = 0; i < Math.min(groups.length, 4) && !stopping; i++) {
+        const ref = groups[(receiptOffset + i) % groups.length]!;
+        try {
+          const lease = await pool.acquire(ref.projectDir);
+          try {
+            for (const m of await sessionMessages(lease.entry.client!, ref.sessionId)) {
+              state.reconcilePromptAcceptance(ref.projectDir, m.info);
+            }
+          } finally { lease.release(); }
+        } catch (err) { pushLog(`acceptance recovery (${ref.sessionId}): ${String(err)}`); }
+      }
+      if (groups.length) receiptOffset = (receiptOffset + 4) % groups.length;
+      await Promise.all(pool.list().filter(e => e.status === "ready").map(e => sweepInteractions(e.dir)));
+      if (stopping) return;
       const n = await sweepMissedMessages(catchupDeps);
       if (n && !boot) ghost.noteReplayed(n); // boot pass replays are the restart gap, not a ghost
       const warn = ghost.check();
@@ -875,10 +1017,10 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     } catch (err) {
       logErr(`catch-up sweep failed: ${String((err as Error)?.message ?? err)}`);
     }
+    } while (catchupRequested && !stopping);
+    })().finally(() => { catchupFlight = undefined; });
+    return catchupFlight;
   };
-  const catchup = setInterval(() => void runCatchup(), 60_000);
-  catchup.unref();
-
   // Interrupt sweep: any thread with a pendingRun tombstone was mid-run when
   // the bridge last stopped (crash / slackoc stop / host reboot). Resolve the
   // orphaned ⏳/✅ lifecycle so users aren't staring at a frozen status.
@@ -886,6 +1028,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   if (interrupted.length) {
     pushLog(`interrupt sweep: ${interrupted.length} thread(s) had a run in flight at shutdown`);
     for (const { key, thread } of interrupted) {
+      if (stopping) return;
       const [channel, threadTs] = key.split(":") as [string, string];
       const pr = thread.pendingRun!;
       for (const ts of pr.userMsgTs) {
@@ -899,7 +1042,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
         .post(
           channel,
           threadTs,
-          ":warning: bridge restarted — the run in progress here was interrupted. Resend your prompt to retry.",
+          "⚠️ Bridge restarted during this run. Check the session before resending: OpenCode may have accepted the prompt before the interruption.",
           undefined,
           // Interactive: the owner needs this notice NOW, not behind a backlog.
           { unfurl: false, lane: "interactive" },
@@ -915,27 +1058,28 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   // pass so freshly seeded threads are swept on this very boot.
   const seeded = state.seedMissingWatermarks();
   if (seeded) pushLog(`catch-up: seeded watermarks for ${seeded} legacy thread(s)`);
+  // Only enable intake after cleaning the previous process's tombstones. A
+  // fresh prompt delivered during app.start must never join the interrupt sweep.
+  if (stopping) return;
+  await app.start();
+  if (stopping) return;
+  const onConnected = () => { if (!stopping) void runCatchup(); };
+  receiver.client.on("connected", onConnected);
+  cleanup.push(() => { receiver.client.off("connected", onConnected); });
+  // A sleep gap gets an immediate pass rather than waiting a fresh minute.
+  let lastBeat = Date.now();
+  let lastSweep = lastBeat;
+  const catchup = setInterval(() => {
+    const now = Date.now();
+    if (now - lastBeat > 30_000 || now - lastSweep >= 60_000) {
+      lastSweep = now;
+      void runCatchup();
+    }
+    lastBeat = now;
+  }, 10_000);
+  catchup.unref();
+  cleanup.push(() => clearInterval(catchup));
   void runCatchup(true);
-
-  // Pidfile was claimed before app.start() (see top of startBridge) — the
-  // shutdown handler owns removing it.
-  const shutdown = () => {
-    console.error("\nslackoc stopping…");
-    clearInterval(reaper);
-    clearInterval(reconciler);
-    clearInterval(catchup);
-    void (async () => {
-      try {
-        await pool.killAll();
-        await app.stop();
-      } finally {
-        rmSync(PID_PATH, { force: true });
-        process.exit(0);
-      }
-    })();
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 
   // Kick the current project's server so the first prompt is snappy.
   void pool.ensure(state.currentProjectDir!).catch(() => {});
@@ -944,6 +1088,10 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   console.error(`✓ slackoc online as @${botAuth.user ?? "bot"} in ${botAuth.team ?? "workspace"}`);
   console.error(`  current project: ${state.currentProjectDir}`);
   console.error(`  config: ${CONFIG_PATH}`);
+  } catch (err) {
+    logErr(`bridge startup failed: ${String((err as Error)?.stack ?? err)}`);
+    await shutdown(1);
+  }
 }
 
 function readPid(pidPath: string): number | null {
@@ -963,26 +1111,98 @@ function processAlive(pid: number): boolean {
 
 export type PidClaim = "claimed" | "running" | "starting";
 
+const PARTIAL_PID_GRACE_MS = 30_000;
+
+function pidClaimOwnerAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (err) {
+    // EPERM (or an unexpected probe failure) is not proof that the owner died.
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/** Publish a nonempty directory atomically: rename cannot replace another
+ * nonempty directory. Remove only our unique marker, then rmdir (never recursive
+ * rm), so late cleanup cannot remove a replacement owner's live lock.
+ */
+function lockPidfile(pidPath: string): (() => void) | null {
+  const lock = `${pidPath}.lock`;
+  const owner = `${process.pid}-${randomUUID()}`;
+  const prepared = `${lock}.${owner}`;
+  mkdirSync(prepared, { mode: 0o700 });
+  const removeOwner = (name: string): void => {
+    try { unlinkSync(`${lock}/${name}`); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
+    }
+    try { rmdirSync(lock); }
+    catch (err) {
+      if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((err as NodeJS.ErrnoException).code ?? "")) throw err;
+    }
+  };
+  try {
+    writeFileSync(`${prepared}/${owner}`, "", { flag: "wx", mode: 0o600 });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        renameSync(prepared, lock);
+        return () => removeOwner(owner);
+      } catch (err) {
+        if (!["ENOTEMPTY", "EEXIST"].includes((err as NodeJS.ErrnoException).code ?? "")) throw err;
+      }
+      let entries: string[];
+      try { entries = readdirSync(lock); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
+      }
+      if (!entries.length) continue; // an owner is finishing release
+      const marker = entries.length === 1 ? entries[0]! : "";
+      const match = /^(\d+)-[0-9a-f-]{36}$/.exec(marker);
+      const pid = match ? Number(match[1]) : NaN;
+      if (!Number.isSafeInteger(pid) || pid <= 1 || pidClaimOwnerAlive(pid)) return null;
+      removeOwner(marker);
+    }
+    return null;
+  } finally {
+    // This unpublished, uniquely named directory is exclusively ours.
+    rmSync(prepared, { recursive: true, force: true });
+  }
+}
+
 /**
- * Atomically claim the pidfile for this process. "running" = a live bridge
- * holds it; "starting" = a concurrent start beat us to the atomic write
- * (wx fails on EEXIST). Stale pidfiles (dead pid) are replaced.
+ * Serialize inspection/replacement, then publish a fully written pid atomically.
+ * A dead lock owner is recoverable; an in-progress owner or recent legacy partial
+ * pidfile reports "starting". No contender ever unlinks the shared pidfile.
  */
 export function claimPidfile(pidPath: string): PidClaim {
-  const existing = readPid(pidPath);
-  if (existing && processAlive(existing)) return "running";
-  rmSync(pidPath, { force: true });
-  mkdirSync(dirname(pidPath), { recursive: true });
+  mkdirSync(dirname(pidPath), { recursive: true, mode: 0o700 });
+  const unlock = lockPidfile(pidPath);
+  if (!unlock) return "starting";
+  const temp = `${pidPath}.${process.pid}-${randomUUID()}.new`;
   try {
-    writeFileSync(pidPath, String(process.pid), { flag: "wx", mode: 0o600 });
+    try {
+      const text = readFileSync(pidPath, "utf8").trim();
+      const existing = /^\d+$/.test(text) ? Number(text) : NaN;
+      if (Number.isSafeInteger(existing) && existing > 1) {
+        if (pidClaimOwnerAlive(existing)) return "running";
+      } else if (Date.now() - statSync(pidPath).mtimeMs < PARTIAL_PID_GRACE_MS) {
+        return "starting";
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    writeFileSync(temp, String(process.pid), { flag: "wx", mode: 0o600 });
+    renameSync(temp, pidPath);
     return "claimed";
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "EEXIST") return "starting";
-    throw err;
+  } finally {
+    try { rmSync(temp, { force: true }); }
+    finally { unlock(); }
   }
 }
 
 export async function stopBridge(): Promise<void> {
+  if (await stopManagedService()) return;
   const pid = readPid(PID_PATH);
   if (!pid || !processAlive(pid)) {
     console.log("slackoc is not running (no live pidfile).");

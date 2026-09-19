@@ -1,7 +1,5 @@
-import { runInit, type InitOptions } from "./init.js";
-import { runDoctor } from "./doctor.js";
-import { startBridge, stopBridge } from "./start.js";
-import { daemonInstall, daemonStatus, daemonUninstall, installedWorkdir } from "./daemon.js";
+import type { InitOptions } from "./init.js";
+import { runServiceCommand } from "./service.js";
 import { parseFlags } from "./args.js";
 import { VERSION } from "./version.js";
 
@@ -14,8 +12,15 @@ Usage:
       --owner <U…>          non-interactive: your Slack member ID
       --dir <path>          non-interactive: default project dir
   slackoc start             start the bridge (runs in foreground)
-  slackoc stop              SIGTERM the running bridge
-  slackoc daemon install    run the bridge as a user service (launchd/systemd)
+  slackoc stop              stop the running bridge (disable its service if managed)
+  slackoc service install   write a macOS LaunchAgent (does not start it)
+      --dir </abs/path>     saved default project (default: install cwd)
+      --keep-awake <bool>   explicit true/false; prevent idle sleep (default: false)
+  slackoc service start     enable and load the installed service
+  slackoc service stop      disable and unload the service
+  slackoc service status    installation, process, cwd and log diagnostics
+  slackoc service uninstall stop and remove only the service definition
+  slackoc daemon install    legacy: systemd on Linux; alias for service on macOS
       --dir <path>          project dir the service binds (default: cwd)
   slackoc daemon status     is the service loaded/active?
   slackoc daemon uninstall  remove the service
@@ -34,6 +39,7 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "init": {
       const flags = parseFlags(rest, ["bot-token", "app-token", "owner", "dir"]);
+      const { runInit } = await import("./init.js");
       const opts: InitOptions = {};
       if (flags["bot-token"]) opts.botToken = flags["bot-token"];
       if (flags["app-token"]) opts.appToken = flags["app-token"];
@@ -42,17 +48,30 @@ async function main(): Promise<void> {
       await runInit(opts);
       break;
     }
-    case "start":
+    case "start": {
       parseFlags(rest, []);
+      const { startBridge } = await import("./start.js");
       await startBridge({ cwd: process.cwd() });
       break;
-    case "stop":
+    }
+    case "stop": {
       parseFlags(rest, []);
+      const { stopBridge } = await import("./start.js");
       await stopBridge();
       break;
+    }
+    case "service":
+      await runServiceCommand(rest);
+      break;
     case "daemon": {
+      if (process.platform === "darwin") {
+        console.error("On macOS, daemon is a legacy alias for service; install only writes configuration. Use service start to activate.");
+        await runServiceCommand(rest);
+        break;
+      }
       const sub = rest[0];
       const flags = parseFlags(rest.slice(1), ["dir"]);
+      const { daemonInstall, daemonStatus, daemonUninstall, installedWorkdir } = await import("./daemon.js");
       if (sub === "install") {
         process.exitCode = await daemonInstall(flags.dir ?? process.cwd());
       } else if (sub === "uninstall") {
@@ -67,10 +86,12 @@ async function main(): Promise<void> {
       }
       break;
     }
-    case "doctor":
+    case "doctor": {
       parseFlags(rest, []);
+      const { runDoctor } = await import("./doctor.js");
       process.exitCode = await runDoctor();
       break;
+    }
     case "help":
     case "-h":
     case "--help":

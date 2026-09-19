@@ -1,5 +1,8 @@
 import type { OCClient, OcEvent, OcPart } from "../opencode/api.js";
-import { sessionGet, sessionMessages } from "../opencode/client.js";
+import { sessionGet, sessionIdle, sessionMessages } from "../opencode/client.js";
+import type { ConnectionState } from "../opencode/server.js";
+import { canonicalDir } from "../paths.js";
+import { formatTool, safeCodePayload, safePayload } from "./tool-format.js";
 import type { StateStore, ThreadState, VerboseMode } from "../state.js";
 import { viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
@@ -38,6 +41,13 @@ export interface RenderDeps {
 }
 
 const registry = new Map<string, SessionView>();
+const connections = new Map<string, ConnectionState>();
+
+export function setProjectConnectionState(dir: string, state: ConnectionState): void {
+  const key = canonicalDir(dir);
+  connections.set(key, state);
+  for (const view of registry.values()) if (view.projectDir === key) view.setConnectionState(state);
+}
 
 let reactionWarned = false;
 
@@ -77,13 +87,29 @@ export function errorMessage(err: unknown, fallback = "unknown session error"): 
   return fallback;
 }
 
-/**
- * One-line, ≤n chars: keep the first line only, collapse whitespace runs,
- * truncate. Keeps thread tool lines compact — bash commands especially.
- */
-function squeeze(s: string, n: number): string {
-  const first = s.split("\n", 1)[0] ?? "";
-  return truncate(first.replace(/\s+/g, " ").trim(), n);
+/** Only structured Slack errors prove a missing message; network errors don't. */
+function messageNotFound(err: unknown): boolean {
+  const e = err as { data?: { error?: string }; code?: string } | undefined;
+  return e?.data?.error === "message_not_found" || e?.code === "message_not_found";
+}
+
+type Transcript = Awaited<ReturnType<typeof sessionMessages>>;
+
+/** Only the newest relevant turn and its actual tool states prove completion. */
+function completedTail(msgs: Transcript, since: number): Transcript[number] | undefined {
+  const relevant = msgs.filter((m) => (m.info?.time?.created ?? 0) >= since)
+    .sort((a, b) => (a.info.time?.created ?? 0) - (b.info.time?.created ?? 0));
+  const last = relevant.at(-1);
+  if (last?.info.role !== "assistant" || !last.info.time?.completed) return;
+  // A completed tool-use step is not a completed answer, even if status raced idle.
+  const finish = (last.info as typeof last.info & { finish?: string }).finish;
+  if (finish === "tool-calls" || finish === "unknown") return;
+  const tools = new Map<string, string | undefined>();
+  for (const m of relevant) for (const p of m.parts ?? []) {
+    if (p.type === "tool") tools.set(p.callID ?? p.id, p.state?.status);
+  }
+  if ([...tools.values()].some((s) => s !== "completed" && s !== "error")) return;
+  return last;
 }
 
 export function getView(sessionId: string): SessionView | undefined {
@@ -91,6 +117,7 @@ export function getView(sessionId: string): SessionView | undefined {
 }
 
 export function deleteView(sessionId: string): void {
+  registry.get(sessionId)?.dispose();
   registry.delete(sessionId);
 }
 
@@ -99,12 +126,14 @@ export function deleteView(sessionId: string): void {
  * project dir — the idle reaper spares servers with active work.
  */
 export function hasActiveViewForProject(dir: string): boolean {
+  dir = canonicalDir(dir);
   for (const v of registry.values()) if (v.projectDir === dir) return true;
   return false;
 }
 
 /** Finalize every live view bound to a project dir with a visible reason. */
 export async function finalizeViewsForProject(dir: string, reason: string): Promise<void> {
+  dir = canonicalDir(dir);
   const targets = [...registry.values()].filter((v) => v.projectDir === dir);
   for (const v of targets) await v.finalize(reason);
 }
@@ -146,7 +175,7 @@ export function describeActiveRuns(): ActiveRunInfo[] {
 export async function reconcileStaleViews(staleMs = 120_000, dir?: string): Promise<number> {
   let n = 0;
   for (const v of [...registry.values()]) {
-    if (dir && v.projectDir !== dir) continue;
+    if (dir && v.projectDir !== canonicalDir(dir)) continue;
     try {
       if (await v.reconcileIfStale(Date.now(), staleMs)) n++;
     } catch (err) {
@@ -157,11 +186,12 @@ export async function reconcileStaleViews(staleMs = 120_000, dir?: string): Prom
 }
 
 function registerView(view: SessionView): void {
-  // Bound memory: drop the oldest finalized view when exceeding the cap.
+  // Bound memory: dispose the oldest view (including its timers) at the cap.
   if (registry.size >= 120) {
     const first = registry.keys().next().value;
-    if (first) registry.delete(first);
+    if (first) deleteView(first);
   }
+  registry.get(view.sessionId)?.dispose();
   registry.set(view.sessionId, view);
 }
 
@@ -210,11 +240,18 @@ export class SessionView {
   private readonly postedPartIds = new Set<string>();
   /** Tool call ids whose start line is already posted (pending → running dedup). */
   private readonly postedToolStarts = new Set<string>();
+  private readonly terminalTools = new Set<string>();
+  private toolTimer: NodeJS.Timeout | null = null;
+  private readonly waiting = new Map<string, "question" | "permission">();
+  private connectionState: ConnectionState;
+  private generation = 0;
+  private reconcileInFlight: Promise<boolean> | null = null;
+  private disposed = false;
   /**
    * Buffered tool-start lines. Verbose-on used to post one Slack message per
    * tool call — tool-heavy runs backed the 1/s FIFO up and flooded phone
    * clients. Lines accumulate and flush as one message on section flips,
-   * buffer pressure, or finalize.
+   * buffer pressure, the 1.5s deadline, or finalize.
    */
   private readonly toolBuf: string[] = [];
   private toolCalls = 0;
@@ -247,6 +284,8 @@ export class SessionView {
   private contentBelow = false;
   /** Serializes sink rounds — at most one post→adopt→delete in flight. */
   private sinkInFlight = false;
+  private sinkRetryAt = 0;
+  private sinkFailures = 0;
   /**
    * Circuit breaker for the strict sink: when this channel's lane is deep in
    * queued work (a torrent run), skip the sink attempt — the bar trails until
@@ -299,7 +338,8 @@ export class SessionView {
   constructor(opts: SessionViewOpts) {
     this.sessionId = opts.sessionId;
     this.client = opts.client;
-    this.projectDir = opts.projectDir;
+    this.projectDir = canonicalDir(opts.projectDir);
+    this.connectionState = connections.get(this.projectDir) ?? "connected";
     this.channel = opts.channel;
     this.threadTs = opts.threadTs;
     this.threadKey = opts.threadKey;
@@ -312,6 +352,66 @@ export class SessionView {
 
   setVerbose(v: VerboseMode): void {
     this.verbose = v;
+    if (v === "off") {
+      this.cancelToolTimer();
+      this.toolBuf.length = 0;
+    }
+  }
+
+  setConnectionState(state: ConnectionState): void {
+    if (this.finalized || this.disposed) return;
+    this.connectionState = state;
+    this.stalled = false;
+    this.generation++;
+  }
+
+  /** IDs are scoped by kind, so independent asks cannot clear each other. */
+  setWaiting(id: string, kind: "question" | "permission", waiting: boolean): void {
+    if (this.finalized || this.disposed) return;
+    const key = `${kind}:${id}`;
+    if (waiting) this.waiting.set(key, kind);
+    else this.waiting.delete(key);
+    this.generation++;
+    this.stalled = false;
+    this.lastEventAt = Date.now();
+    this.cancelIdleGrace();
+    if (this.active && !this.attached) this.armWatchdog();
+  }
+
+  /** Call after an external question/permission thread post succeeds. */
+  contentPosted(): void {
+    if (this.finalized || this.disposed) return;
+    this.contentBelow = true;
+    this.maybeSink();
+  }
+
+  private stopTimers(): void {
+    this.stopPolling();
+    this.cancelIdleGrace();
+    this.cancelToolTimer();
+    if (this.ticker) clearInterval(this.ticker);
+    if (this.watchdog) clearTimeout(this.watchdog);
+    this.ticker = this.watchdog = null;
+  }
+
+  /** Detach immediately; in-flight status posts clean themselves up on arrival. */
+  dispose(): void {
+    this.disposed = true;
+    this.active = false;
+    this.generation++;
+    this.stopTimers();
+    this.toolBuf.length = 0;
+    if (this.statusTs) {
+      void this.deleteStatus(this.statusTs);
+      this.statusTs = null;
+    }
+  }
+
+  private async deleteStatus(ts: string): Promise<void> {
+    try { await this.deps.delete(this.channel, ts); }
+    catch (err) {
+      if (!messageNotFound(err)) logErr(`status cleanup failed (${this.sessionId}, ${ts}): ${errorMessage(err)}`);
+    }
   }
 
   /** Read-throughs for the \status board (describeActiveRuns) — no registry surgery. */
@@ -328,33 +428,51 @@ export class SessionView {
   /**
    * RB2: a run whose completion signals were all lost (SSE dropped during the
    * final events) will never receive another event — its ⏳ hangs forever.
-   * Reconcile from polled server state: finalize ONLY when the server proves
-   * the run completed (an assistant message created for THIS run carrying a
-   * completed timestamp); a genuinely long-running prompt stays untouched.
+   * Require verified idle status and the newest completed transcript turn;
+   * local waits and changes during the poll invalidate that proof.
    * Returns true when it finalized.
    */
-  async reconcileIfStale(now = Date.now(), staleMs = 120_000): Promise<boolean> {
-    if (this.finalized || !this.active) return false;
-    if (now - this.lastEventAt < staleMs) return false;
-    let completed = false;
-    try {
-      const msgs = await sessionMessages(this.client, this.sessionId);
-      for (const m of msgs) {
-        if (m.info?.role !== "assistant") continue;
-        if ((m.info.time?.created ?? 0) < this.runStartedAt - 2_000) continue;
-        if (m.info.time?.completed) {
-          completed = true;
-          break;
-        }
+  reconcileIfStale(now = Date.now(), staleMs = 120_000): Promise<boolean> {
+    if (this.reconcileInFlight) return this.reconcileInFlight;
+    if (this.finalized || this.disposed || !this.active || now - this.lastEventAt < staleMs) return Promise.resolve(false);
+    const generation = this.generation;
+    const sessionId = this.sessionId;
+    const run = (async () => {
+      try {
+        await this.tail;
+        if (this.finalized || this.disposed || generation !== this.generation) return false;
+        const msgs = await sessionMessages(this.client, sessionId);
+        this.reconcileReceipts(msgs);
+        const idle = await sessionIdle(this.client, sessionId);
+        const check = this.tail.then(async () => {
+          if (this.finalized || this.disposed || generation !== this.generation || this.waiting.size) return false;
+          if (!idle) return false;
+          const completed = completedTail(msgs, this.runStartedAt - 2_000);
+          if (!completed) {
+            if (this.attached && !this.streamedAny && !msgs.some((m) => (m.info.time?.created ?? 0) >= this.runStartedAt - 2_000)) {
+              await this.stopWatchingInner(`:eye_in_speech_bubble: Nothing running in \`${safePayload(shortId(this.sessionId))}\` right now — \`\\watch\` again when it starts.`);
+              return true;
+            }
+            return false;
+          }
+          // Lost terminal events can leave activeTools stale. Transcript states
+          // above, not that event cache, decide whether tools are still pending.
+          await this.finalizeInner(completed.info.error ? errorMessage(completed.info.error) : undefined);
+          return true;
+        });
+        this.tail = check.then(() => {}, () => {});
+        return await check;
+      } catch (err) {
+        logErr(`reconcile failed (${sessionId}): ${errorMessage(err)}`);
+        return false;
       }
-    } catch {
-      return false; // server unreachable — the death hook / next sweep owns that
-    }
-    if (!completed) return false;
-    // Public finalize() is correct here: reconcile runs OUTSIDE the tail
-    // chain (timer / SSE-resume paths), so chaining is safe.
-    await this.finalize();
-    return true;
+    })();
+    this.reconcileInFlight = run.finally(() => { this.reconcileInFlight = null; });
+    return this.reconcileInFlight;
+  }
+
+  private reconcileReceipts(msgs: Transcript): void {
+    for (const m of msgs) if (m.info?.role === "user") this.state.reconcilePromptAcceptance(this.projectDir, m.info);
   }
 
   /**
@@ -363,6 +481,7 @@ export class SessionView {
    * on the user's message continues uninterrupted.
    */
   retargetSession(newSessionId: string): void {
+    this.generation++;
     registry.delete(this.sessionId);
     this.sessionId = newSessionId;
     registry.set(newSessionId, this);
@@ -370,14 +489,15 @@ export class SessionView {
 
   /** Idempotent: posts the live-status placeholder once per run. */
   async start(): Promise<void> {
-    if (this.statusTs) return;
+    if (this.statusTs || this.finalized || this.disposed) return;
     this.lastSection = null;
     // Interactive: the run's ack message — the user is staring at the thread
     // waiting for it; it must not queue behind background stream traffic.
-    const { ts } = await this.deps.post(this.channel, this.threadTs, ":hourglass: OpenCode is on it…", undefined, {
+    const { ts } = await this.deps.post(this.channel, this.threadTs, "⏳ OpenCode is on it…", undefined, {
       unfurl: false,
       lane: "interactive",
     });
+    if (this.finalized || this.disposed) { await this.deleteStatus(ts); return; }
     this.statusTs = ts;
   }
 
@@ -390,26 +510,25 @@ export class SessionView {
     if (this.watchdog) clearTimeout(this.watchdog);
     this.watchdog = setTimeout(() => {
       this.watchdog = null;
-      if (this.finalized || this.statusTs == null) return;
-      if (Date.now() - this.lastEventAt < SessionView.WATCHDOG_MS - 1_000) {
+      if (this.finalized || this.disposed || this.statusTs == null) return;
+      if (this.waiting.size || this.connectionState !== "connected" || Date.now() - this.lastEventAt < SessionView.WATCHDOG_MS - 1_000) {
         this.armWatchdog(); // events are still landing — just re-check later
         return;
       }
       this.nudges += 1;
       this.stalled = true; // the ticker takes over the stall line from here
-      void this.deps
-        .update(this.channel, this.statusTs, ":hourglass: still working… no updates for 3m — `\\stop` to cancel")
-        .catch(() => {});
+      void this.updateStatus(this.statusTs, "⏳ still working… no updates for 3m — `\\stop` to cancel");
       // First true stall also pages the owner — a stalled run needs attention
       // even when nobody is watching the thread.
       if (this.nudges === 1) {
         const proj = this.projectDir.split("/").filter(Boolean).pop() ?? "run";
         void this.deps
-          .dm?.(this.channel, this.threadTs, `:alarm_clock: *${proj}* stalled — no events for 3m. Reply \`\\stop\` in the thread to cancel.`)
+          .dm?.(this.channel, this.threadTs, `:alarm_clock: *${safePayload(proj)}* stalled — no events for 3m. Reply \`\\stop\` in the thread to cancel.`)
           .catch(() => {});
       }
       if (this.nudges < SessionView.MAX_NUDGES) this.armWatchdog();
     }, SessionView.WATCHDOG_MS);
+    this.watchdog.unref();
   }
 
   /**
@@ -419,6 +538,8 @@ export class SessionView {
    * back-to-back prompts on an active session.
    */
   async beginPrompt(userMsgTs: string): Promise<void> {
+    if (this.finalized || this.disposed) return;
+    this.generation++;
     // A prompt through this thread means Slack is taking the watched session
     // over — stop the transcript poll and let the SSE handlers own delivery
     // (the runPrompt watchOnly gate has already been passed by \resume).
@@ -435,6 +556,7 @@ export class SessionView {
     this.lastEventAt = Date.now();
     this.armWatchdog();
     await this.start();
+    if (this.finalized || this.disposed) return;
     this.startTicker();
     // Tombstone for the interrupt sweep: if the bridge dies before finalize,
     // the next boot can resolve this thread's ⏳ instead of leaving it frozen.
@@ -446,7 +568,7 @@ export class SessionView {
     if (wasActive) {
       // Interactive: this ack directly answers the user's just-sent message.
       await this.deps
-        .post(this.channel, this.threadTs, ":hourglass: Queued — runs after the current task.", undefined, {
+        .post(this.channel, this.threadTs, "⏳ Queued — runs after the current task.", undefined, {
           unfurl: false,
           lane: "interactive",
         })
@@ -474,6 +596,8 @@ export class SessionView {
    * \history's job, not the watcher's.
    */
   async attach(): Promise<void> {
+    if (this.finalized || this.disposed) return;
+    this.generation++;
     this.attached = true;
     this.active = true; // \status "runs in flight" + the idle reaper's busy check
     this.runStartedAt = Date.now();
@@ -486,6 +610,7 @@ export class SessionView {
       undefined,
       { unfurl: false },
     );
+    if (this.finalized || this.disposed) { await this.deleteStatus(ts); return; }
     this.statusTs = ts;
     this.startTicker();
     this.pollTimer = setInterval(() => void this.pollTranscript(), SessionView.POLL_MS);
@@ -531,77 +656,69 @@ export class SessionView {
       return;
     }
     this.pollInFlight = true;
+    const generation = this.generation;
     try {
       const msgs = await sessionMessages(this.client, this.sessionId);
-      if (this.finalized || !this.attached) return;
-      const grew = msgs.length !== this.lastTranscriptSize;
-      const firstPoll = this.lastTranscriptSize === 0;
-      this.lastTranscriptSize = msgs.length;
-      if (grew && !firstPoll) this.cancelSettle(); // fresh activity always outvotes a pending settle
+      this.reconcileReceipts(msgs);
+      const idle = await sessionIdle(this.client, this.sessionId).catch(() => false);
+      const run = this.tail.then(async () => {
+        if (this.finalized || this.disposed || !this.attached || generation !== this.generation) return;
+        const grew = msgs.length !== this.lastTranscriptSize;
+        const firstPoll = this.lastTranscriptSize === 0;
+        this.lastTranscriptSize = msgs.length;
+        if (grew && !firstPoll) this.cancelSettle(); // fresh activity always outvotes a pending settle
 
-      let newToolLines: string[] = [];
-      for (const m of msgs) {
-        const created = m.info?.time?.created ?? 0;
-        if (created < this.runStartedAt - 2_000) continue; // pre-attach history is \history's job
-        if (m.info?.role === "user") {
-          this.activityUpdate("new prompt on the computer…");
-          continue;
-        }
-        if (m.info?.role !== "assistant") continue;
-        const done = !!m.info.time?.completed;
-        for (const p of m.parts ?? []) {
-          if (p.type === "text") {
-            const text = (p as { text?: string }).text ?? "";
-            if (!text.trim() || this.postedPartIds.has(p.id)) continue;
-            // Stream while incomplete; post leftovers once the message completes.
-            if (!p.time?.end && !done) {
-              this.pendingText.set(p.id, text);
-              this.activityUpdate("typing…");
-              continue;
+        for (const m of msgs) {
+          if (this.disposed) return;
+          const created = m.info?.time?.created ?? 0;
+          if (created < this.runStartedAt - 2_000) continue; // pre-attach history is \history's job
+          if (m.info?.role === "user") {
+            this.activityUpdate("new prompt on the computer…");
+            continue;
+          }
+          if (m.info?.role !== "assistant") continue;
+          const done = !!m.info.time?.completed;
+          for (const p of m.parts ?? []) {
+            if (this.disposed || !this.attached) return;
+            if (p.type === "text") {
+              const text = (p as { text?: string }).text ?? "";
+              if (!text.trim() || this.postedPartIds.has(p.id)) continue;
+              // Stream while incomplete; post leftovers once the message completes.
+              if (!p.time?.end && !done) {
+                this.pendingText.set(p.id, text);
+                this.activityUpdate("typing…");
+                continue;
+              }
+              this.pendingText.delete(p.id);
+              this.postedPartIds.add(p.id);
+              this.streamedAny = true;
+              await this.postThreadText(text);
+            } else if (p.type === "tool") {
+              await this.handleTool(p);
+              if (this.verbose !== "off") this.streamedAny = true;
+            } else if (p.type === "file") {
+              await this.postFilePart(p).catch(() => {});
+              this.streamedAny = true;
             }
-            this.pendingText.delete(p.id);
-            this.postedPartIds.add(p.id);
-            this.streamedAny = true;
-            await this.postThreadText(text);
-          } else if (p.type === "tool") {
-            const callId = p.callID ?? p.id;
-            const st = p.state ?? {};
-            if ((st.status === "running" || st.status === "completed") && !this.postedToolStarts.has(callId)) {
-              this.postedToolStarts.add(callId);
-              this.toolCalls += 1;
-              this.activityUpdate(`tool: ${this.toolTitle(p)}`);
-              if (st.status === "running") newToolLines.push(this.toolLine(p, this.toolTitle(p)));
-            }
-          } else if (p.type === "file") {
-            await this.postFilePart(p).catch(() => {});
-            this.streamedAny = true;
           }
         }
-      }
-      if (newToolLines.length) {
-        this.toolBuf.push(...newToolLines);
-        await this.flushTools();
-      }
-
-      const tail = msgs.at(-1);
-      const tailCreated = tail?.info?.time?.created ?? 0;
-      const tailDone = tail?.info?.role === "assistant" && !!tail.info.time?.completed;
-      const postAttach = tailCreated >= this.runStartedAt - 2_000;
-      if (!postAttach || (tailDone && !grew) || (!tailDone && !grew && !firstPoll && tailCreated < this.runStartedAt)) {
-        // Either the streamed run completed, or nothing has happened since
-        // attach (idle session) — settle and end the watch either way.
-        if (!this.settleTimer) {
-          this.settleTimer = setTimeout(() => {
-            this.settleTimer = null;
-            void (this.streamedAny
-              ? this.finalize()
-              : this.stopWatching(
-                  `:eye_in_speech_bubble: Nothing running in \`${shortId(this.sessionId)}\` right now — \`\\watch\` again when it starts.`,
-                ));
-          }, SessionView.WATCH_SETTLE_MS);
-          this.settleTimer.unref();
-        }
-      }
+        const tail = msgs.at(-1);
+        const tailCreated = tail?.info?.time?.created ?? 0;
+        const tailDone = !!completedTail(msgs, this.runStartedAt - 2_000);
+        const postAttach = tailCreated >= this.runStartedAt - 2_000;
+        if (idle && !this.waiting.size && (!postAttach || (tailDone && !grew))) {
+          // Recheck server proof when the settle timer fires, not just here.
+          if (!this.settleTimer) {
+            this.settleTimer = setTimeout(() => {
+              this.settleTimer = null;
+              void this.reconcileIfStale(Date.now(), 0);
+            }, SessionView.WATCH_SETTLE_MS);
+            this.settleTimer.unref();
+          }
+        } else this.cancelSettle();
+      });
+      this.tail = run.then(() => {}, () => {});
+      await run;
     } catch (err) {
       // The server for this project died mid-watch: the pool's death hook
       // finalizes this view with a visible reason — swallow poll errors here.
@@ -617,20 +734,23 @@ export class SessionView {
    * settle. Idempotent with finalize() (whichever ran first wins).
    */
   async stopWatching(reason?: string): Promise<void> {
-    if (this.finalized) return;
-    this.stopPolling();
+    const run = this.tail.then(() => this.stopWatchingInner(reason));
+    this.tail = run.then(() => {}, () => {});
+    return run;
+  }
+
+  private async stopWatchingInner(reason?: string): Promise<void> {
+    if (this.finalized || this.disposed) return;
+    this.finalized = true;
+    this.stopTimers();
     this.active = false;
-    if (this.ticker) {
-      clearInterval(this.ticker);
-      this.ticker = null;
-    }
     if (this.statusTs) {
-      await this.deps.delete(this.channel, this.statusTs).catch(() => {});
+      await this.deleteStatus(this.statusTs);
       this.statusTs = null;
     }
     const cur = this.state.getThread(this.threadKey);
     if (cur) this.state.setThread(this.threadKey, { ...cur, watchOnly: false });
-    deleteView(this.sessionId);
+    if (registry.get(this.sessionId) === this) deleteView(this.sessionId);
     if (reason) await this.deps.post(this.channel, this.threadTs, reason, undefined, { unfurl: false }).catch(() => {});
   }
 
@@ -644,6 +764,7 @@ export class SessionView {
    * stall the grace forever). Quiet expiry means the queue really drained.
    */
   private async onIdle(): Promise<void> {
+    if (this.waiting.size) return;
     this.outstandingPrompts = Math.max(0, this.outstandingPrompts - 1);
     if (this.outstandingPrompts > 0) {
       this.cancelIdleGrace();
@@ -651,6 +772,7 @@ export class SessionView {
         this.idleGrace = null;
         void this.finalize();
       }, SessionView.IDLE_GRACE_MS);
+      this.idleGrace.unref();
       return;
     }
     // NOTE: onIdle runs INSIDE the serialized tail chain — calling the public
@@ -661,7 +783,8 @@ export class SessionView {
   }
 
   async handle(ev: OcEvent): Promise<void> {
-    if (this.finalized) return;
+    if (this.finalized || this.disposed) return;
+    this.generation++;
     // Serialize event processing: Slack's API delivers results the instant a
     // post is enqueued, so two events processed concurrently can enqueue their
     // posts out of arrival order (dividers/messages out of order). Chain every
@@ -677,6 +800,7 @@ export class SessionView {
   }
 
   private async handleInner(ev: OcEvent): Promise<void> {
+    if (this.finalized || this.disposed) return;
     this.lastEventAt = Date.now();
     this.stalled = false; // any SSE signal means the run is alive — drop the stall line
     const props = (ev.properties ?? {}) as Record<string, unknown>;
@@ -740,7 +864,7 @@ export class SessionView {
         if (st.type === "busy") {
           this.cancelIdleGrace(); // a queued run took over before the grace expired
           this.activityUpdate("working…");
-        } else if (st.type === "retry") this.activityUpdate(`retrying${st.message ? `: ${truncate(st.message, 60)}` : ""} (attempt ${st.attempt ?? "?"})`);
+        } else if (st.type === "retry") this.activityUpdate(`retrying${st.message ? `: ${safePayload(truncate(st.message, 60))}` : ""} (attempt ${st.attempt ?? "?"})`);
         else if (st.type === "idle") await this.onIdle();
         return;
       }
@@ -753,7 +877,7 @@ export class SessionView {
       case "file.edited": {
         if (typeof props.file === "string") {
           this.files.add(props.file);
-          this.activityUpdate(`edited ${shortPath(props.file)}`);
+          this.activityUpdate(`edited ${safePayload(shortPath(props.file))}`);
         }
         return;
       }
@@ -788,13 +912,13 @@ export class SessionView {
   private static readonly TICK_MS = 1_000;
 
   private tick(): void {
-    if (this.finalized || this.statusTs == null || this.tickInFlight) return;
+    if (this.finalized || this.disposed || this.tickInFlight) return;
     // The sink owns the beat whenever the bar isn't at the bottom (issue #6):
     // re-homing it IS this second's refresh — a same-second re-render on top
     // would double-post. Sinks are never gated on queue depth; the round-1 #4
     // design gated them inside the ticker, so any sustained queue traffic
     // pinned the bar to the top for the whole run.
-    if (this.contentBelow || this.sinkInFlight) {
+    if (this.contentBelow || this.sinkInFlight || this.statusTs == null) {
       this.maybeSink();
       return;
     }
@@ -805,12 +929,22 @@ export class SessionView {
     if (laneDepth(this.channel) > 0) return;
     this.tickInFlight = true;
     this.tickSeen += 1;
-    void this.deps
-      .update(this.channel, this.statusTs, this.statusText())
-      .catch(() => {})
+    void this.updateStatus(this.statusTs, this.statusText())
       .finally(() => {
         this.tickInFlight = false;
       });
+  }
+
+  private async updateStatus(ts: string, text: string): Promise<void> {
+    try { await this.deps.update(this.channel, ts, text); }
+    catch (err) {
+      if (messageNotFound(err) && this.statusTs === ts && !this.finalized && !this.disposed) {
+        this.statusTs = null;
+        this.syncTombstoneStatusTs();
+        this.contentBelow = true;
+        this.maybeSink();
+      } else if (!messageNotFound(err)) logErr(`status update failed (${this.sessionId}): ${errorMessage(err)}`);
+    }
   }
 
   /**
@@ -820,11 +954,12 @@ export class SessionView {
    * adopt its ts, delete the old one. Coalesced by sinkInFlight (bursts chain
    * back-to-back rounds via the finally re-check, never overlapping); the
    * lane-depth circuit breaker makes torrents trail the bar instead of
-   * burying the lane in stale sink pairs. On a failed post the old status and
-   * the flag stay — the next content post (or tick) retries.
+   * burying the lane in stale sink pairs. Failed posts retain the dirty flag;
+   * later ticks/content retry after the 2/4/8/16/30s backoff deadline.
    */
   private maybeSink(): void {
-    if (this.finalized || this.statusTs == null || this.sinkInFlight || !this.contentBelow) return;
+    if (this.finalized || this.disposed || this.sinkInFlight || !this.contentBelow || Date.now() < this.sinkRetryAt) return;
+    if (this.statusTs == null && !this.active) return;
     if (laneDepth(this.channel) > SessionView.SINK_MAX_LANE_DEPTH) return;
     this.sinkInFlight = true;
     // The flag is CONSUMED up front so content landing mid-flight re-arms it
@@ -840,16 +975,20 @@ export class SessionView {
         // finalize() may have run while the post was in flight (it deletes the
         // then-current statusTs). If so, the message we just posted is an
         // orphan — delete it rather than re-adopting it.
-        if (this.finalized) return this.deps.delete(this.channel, ts).catch(() => {});
+        if (this.finalized || this.disposed) return this.deleteStatus(ts);
+        this.sinkFailures = 0;
+        this.sinkRetryAt = 0;
         this.statusTs = ts;
         // The crash-recovery tombstone must point at the LIVE bar: a bridge
         // death after a sink would otherwise leave the boot interrupt sweep
         // deleting a stale ts and missing this one (orphaned "still working").
         this.syncTombstoneStatusTs();
-        return this.deps.delete(this.channel, oldTs).catch(() => {});
+        if (oldTs) return this.deleteStatus(oldTs);
       })
-      .catch(() => {
+      .catch((err) => {
         this.contentBelow = true; // the sink failed — retry on a later beat/post
+        this.sinkRetryAt = Date.now() + Math.min(30_000, 2_000 * 2 ** Math.min(this.sinkFailures++, 4));
+        logErr(`status sink failed (${this.sessionId}): ${errorMessage(err)}`);
       })
       .finally(() => {
         this.sinkInFlight = false;
@@ -860,15 +999,23 @@ export class SessionView {
 
   /** Keep the interrupt sweep's tombstone pointed at the live status message. */
   private syncTombstoneStatusTs(): void {
-    if (this.statusTs == null) return;
     const cur = this.state.getThread(this.threadKey);
     if (!cur?.pendingRun || cur.pendingRun.statusTs === this.statusTs) return;
-    this.state.setThread(this.threadKey, { ...cur, pendingRun: { ...cur.pendingRun, statusTs: this.statusTs } });
+    this.state.setThread(this.threadKey, { ...cur, pendingRun: { ...cur.pendingRun, statusTs: this.statusTs ?? undefined } });
   }
 
   private statusText(): string {
-    const glass = this.tickSeen % 2 ? ":hourglass_flowing_sand:" : ":hourglass:";
+    const glass = this.tickSeen % 2 ? "⌛" : "⏳";
     const elapsed = dur(Date.now() - this.runStartedAt);
+    if (this.waiting.size) {
+      const kinds = new Set(this.waiting.values());
+      const what = kinds.size === 2 ? "your answer and permission" : kinds.has("question") ? "your answer" : "permission";
+      return `${glass} Waiting for ${what} (${elapsed})`;
+    }
+    if (this.connectionState !== "connected") {
+      const label = this.connectionState === "connecting" ? "Connecting to OpenCode" : this.connectionState === "reconnecting" ? "Reconnecting to OpenCode" : "Disconnected from OpenCode";
+      return `${glass} ${label} · last update ${dur(Date.now() - this.lastEventAt)} ago`;
+    }
     // Watching mirrors someone else's driving — a distinct prefix so the line
     // never reads as if Slack started this run.
     if (this.attached) return `👀 ${this.activity || "watching…"} (${elapsed})`;
@@ -879,15 +1026,7 @@ export class SessionView {
   }
 
   private toolTitle(part: OcPart): string {
-    const st = part.state ?? {};
-    if (st.title) return squeeze(String(st.title), 60);
-    const input = (st.input ?? {}) as Record<string, unknown>;
-    const tool = part.tool ?? "tool";
-    if (typeof input.command === "string") return `bash: ${squeeze(input.command, 60)}`;
-    if (typeof input.filePath === "string") return `${tool}: ${shortPath(input.filePath)}`;
-    if (typeof input.pattern === "string") return `${tool}: ${squeeze(input.pattern, 40)}`;
-    if (typeof input.url === "string") return `${tool}: ${squeeze(input.url, 50)}`;
-    return tool;
+    return formatTool(part, this.projectDir);
   }
 
   /**
@@ -909,7 +1048,8 @@ export class SessionView {
 
   /** Post the section divider + first line as one message when a divider is due. */
   private async postSection(s: "tools" | "response", firstLine: string): Promise<void> {
-    const divider = this.enterSection(s);
+    if (this.disposed) return;
+    const divider = this.verbose === "off" ? null : this.enterSection(s);
     // Tool chatter suppresses link previews; answer text keeps them.
     await this.deps.post(
       this.channel,
@@ -927,96 +1067,53 @@ export class SessionView {
 
   /** Emit buffered tool lines as a single tools-section message (atomic with the divider). */
   private async flushTools(): Promise<void> {
+    this.cancelToolTimer();
     if (!this.toolBuf.length) return;
     const body = this.toolBuf.join("\n");
     this.toolBuf.length = 0;
+    if (this.verbose === "off" || this.disposed) return;
     await this.postSection("tools", body);
   }
 
-  /**
-   * Compact one-line rendering of a tool invocation.
-   * Pending events carry empty input, so derivation there ends in "…" — but the
-   * running/completed events fill in targets, and OpenCode's own state.title
-   * ("Read /a/b.ts", `Grep "pat"`, "$ cmd") is preferred verbatim once set.
-   */
-  private toolLine(part: OcPart, fallbackTitle: string): string {
-    const tool = part.tool ?? "";
-    const st = (part.state ?? {}) as { input?: Record<string, unknown> };
-    const stateTitleRaw = (part.state as { title?: unknown } | undefined)?.title;
-    const stateTitle = typeof stateTitleRaw === "string" ? stateTitleRaw.trim() : "";
-    const input = st.input ?? {};
-    const str = (...keys: string[]): string | undefined => {
-      for (const k of keys) {
-        const v = input[k];
-        if (typeof v === "string" && v.trim()) return v.trim();
-      }
-      return undefined;
-    };
-    // Display paths relative to the session's project dir when possible.
-    const dir = this.projectDir.replace(/\/+$/, "");
-    const rel = (s: string | undefined): string | undefined => {
-      if (!s || !dir) return s;
-      if (s.startsWith(`${dir}/`)) return s.slice(dir.length + 1);
-      return s;
-    };
-    // Rewrite any absolute project path inside a free-form title (e.g. "Read /p/x.ts").
-    const relIn = (s: string): string => (dir ? s.split(`${dir}/`).join("") : s);
-    // glob/grep show an "in path" suffix when a search root is set.
-    const inPath = (): string => {
-      const p = rel(str("path"));
-      return p ? ` in ${truncate(p, 60)}` : "";
-    };
+  private cancelToolTimer(): void {
+    if (this.toolTimer) clearTimeout(this.toolTimer);
+    this.toolTimer = null;
+  }
 
-    // Bash/shell: 🔧 + command (first line, squeezed hard — these get long).
-    if (tool === "bash" || tool === "shell") {
-      const cmdInput = str("command");
-      const cmd = cmdInput ? squeeze(cmdInput, 60) : fallbackTitle !== tool ? fallbackTitle : "…";
-      return `🔧 ${cmd}`;
-    }
-
-    // OpenCode's own human title is the best label once the tool is running —
-    // rewrite absolute paths to project-relative, keep it to one short line.
-    if (stateTitle) return squeeze(relIn(stateTitle), 60);
-
-    const derived = (): string => {
-      switch (tool) {
-        case "read":
-          return `📄 read ${squeeze(rel(str("filePath", "path")) ?? "…", 70)}`;
-        case "edit":
-          return `✏️ edit ${squeeze(rel(str("filePath", "path")) ?? "…", 70)}`;
-        case "write":
-          return `📝 write ${squeeze(rel(str("filePath", "path")) ?? "…", 70)}`;
-        case "glob":
-          return `🔍 glob "${squeeze(str("pattern") ?? "…", 40)}"${inPath()}`;
-        case "grep":
-          return `🔍 grep "${squeeze(str("pattern", "query") ?? "…", 40)}"${inPath()}`;
-        case "list":
-          return `🗂️ list ${squeeze(rel(str("path")) ?? "…", 60)}`;
-        case "webfetch":
-          return `🌐 fetch ${squeeze(str("url") ?? "…", 60)}`;
-        case "websearch":
-          return `🌐 search "${squeeze(str("query") ?? "…", 50)}"`;
-        case "skill":
-          return `⚡ skill ${squeeze(str("name") ?? "…", 40)}`;
-        case "task":
-          return `🤖 task ${squeeze(str("subagent_type", "description", "prompt") ?? "…", 60)}`;
-        case "question":
-          return "❓ question";
-        case "todowrite":
-          return "📋 todos";
-        case "patch":
-          return `🩹 patch ${squeeze(rel(str("filePath", "path")) ?? "…", 60)}`;
-        default:
-          return `🔧 ${squeeze(fallbackTitle || tool || "tool", 40)}`;
-      }
-    };
-    return derived();
+  private bufferTool(part: OcPart): void {
+    const callId = part.callID ?? part.id;
+    if (this.postedToolStarts.has(callId)) return;
+    this.postedToolStarts.add(callId);
+    if (this.verbose === "off") return;
+    this.toolBuf.push(formatTool(part, this.projectDir));
+    if (this.toolTimer) return;
+    const timer = setTimeout(() => {
+      // Keep the token until the serialized flush executes: new items never
+      // slide the deadline, and an early flush invalidates this queued callback.
+      const run = this.tail.then(async () => {
+        if (this.toolTimer !== timer || this.finalized || this.disposed) return;
+        await this.flushTools();
+        this.maybeSink();
+      }).catch((err) => {
+        logErr(`tool batch failed (${this.sessionId}): ${errorMessage(err)}`);
+        void this.finalize(`tool batch delivery failed: ${errorMessage(err)}`);
+      });
+      this.tail = run.then(() => {}, () => {});
+    }, 1_500);
+    timer.unref();
+    this.toolTimer = timer;
   }
 
   private async handleTool(part: OcPart): Promise<void> {
     const st = part.state ?? {};
     const callId = part.callID ?? part.id;
     const title = this.toolTitle(part);
+    if (this.terminalTools.has(callId)) return;
+    if (st.status === "completed" || st.status === "error") {
+      this.terminalTools.add(callId);
+      this.toolCalls++;
+      this.bufferTool(part); // missing running event: synthesize its useful start
+    }
     switch (st.status) {
       case "running":
       case "pending": {
@@ -1025,20 +1122,14 @@ export class SessionView {
         // Pending events carry empty input ("📄 read …"); don't burn the one
         // line per call on it — wait for `running`, which has real targets.
         if (st.status === "pending") return;
-        if (this.verbose !== "off" && !this.postedToolStarts.has(callId)) {
-          this.postedToolStarts.add(callId);
-          // Batched: flush under buffer pressure; otherwise waits for the
-          // section flip / finalize so tool chatter doesn't flood the thread.
-          this.toolBuf.push(this.toolLine(part, title));
-          if (this.toolBuf.length >= 8 || this.toolBuf.join("\n").length > 2000) {
-            await this.flushTools();
-            this.maybeSink(); // tool lines landed below the bar — re-home it
-          }
+        this.bufferTool(part);
+        if (this.toolBuf.length >= 8 || this.toolBuf.join("\n").length > 2000) {
+          await this.flushTools();
+          this.maybeSink(); // tool lines landed below the bar — re-home it
         }
         return;
       }
       case "completed": {
-        this.toolCalls += 1;
         this.activeTools.delete(callId);
         this.activityUpdate(`done: ${title}`);
         if (this.verbose === "full") {
@@ -1049,30 +1140,32 @@ export class SessionView {
             // tool output belongs in the tools section
             if (out.length > 400) {
               await this.postSection("tools", `:hammer_and_wrench: ${title}`);
+              if (this.disposed) return;
               await this.deps.upload({
                 channelId: this.channel,
                 threadTs: this.threadTs,
-                filename: `${part.tool ?? "tool"}-${callId.slice(-6)}.txt`,
+                filename: `${part.tool ?? "tool"}-${callId.slice(-6)}.txt`.replace(/[^\w.-]/g, "-"),
                 content: out.slice(0, 200_000),
               });
             } else {
-              await this.postSection("tools", `\`\`\`${out.slice(0, 3700)}\`\`\``);
+              await this.postSection("tools", `\`\`\`${safeCodePayload(out.slice(0, 3700), true)}\`\`\``);
             }
             this.maybeSink(); // output landed below the bar — re-home it
           }
+        }
+        if (this.toolBuf.length >= 8 || this.toolBuf.join("\n").length > 2000) {
+          await this.flushTools();
+          this.maybeSink();
         }
         return;
       }
       case "error": {
         this.activeTools.delete(callId);
         this.activityUpdate(`⚠️ tool failed: ${title}`);
-        if (this.verbose !== "off") {
-          const errText = typeof st.error === "string" ? st.error : JSON.stringify(st.error);
-          await this.flushTools(); // buffered start lines precede the failure
-          // tool failures belong in the tools section
-          await this.postSection("tools", `⚠️ ${title} failed: ${truncate(errText ?? "unknown", 400)}`);
-          this.maybeSink(); // the failure line landed below the bar — re-home it
-        }
+        const errText = typeof st.error === "string" ? st.error : JSON.stringify(st.error);
+        await this.flushTools(); // buffered start lines precede the failure
+        await this.postSection("tools", `⚠️ ${title} failed: ${safePayload(truncate(errText ?? "unknown", 400))}`);
+        this.maybeSink(); // errors remain visible even in silent mode
         return;
       }
       default:
@@ -1093,9 +1186,11 @@ export class SessionView {
    * ⎯ response ⎯ divider, unlike tool chatter.
    */
   private async postFilePart(part: OcPart): Promise<void> {
+    if (this.disposed) return;
     const url = part.url ?? "";
     if (!url || this.postedPartIds.has(part.id)) return;
     this.postedPartIds.add(part.id);
+    await this.flushTools(); // including file-fetch failure notices
     const mime =
       part.mime ?? (url.startsWith("data:") ? url.slice(5, url.indexOf(";") || undefined) : undefined) ?? "application/octet-stream";
     let data: Buffer;
@@ -1112,7 +1207,7 @@ export class SessionView {
         .post(
           this.channel,
           this.threadTs,
-          `:warning: couldn't display ${part.filename ?? "model output file"} (${String((err as Error)?.message ?? err)})`,
+           `:warning: couldn't display ${safePayload(part.filename ?? "model output file")} (${safePayload(errorMessage(err))})`,
           undefined,
           { unfurl: false },
         )
@@ -1123,10 +1218,11 @@ export class SessionView {
         .catch(() => {});
       return;
     }
-    if (!data.length) return;
+    if (!data.length || this.disposed) return;
     const ext = mime.includes("/") ? mime.split("/").pop()! : "bin";
     const filename = part.filename ?? `output-${part.id.slice(-6)}.${ext}`;
     await this.flushTools(); // buffered tool chatter precedes response content
+    if (this.disposed) return;
     // Divider must precede the upload — post it with a tiny banner comment as
     // its own message when a section flip is due (uploads can't join text).
     const divider = this.enterSection("response");
@@ -1139,13 +1235,14 @@ export class SessionView {
       threadTs: this.threadTs,
       filename,
       file: data,
-      comment: `:framed_picture: ${filename} received.`,
+      comment: `:framed_picture: ${safePayload(filename)} received.`,
     });
     this.contentBelow = true; // the upload landed below the live-status line
     this.maybeSink(); // last message of this emit step — re-home the bar now
   }
 
   async postThreadText(text: string): Promise<void> {
+    if (this.disposed) return;
     // Assistants emit GitHub-flavored markdown; Slack speaks mrkdwn. Trim the
     // extremes: model parts routinely lead/trail with \n, and the divider joins
     // with \n\n — untrimmed, that becomes 3+ blank lines after ⎯ response ⎯.
@@ -1160,6 +1257,7 @@ export class SessionView {
     // Divider + first chunk post as ONE atomic message.
     await this.postSection("response", first);
     for (const chunk of chunks) {
+      if (this.disposed) return;
       await this.deps.post(this.channel, this.threadTs, chunk);
       this.contentBelow = true; // continuation chunk landed below the bar
     }
@@ -1171,19 +1269,23 @@ export class SessionView {
     // Finalize can be invoked from outside the event chain (prompt-failure
     // path in the router) — run it through the same serialization so it
     // can't interleave with an in-flight event render.
-    const run = this.tail.then(() => this.finalizeInner(err)).catch(() => {});
+    const run = this.tail.then(() => this.finalizeInner(err)).catch((error) => {
+      logErr(`finalize failed (${this.sessionId}): ${errorMessage(error)}`);
+      if (registry.get(this.sessionId) === this) deleteView(this.sessionId);
+    });
     this.tail = run.then(() => {}, () => {});
     return run;
   }
 
   private async finalizeInner(err?: string): Promise<void> {
-    if (this.finalized) return;
+    if (this.finalized || this.disposed) return;
     this.finalized = true;
+    this.generation++;
     this.active = false;
     // A watched run just ended — stop the poll and ungate the thread in the
     // same breath (watchOnly must never outlive its view).
     const wasWatch = this.attached;
-    this.stopPolling();
+    this.stopTimers();
     // Run completed normally — it is no longer an interruption candidate.
     // One write: clear any tombstone, and lift the watch gate when this was a
     // watched run (watchOnly must never outlive its view). A second spread of
@@ -1192,23 +1294,14 @@ export class SessionView {
     if (cur && (cur.pendingRun || wasWatch)) {
       this.state.setThread(this.threadKey, { ...cur, pendingRun: undefined, watchOnly: wasWatch ? false : cur.watchOnly });
     }
-    if (this.ticker) {
-      clearInterval(this.ticker);
-      this.ticker = null;
-    }
-    if (this.watchdog) {
-      clearTimeout(this.watchdog);
-      this.watchdog = null;
-    }
     this.outstandingPrompts = 0;
-    this.cancelIdleGrace();
-    await this.flushTools().catch(() => {});
+    await this.flushTools().catch((error) => logErr(`final tool flush failed (${this.sessionId}): ${errorMessage(error)}`));
 
     // Flush text that never got an explicit `end` marker.
     for (const [id, text] of this.pendingText) {
       if (text.trim() && !this.postedPartIds.has(id)) {
         this.postedPartIds.add(id);
-        await this.postThreadText(text).catch(() => {});
+        await this.postThreadText(text).catch((error) => logErr(`final text flush failed (${this.sessionId}): ${errorMessage(error)}`));
       }
     }
     this.pendingText.clear();
@@ -1220,6 +1313,7 @@ export class SessionView {
     // posted-set doesn't know about them). Errors degrade to SSE-only behavior.
     try {
       const msgs = await sessionMessages(this.client, this.sessionId);
+      this.reconcileReceipts(msgs);
       for (const m of msgs) {
         if (m.info?.role !== "assistant") continue;
         if ((m.info.time?.created ?? 0) < this.runStartedAt - 2_000) continue;
@@ -1260,13 +1354,13 @@ export class SessionView {
     const bits: string[] = [];
     // Current project name (basename of the session's dir) leads the line.
     const proj = this.projectDir.split("/").filter(Boolean).pop();
-    if (proj) bits.push(`*${proj}*`);
+    if (proj) bits.push(`*${safePayload(proj)}*`);
     if (summary && (summary.additions || summary.deletions || summary.files)) {
       bits.push(`+${summary.additions}/−${summary.deletions} across ${summary.files} file(s)`);
     } else if (this.files.size) {
       bits.push(`${this.files.size} file(s) touched`);
     }
-    if (model) bits.push(`\`${model}\``);
+    if (model) bits.push(`\`${safePayload(model)}\``);
     bits.push(dur(Date.now() - this.runStartedAt));
     if (cost) bits.push(money(cost));
     if (input || output) bits.push(`${tok(input)}↑/${tok(output)}↓`);
@@ -1278,19 +1372,21 @@ export class SessionView {
     // back-to-back messages can't miss their ✅/❌. The 👀 liveness ack from
     // dispatch is removed first — one state per message (seen → outcome).
     for (const ts of this.pendingUserMsgs) {
+      if (this.disposed) return;
       await this.reactOrLog(this.channel, ts, "eyes", false);
       await this.reactOrLog(this.channel, ts, err ? "x" : "white_check_mark", true);
     }
     this.pendingUserMsgs.length = 0;
     // The live-status message has served its purpose — remove it to keep the thread clean.
     if (this.statusTs) {
-      await this.deps.delete(this.channel, this.statusTs).catch(() => {});
+      await this.deleteStatus(this.statusTs);
       this.statusTs = null;
     }
     // The summary/error line is the one message that must never be lost: a
     // dropped post (rate-limit give-up etc.) used to skip the DM + registry
     // cleanup entirely and leak the view. If it fails, tell the owner by DM.
-    const summaryLine = err ? `:x: ${truncate(err, 200)}` : bits.length ? bits.join(" · ") : null;
+    if (this.disposed) return;
+    const summaryLine = err ? `:x: ${safePayload(truncate(err, 200))}` : bits.length ? bits.join(" · ") : null;
     if (summaryLine) {
       await this.deps.post(this.channel, this.threadTs, summaryLine, undefined, { unfurl: false }).catch(async (postErr) => {
         logErr(`run summary post failed (${this.sessionId}): ${String((postErr as Error)?.message ?? postErr)}`);
@@ -1304,7 +1400,7 @@ export class SessionView {
     // never hold up or fail the thread-side finalize.
     try {
       if (err) {
-        await this.deps.dm?.(this.channel, this.threadTs, `:x: *${proj ?? "run"}* failed: ${truncate(err, 200)}`);
+        await this.deps.dm?.(this.channel, this.threadTs, `:x: *${safePayload(proj ?? "run")}* failed: ${safePayload(truncate(err, 200))}`);
       } else if (bits.length) {
         const notify = this.state.getThread(this.threadKey)?.notify;
         if (notify) {
@@ -1322,6 +1418,6 @@ export class SessionView {
     } catch {
       /* DM is best-effort; the thread copy posted above */
     }
-    deleteView(this.sessionId);
+    if (registry.get(this.sessionId) === this) deleteView(this.sessionId);
   }
 }

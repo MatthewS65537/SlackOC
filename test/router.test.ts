@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { Jimp, JimpMime } from "jimp";
@@ -6,8 +6,11 @@ import { claimEvent, hushAction, handleIncomingMessage, type BridgeDeps, type Sl
 import type { RenderDeps } from "../src/slack/render.js";
 import type { ServerPool } from "../src/opencode/server.js";
 import type { SlackocConfig } from "../src/config.js";
-import { StateStore } from "../src/state.js";
+import { MAX_MESSAGE_RECEIPTS, RECOVERY_RECEIPT_RESERVE, StateStore } from "../src/state.js";
 import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_EDGE, TARGET_IMAGE_BYTES } from "../src/image.js";
+import { deleteView } from "../src/slack/render.js";
+import { sweepMissedMessages } from "../src/slack/catchup.js";
+import { registerCommand } from "../src/commands/registry.js";
 
 describe("claimEvent (Slack double-delivery dedup)", () => {
   it("claims a channel+ts exactly once", () => {
@@ -108,7 +111,7 @@ function ownerMsg(channel: string, ts: string, threadTs: string | undefined, tex
 }
 
 describe("rebind prompt failure (NB1)", () => {
-  it("a failed retry finalizes: ❌, error line, status removed, failure DM", async () => {
+  it("404 permits one rebind; an ambiguous retry retains evidence and reports uncertainty", async () => {
     let promptCalls = 0;
     const client = {
       session: {
@@ -128,19 +131,19 @@ describe("rebind prompt failure (NB1)", () => {
     const msg = ownerMsg("C9", "900.001", undefined, "hello");
     d.state.setThread("C9:900.001", { sessionId: "sess-old", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 });
 
-    await handleIncomingMessage(msg, d);
+    expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
 
     expect(promptCalls).toBe(2); // original + the rebind retry
-    expect(log.reacted).toEqual([
-      ["900.001", "eyes"], // liveness ack on dispatch
-      ["900.001", "x"],
-    ]);
-    expect(log.posted.some((p) => p.includes("prompt failed after rebind: boom"))).toBe(true);
-    expect(log.deleted.length).toBe(1); // live status/ack removed
-    expect(log.dms.some((m) => m.includes("failed"))).toBe(true); // pager fired
+    expect(log.reacted).toEqual([["900.001", "eyes"]]);
+    expect(log.posted.some((p) => p.includes("Prompt acceptance is uncertain") && p.includes("boom"))).toBe(true);
+    expect(log.deleted.length).toBe(0);
     const t = d.state.getThread("C9:900.001");
     expect(t?.sessionId).toBe("sess-new");
-    expect(t?.pendingRun).toBeUndefined(); // finalize cleared the tombstone
+    expect(t?.pendingRun).toBeDefined(); // may still be running; reconciliation owns completion
+    expect(d.state.getReceipt("C9:900.001", msg.ts)?.disposition).toBe("uncertain");
+    expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
+    expect(promptCalls).toBe(2);
+    deleteView("sess-new");
   });
 });
 
@@ -182,6 +185,233 @@ describe("concurrent cold-start prompts (NB3)", () => {
     expect(promptCalls).toBe(2); // both prompts delivered on the shared session
     expect(log.posted.some((p) => p.includes("Queued — runs after the current task"))).toBe(true);
     expect(d.state.getThread("C9:900.100")?.sessionId).toBe("sess-1");
+  });
+});
+
+describe("real-router recovery receipts", () => {
+  const root = "1200.000000";
+  const baseline = "1200.000001";
+  const blankLog = (): CallLog => ({ posted: [], deleted: [], reacted: [], dms: [] });
+  function setup(name: string, prompt: (args: any) => Promise<unknown>) {
+    const log = blankLog();
+    const client = { session: { promptAsync: prompt, messages: async () => ({ data: [] }),
+      get: async () => ({ data: {} }), create: vi.fn(async () => ({ data: { id: `${name}-new` } })) } };
+    const d = makeDeps(name, fakePool(client), fakeRender(log));
+    d.state.setThread(`C:${root}`, { sessionId: name, projectDir: "/p", verbose: "on", createdAt: 1,
+      lastUsedAt: 1, lastSeenTs: baseline, notify: true });
+    const catchup = (messages: SlackMsg[]) => sweepMissedMessages({ state: d.state, ownerSlackUserId: "U1",
+      fetchReplies: async () => messages, dispatch: (m) => handleIncomingMessage(m, d) });
+    return { d, log, client, catchup };
+  }
+
+  it("a newer live submission does not hide an older history gap", async () => {
+    const submitted: string[] = [];
+    const { d, catchup } = setup("receipt-gap", async (args) => { submitted.push(args.body.parts[0].text); return { data: {} }; });
+    try {
+      const newer = ownerMsg("C", "1200.000003", root, "newer live");
+      const older = ownerMsg("C", "1200.000002", root, "older missed");
+      expect(await handleIncomingMessage(newer, d)).toBe("accepted");
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
+      expect(await catchup([newer, older])).toBe(1);
+      expect(submitted).toEqual(["newer live", "older missed"]);
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(newer.ts);
+      expect(d.state.recoveryStatus().receipts).toBe(0);
+      expect(await handleIncomingMessage(older, d)).toBe("accepted");
+      expect(submitted).toHaveLength(2);
+    } finally { deleteView("receipt-gap"); }
+  });
+
+  it("live/replay overlap neither resubmits nor consumes an in-flight message; lease spans submission", async () => {
+    let finish!: () => void;
+    const gate = new Promise<void>((r) => { finish = r; });
+    const prompt = vi.fn(async () => { await gate; return { data: {} }; });
+    const { d, catchup } = setup("receipt-race", prompt);
+    const release = vi.fn();
+    d.pool.acquire = async (dir) => ({ entry: await d.pool.ensure(dir), release });
+    const msg = ownerMsg("C", "1200.000002", root, "once");
+    try {
+      const live = handleIncomingMessage(msg, d);
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+      expect(release).not.toHaveBeenCalled();
+      expect(await handleIncomingMessage(msg, d)).toBe("processing");
+      expect(await catchup([msg])).toBe(0);
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
+      expect(d.state.getReceipt(`C:${root}`, msg.ts)?.disposition).toBe("processing");
+      finish();
+      expect(await live).toBe("accepted");
+      expect(release).toHaveBeenCalledOnce();
+      expect(await catchup([msg])).toBe(0);
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(msg.ts);
+      expect(prompt).toHaveBeenCalledOnce();
+    } finally { finish(); deleteView("receipt-race"); }
+  });
+
+  it("a real pre-submission pool failure releases its claim despite lastSeen moving, then retries", async () => {
+    const prompt = vi.fn(async () => ({ data: {} }));
+    const { d, catchup } = setup("receipt-retry", prompt);
+    const ensure = d.pool.ensure.bind(d.pool);
+    let failed = false;
+    d.pool.ensure = async (dir) => { if (!failed) { failed = true; throw new Error("health unavailable"); } return ensure(dir); };
+    const msg = ownerMsg("C", "1200.000002", root, "retry safe");
+    try {
+      expect(await catchup([msg])).toBe(0);
+      expect(d.state.getThread(`C:${root}`)?.lastSeenTs).toBe(msg.ts);
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
+      expect(d.state.getReceipt(`C:${root}`, msg.ts)).toBeUndefined();
+      expect(prompt).not.toHaveBeenCalled();
+      expect(await catchup([msg])).toBe(1);
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(msg.ts);
+    } finally { deleteView("receipt-retry"); }
+  });
+
+  it("timeout (even mentioning 404) is not rebound or replayed after restart", async () => {
+    const prompt = vi.fn(async () => { throw new Error("request timed out after 404 ms"); });
+    const { d, log, client, catchup } = setup("receipt-timeout", prompt);
+    const release = vi.fn();
+    d.pool.acquire = async (dir) => ({ entry: await d.pool.ensure(dir), release });
+    const msg = ownerMsg("C", "1200.000002", root, "may be running");
+    try {
+      expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
+      expect(release).toHaveBeenCalledOnce();
+      expect(client.session.create).not.toHaveBeenCalled();
+      expect(log.posted.some((s) => s.includes("will not automatically resubmit"))).toBe(true);
+      d.state = new StateStore(join(FIXTURES, "receipt-timeout", "state.json"));
+      expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
+      expect(await catchup([msg])).toBe(0);
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
+    } finally { deleteView("receipt-timeout"); }
+  });
+
+  it("forwards and persists a generated messageID, then resolves a timeout only from its matching user transcript entry", async () => {
+    let sentID = "";
+    let persistedSubmission: unknown;
+    const prompt = vi.fn(async (args) => {
+      sentID = args.body.messageID;
+      const persisted = new StateStore(join(FIXTURES, "receipt-correlated", "state.json"));
+      persistedSubmission = persisted.getReceipt(`C:${root}`, "1200.000002")?.submission;
+      throw new Error("HTTP timeout after possible acceptance");
+    });
+    const { d, catchup } = setup("receipt-correlated", prompt);
+    const msg = ownerMsg("C", "1200.000002", root, "correlate this");
+    try {
+      expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
+      expect(sentID).toMatch(/^msg_[0-9a-f]+$/);
+      expect(persistedSubmission).toEqual({ projectDir: "/p", sessionId: "receipt-correlated", messageId: sentID });
+      d.state = new StateStore(join(FIXTURES, "receipt-correlated", "state.json"));
+      expect(d.state.reconcilePromptAcceptance("/p", { id: "msg_later", sessionID: "receipt-correlated", role: "user" })).toEqual([]);
+      expect(await catchup([msg])).toBe(0);
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
+      expect(d.state.reconcilePromptAcceptance("/p", { id: sentID, sessionID: "receipt-correlated", role: "user" })).toHaveLength(1);
+      expect(await catchup([msg])).toBe(0); // consumes evidence; no second submission
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(msg.ts);
+      expect(prompt).toHaveBeenCalledOnce();
+    } finally { deleteView("receipt-correlated"); }
+  });
+
+  it("SSE acceptance can precede HTTP failure and history cleanup without a false uncertain/rebind outcome", async () => {
+    let sentID = "";
+    let fail!: () => void;
+    const gate = new Promise<void>((resolve) => { fail = resolve; });
+    const prompt = vi.fn(async (args) => { sentID = args.body.messageID; await gate; throw new Error("404 not found"); });
+    const { d, client, log, catchup } = setup("receipt-evidence-race", prompt);
+    const msg = ownerMsg("C", "1200.000002", root, "race with SSE");
+    try {
+      const live = handleIncomingMessage(msg, d);
+      await vi.waitFor(() => expect(sentID).not.toBe(""));
+      expect(d.state.reconcilePromptAcceptance("/p", { id: sentID, sessionID: "receipt-evidence-race", role: "user" })).toHaveLength(1);
+      await catchup([msg]);
+      expect(d.state.getReceipt(`C:${root}`, msg.ts)).toBeUndefined();
+      fail();
+      expect(await live).toBe("accepted");
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(client.session.create).not.toHaveBeenCalled();
+      expect(log.posted.some((s) => s.includes("acceptance is uncertain"))).toBe(false);
+    } finally { fail(); deleteView("receipt-evidence-race"); }
+  });
+
+  it("retains a failed command's partial side effect and never repeats it", async () => {
+    let effects = 0;
+    registerCommand({ name: "receiptpartial", usage: "", summary: "", run: async (ctx) => {
+      effects++;
+      ctx.state.setThread(ctx.threadKey, { ...ctx.thread!, notify: false });
+      throw new Error("failed after mutation");
+    } });
+    const { d, catchup } = setup("receipt-command", async () => ({ data: {} }));
+    const msg = ownerMsg("C", "1200.000002", root, "\\receiptpartial");
+    expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
+    expect(d.state.getThread(`C:${root}`)?.notify).toBe(false);
+    expect(await catchup([msg])).toBe(0);
+    expect(effects).toBe(1);
+    expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
+  });
+
+  it("two immediate cold messages share creation even when both await a cold-start ack", async () => {
+    const create = vi.fn(async () => ({ data: { id: "receipt-cold" } }));
+    const prompt = vi.fn(async () => ({ data: {} }));
+    const log = blankLog();
+    const pool = fakePool({ session: { create, promptAsync: prompt } });
+    const d = makeDeps("receipt-cold", pool, fakeRender(log));
+    let held = 0;
+    pool.acquire = async (dir) => { held++; return { entry: await pool.ensure(dir), release: () => { held--; } }; };
+    try {
+      const outcomes = await Promise.all([
+        handleIncomingMessage(ownerMsg("C", "1300.000001", "1300.000000", "one"), d),
+        handleIncomingMessage(ownerMsg("C", "1300.000002", "1300.000000", "two"), d),
+      ]);
+      expect(outcomes).toEqual(["accepted", "accepted"]);
+      expect(create).toHaveBeenCalledOnce();
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(held).toBe(0);
+      expect(log.posted.filter((text) => text.startsWith("⏳ OpenCode"))).toHaveLength(2);
+      expect(log.deleted.filter((ts) => ts === "ts-2")).toHaveLength(1); // follower's extra ack was not adopted
+    } finally { deleteView("receipt-cold"); }
+  });
+});
+
+describe("receipt capacity recovery commands", () => {
+  function saturated(name: string, count = MAX_MESSAGE_RECEIPTS) {
+    const path = join(FIXTURES, name, "state.json");
+    mkdirSync(join(FIXTURES, name), { recursive: true });
+    const receipts = Object.fromEntries(Array.from({ length: count }, (_, i) => {
+      const ts = `1400.${String(i + 1).padStart(6, "0")}`;
+      return [`stuck:${ts}`, { threadKey: "stuck:1400.000000", ts, disposition: "uncertain", updatedAt: 1 }];
+    }));
+    writeFileSync(path, JSON.stringify({ threads: {}, projects: {}, receipts }));
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps(name, fakePool({}), fakeRender(log));
+    d.cwd = "/capacity-recovery";
+    const kill = vi.fn(async () => {});
+    d.pool.killOne = kill;
+    return { d, log, kill, path };
+  }
+
+  it("reserves a durable slot for restart and suppresses its duplicate after a process restart", async () => {
+    const { d, kill, path } = saturated("reserve-restart");
+    const msg = ownerMsg("recovery", "1500.000001", undefined, "\\restart");
+    expect(await handleIncomingMessage(ownerMsg("recovery", "1500.000000", undefined, "a prompt"), d)).toBe("paused");
+    expect(await handleIncomingMessage(msg, d)).toBe("accepted");
+    expect(kill).toHaveBeenCalledOnce();
+    expect(d.state.recoveryStatus().receipts).toBe(MAX_MESSAGE_RECEIPTS + 1);
+    d.state = new StateStore(path);
+    expect(await handleIncomingMessage(msg, d)).toBe("accepted");
+    expect(kill).toHaveBeenCalledOnce();
+    expect(d.state.recoveryStatus().uncertain).toBe(MAX_MESSAGE_RECEIPTS);
+  });
+
+  it("status stays read-only and available even at the hard limit; restart cannot bypass durable claims", async () => {
+    const { d, log, kill, path } = saturated("hard-cap-status", MAX_MESSAGE_RECEIPTS + RECOVERY_RECEIPT_RESERVE);
+    const msg = ownerMsg("recovery", "1501.000001", undefined, "\\status");
+    expect(await handleIncomingMessage(msg, d)).toBe("accepted");
+    expect(log.posted.some((s) => s.includes("*Recovery:* paused"))).toBe(true);
+    const posted = log.posted.length;
+    expect(await handleIncomingMessage(msg, d)).toBe("ignored");
+    expect(log.posted).toHaveLength(posted);
+    expect(await handleIncomingMessage(ownerMsg("recovery", "1501.000002", undefined, "\\restart"), d)).toBe("paused");
+    expect(kill).not.toHaveBeenCalled();
+    expect(Object.keys(JSON.parse(readFileSync(path, "utf8")).receipts)).toHaveLength(MAX_MESSAGE_RECEIPTS + RECOVERY_RECEIPT_RESERVE);
+    expect(d.state.recoveryStatus().uncertain).toBe(MAX_MESSAGE_RECEIPTS + RECOVERY_RECEIPT_RESERVE);
   });
 });
 

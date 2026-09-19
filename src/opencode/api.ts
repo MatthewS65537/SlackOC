@@ -50,6 +50,11 @@ export interface OcMessageInfo {
   id: string;
   sessionID: string;
   role: string;
+  /** Assistant's originating user message; useful when reconciling queued turns. */
+  parentID?: string;
+  /** Provider finish reason, e.g. stop or tool-calls; completed time alone is insufficient. */
+  finish?: string;
+  summary?: boolean;
   modelID?: string;
   providerID?: string;
   error?: { name?: string; data?: Record<string, unknown> } | null;
@@ -127,6 +132,11 @@ export interface OcQuestionRequest {
   questions: OcQuestionInfo[];
   tool?: { messageID: string; callID: string };
 }
+
+export type OcSessionStatus =
+  | { type: "idle" }
+  | { type: "busy" }
+  | { type: "retry"; attempt: number; message: string; next: number };
 
 export interface OcSessionStatusPayload {
   sessionID?: string;

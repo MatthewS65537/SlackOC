@@ -38,19 +38,20 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 
 - **Remote prompting** from Slack DM or mention, with answers streamed into threads
 - **Proactive threads with a mute** — once a thread has a session, replies are answered with no @ mention needed; `\hush` quiets the thread (an @ always wakes it)
-- **Tool visibility by default** — `\verbose full|on|off`; each tool call posts a compact line showing exactly what it's doing (`📄 read src/x.ts`, `🔧 npm test`, `🔍 grep "pattern"`), `full` adds output snippets
+- **Tool visibility by default** — `\verbose full|on|off`; compact tool batches flush after 1.5 seconds or at a size threshold, and before answers. Paths, commands, and search patterns use inline code; shell descriptions stay concise. `full` adds output snippets. Slack queueing or rate limits may delay delivery
+- **Clear progress** — literal ⏳/⌛ characters, elapsed time, waiting-for-answer/permission and connection states; the indicator moves below new content, with bounded retry backoff when Slack is unavailable
 - **Markdown answers render properly** — GFM → Slack mrkdwn conversion (bold, lists, links, headings); fenced code stays code
 - **Image support, both ways** — attach a screenshot (or any text/PDF/JSON file ≤8MB) to your message and the model sees it; images over ~1MB are auto-compressed to stay under provider request-size limits; images the model produces are posted back into the thread
 - **Approval buttons** — Approve once / Always allow / Deny, resolving OpenCode's permission requests in place — mirrored to your DMs, so a blocked run pages you on your phone
 - **Notifications that reach you** — failures DM the owner by default; `\notify on` adds a DM when each run finishes (with a one-tap 📄 View diff button); a 3-minute stall pages you once
-- **Crash-proof, self-healing threads** — an `opencode serve` that dies mid-run fails the thread loudly instead of hanging silently; a run whose completion events are lost (wifi blip, sleep/wake) is reconciled and finished from polled state within ~2 minutes; `\restart` rescues a wedged server; idle servers auto-stop after 30 minutes
+- **Failure recovery** — an `opencode serve` that dies mid-run fails the thread visibly; periodic reconciliation checks polled session state when completion events are lost. Recovery depends on connectivity and evidence of completion; `\restart` rescues a wedged server; idle servers auto-stop after 30 minutes
 - **Status board in your pocket** — `\status` lists runs in flight (elapsed, queued, thread links); markdown tables from the model render as aligned code blocks
 - **Restart-safe** — a run interrupted by a bridge restart gets its ❌ and a clear notice instead of a frozen "working…" message
-- **Alive-at-a-glance** — every accepted prompt stamps a 👀 on your message within a second (cleared when ✅/❌ lands), so a dead bridge can never look identical to a slow one
- - **Lost-message catch-up** — Slack discards Socket Mode envelopes it can't deliver (restart gap, network flap, zombie connection) without replaying them; every minute the bridge re-reads active threads from `conversations.replies` and routes anything it missed, so a delivery gap costs latency, never the message itself. Socket connect/disconnect/ping-timeout evidence lands in `\logs`
- - **Post-mortem-able logs** — every log line also lands in a size-rotated `~/.config/slackoc/bridge.log`, so a crash or a 429 storm from before this boot is recoverable; `\logs --follow` tails it live from Slack
- - **Runs as a service** — `slackoc daemon install` registers a user-level launchd/systemd unit (no sudo) that keeps the bridge alive across reboots and logouts; `daemon status` / `daemon uninstall` manage it
-- **Instant `\` commands, even mid-run** — outbound Slack calls ride a per-channel queue where interactive traffic (command answers, approval prompts, acks) jumps ahead of background stream traffic; a busy run never delays `\help` & co.
+- **Receipt acknowledgment** — accepted prompts attempt a 👀 reaction immediately, cleared when ✅/❌ lands; network/API failures can delay acknowledgments
+- **Lost-message catch-up** — periodic history polling rotates through retained threads, including older threads, with a bounded per-pass budget. Busy workspaces, API failures, queueing and sleep can delay recovery; unseen threads or messages outside retained history may not be recoverable. Ambiguous submissions are not blindly replayed, and exactly-once execution across crashes is not guaranteed. Socket diagnostics land in `\logs`
+- **Persistent logs** — managed stdout, stderr and bridge logs share `~/.config/slackoc/logs/bridge.log`, bounded to 5 MiB plus two 5 MiB backups. Foreground logging remains at `~/.config/slackoc/bridge.log`; `\logs --follow` streams the in-memory log from Slack
+- **macOS background service** — `slackoc service install` writes a per-user LaunchAgent; `service start` activates it. It starts at login and restarts after crashes while the user is logged in and the Mac is awake. `service stop` disables it until explicitly started again
+- **Prioritized `\` commands, even mid-run** — outbound Slack calls ride a per-channel queue where interactive traffic (command answers, approval prompts, acks) jumps ahead of queued background traffic; an in-flight operation or Slack rate limit can still delay a reply
 - **Progress bar pinned to the bottom** — the ⏳ indicator re-homes itself below every streamed message, so a long-running task's live status is always the last thing on screen
 - **Multi-project** — not locked to one folder: `\projects`, `\cd /path`, `\new /path`
 - **Native command passthrough** — `\cmd <opencode command>`, plus model (`\model <#>`) and agent (`\agent <#|name>`) swaps
@@ -63,10 +64,34 @@ Backslash commands run inside Slack but are invisible to the workspace — they 
 1. Install (Node ≥ 20): `curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash` — and have `opencode` ≥ 1.18 on your box.
 2. `slackoc init` — guided: create the Slack app from the bundled manifest, install it, paste the bot token (`xoxb-`) and app-level token (`xapp-`), enter your Slack member ID. Both tokens are validated live against Slack; the member ID is verified (`users:read` scope — already in the manifest). Non-interactive flags for CI: `--bot-token --app-token --owner [--dir]`
 3. `slackoc doctor` — sanity check
-4. `slackoc start` — bridge online (foreground), or `slackoc daemon install` to run it as a user service (launchd on macOS, systemd user unit on Linux) that survives logout and restarts — no sudo
+4. `slackoc start` — bridge online in the foreground. For managed macOS operation, choose a default project directory and use the service commands below
 5. Open Slack → DM your bot → prompt
 
 Details & troubleshooting: [docs/SETUP.md](docs/SETUP.md).
+
+### macOS service
+
+```bash
+slackoc service install --dir /absolute/default/project  # writes only; defaults to install cwd
+slackoc service start
+slackoc service status
+slackoc service stop       # disables login/crash restart, then unloads
+slackoc service uninstall  # also stops; retains config, state and logs
+```
+
+Stop an existing foreground bridge before `service start`. Ordinary `slackoc stop`
+also disables/unloads a managed bridge. To change the saved directory, PATH, Node/CLI
+location or keep-awake option, stop, reinstall, then start the service.
+
+Optional: `slackoc service install --dir /absolute/default/project --keep-awake true`
+prevents **idle system sleep** while the bridge runs; `false` is the default.
+This does not keep the display on or guarantee availability with a closed lid,
+after logout, while offline, or when powered off. Continuous remote use needs an
+appropriately configured, awake host.
+
+The service stores only a small environment whitelist; provider credentials that
+exist only in your shell need saved OpenCode configuration/auth. Slack tokens stay
+in SlackOC's config file. See [service setup details](docs/SETUP.md#macos-background-service).
 
 ## Command surface
 
@@ -86,7 +111,7 @@ Each thread answers proactively once it has a session — invite the bot to any 
 | `\diff` `\cmd …` | diff summary (`\diff full` adds the unified diff, snippet when long) / OpenCode native command passthrough |
 | `\notify on\|off` | DM the owner when runs in this thread finish (failures + permission asks always DM) |
 | `\logs [filter]` | recent bridge log lines, optionally substring-filtered (`\logs error`) — remote debugging without the console |
-| `\logs --follow [filter]` | stream new log lines into the thread for 30s (`tail -f` from your phone); the persistent rotated log lives at `~/.config/slackoc/bridge.log` |
+| `\logs --follow [filter]` | stream new in-memory log lines into the thread for 30s; managed persistent log: `~/.config/slackoc/logs/bridge.log` |
 | `\restart` | restart this project's opencode server (wedged-run rescue — threads keep their sessions) |
 
 ## Security model

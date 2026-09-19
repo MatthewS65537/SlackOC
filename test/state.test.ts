@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { StateStore } from "../src/state.js";
+import { MAX_MESSAGE_RECEIPTS, StateStore, UNBOUND_RECEIPT_HORIZON_MS } from "../src/state.js";
+import { canonicalDir } from "../src/paths.js";
 
 // Test fixtures stay inside the project (never the system tmpdir). This suite
 // owns its own subdir: suites run in parallel workers, so removing the shared
@@ -138,6 +139,139 @@ describe("StateStore save durability (RB3)", () => {
     const s = new StateStore(path);
     expect(s.getThread("C:1")).toBeNull();
     expect(s.listProjects()).toEqual([]);
+  });
+});
+
+describe("canonical identity and durable recovery", () => {
+  it("normalizes old state idempotently, merging newest aliases and preserving pending/watch metadata", () => {
+    const root = join(FIXTURES, "canonical");
+    const real = join(root, "project");
+    const alias = join(root, "alias");
+    mkdirSync(real, { recursive: true });
+    symlinkSync(real, alias);
+    const path = join(root, "state.json");
+    const now = Date.now();
+    const thread = { sessionId: "watching", projectDir: alias, verbose: "full", watchOnly: true,
+      notify: true, model: "p/m", agent: "build", hushed: true, lastSeenTs: "100.000002",
+      createdAt: now, lastUsedAt: now, pendingRun: { userMsgTs: ["100.000002"], statusTs: "status", futureField: 7 } };
+    writeFileSync(path, JSON.stringify({ currentProjectDir: alias + "/", threads: { "C:100": thread },
+      projects: { [alias]: { lastUsedAt: 3 }, [real + "/./"]: { lastUsedAt: 8 } } }));
+    const s = new StateStore(path);
+    expect(s.listProjects()).toEqual([{ dir: canonicalDir(real), lastUsedAt: 8 }]);
+    expect(s.currentProjectDir).toBe(canonicalDir(real));
+    expect(s.getThread("C:100")).toEqual({ ...thread, projectDir: canonicalDir(real), historyCursorTs: thread.lastSeenTs });
+    expect(s.anyThreadInDir(alias)).toBe(true);
+    s.save();
+    const once = readFileSync(path, "utf8");
+    new StateStore(path).save();
+    expect(readFileSync(path, "utf8")).toBe(once);
+  });
+
+  it("lastSeen and stale renderer snapshots cannot advance/regress history; crash-held claims become uncertain", () => {
+    const { store: s, path } = tempStore("receipt-lifecycle");
+    s.setThread("C:100", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: "100.000001" });
+    const stale = s.getThread("C:100")!;
+    expect(s.claimMessage("C:100", "100.000003")).toBe("claimed");
+    s.markThreadSeen("C:100", "100.000003");
+    expect(s.getThread("C:100")?.historyCursorTs).toBe("100.000001");
+    expect(s.claimMessage("C:100", "100.000003")).toBe("processing");
+    expect(s.confirmHistory("C:100", "100.000003")).toBe(false);
+    const restarted = new StateStore(path);
+    expect(restarted.claimMessage("C:100", "100.000003")).toBe("uncertain");
+    restarted.settleMessage("C:100", "100.000003", "accepted");
+    expect(restarted.confirmHistory("C:100", "100.000003")).toBe(true);
+    expect(restarted.getReceipt("C:100", "100.000003")).toBeUndefined();
+    restarted.setThread("C:100", { ...stale, pendingRun: { userMsgTs: ["100.000003"] } });
+    expect(restarted.getThread("C:100")?.historyCursorTs).toBe("100.000003");
+    expect(restarted.getThread("C:100")?.lastSeenTs).toBe("100.000003");
+    expect(restarted.claimMessage("C:100", "100.000002")).toBe("accepted");
+  });
+
+  it("pauses on receipt overflow without evicting evidence, then resumes when history drains", () => {
+    const { path } = tempStore("receipt-overflow");
+    mkdirSync(join(FIXTURES, "receipt-overflow"), { recursive: true });
+    const receipts = Object.fromEntries(Array.from({ length: MAX_MESSAGE_RECEIPTS }, (_, i) => {
+      const ts = `100.${String(i + 1).padStart(6, "0")}`;
+      return [`C:${ts}`, { threadKey: "C:100", ts, disposition: "accepted", updatedAt: 1 }];
+    }));
+    writeFileSync(path, JSON.stringify({ threads: { "C:100": { sessionId: "s", projectDir: "/p", verbose: "on",
+      createdAt: 1, lastUsedAt: 1, historyCursorTs: "100.000000" } }, projects: {}, receipts }));
+    const s = new StateStore(path);
+    expect(s.claimMessage("C:100", "101.000000")).toBe("paused");
+    expect(s.recoveryStatus()).toEqual({ paused: true, receipts: MAX_MESSAGE_RECEIPTS, uncertain: 0 });
+    expect(s.getReceipt("C:100", "100.000001")?.disposition).toBe("accepted");
+    expect(s.getThread("C:100")).not.toBeNull(); // old binding with evidence survives pruning
+    expect(s.confirmHistory("C:100", "100.000001")).toBe(true);
+    expect(s.claimMessage("C:100", "101.000000")).toBe("claimed");
+  });
+
+  it("GC expires only accepted unbound receipts, durably suppressing old deliveries and later-binding replay", () => {
+    const { path } = tempStore("receipt-gc");
+    mkdirSync(join(FIXTURES, "receipt-gc"), { recursive: true });
+    const now = Date.now();
+    const old = now - UNBOUND_RECEIPT_HORIZON_MS - 60_000;
+    const ts = `${Math.floor(old / 1000)}.000001`;
+    const futureTs = `${Math.floor(now / 1000) + 60}.000001`;
+    const receipt = (threadKey: string, disposition: string, updatedAt = old, timestamp = ts) => ({ threadKey, ts: timestamp, disposition, updatedAt });
+    writeFileSync(path, JSON.stringify({ projects: {}, threads: {
+      "bound:root": { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: now, lastUsedAt: now, historyCursorTs: "100.000000" },
+    }, receipts: {
+      [`expire:${ts}`]: receipt("expire:root", "accepted"),
+      [`recent:${ts}`]: receipt("recent:root", "accepted", now),
+      [`uncertain:${ts}`]: receipt("uncertain:root", "uncertain"),
+      [`processing:${ts}`]: receipt("processing:root", "processing"),
+      [`bound:${ts}`]: receipt("bound:root", "accepted"),
+      [`future:${futureTs}`]: receipt("future:root", "accepted", old, futureTs),
+    } }));
+    const s = new StateStore(path);
+    expect(s.pruneAcceptedUnboundReceipts(now)).toBe(1);
+    expect(s.messageReceipts()).toHaveLength(5);
+    expect(s.getReceipt("expire:root", ts)).toBeUndefined();
+    expect(s.getReceipt("uncertain:root", ts)?.disposition).toBe("uncertain");
+    expect(s.getReceipt("processing:root", ts)?.disposition).toBe("uncertain");
+    const restarted = new StateStore(path);
+    expect(restarted.claimMessage("expire:root", ts)).toBe("accepted");
+    restarted.setThread("expire:root", { sessionId: "later", projectDir: "/p", verbose: "on", createdAt: now,
+      lastUsedAt: now, historyCursorTs: "100.000000" });
+    expect(restarted.getThread("expire:root")!.historyCursorTs! > ts).toBe(true);
+    expect(restarted.claimMessage("expire:root", ts)).toBe("accepted");
+    // Existing bound history is not raised to a global age limit.
+    expect(restarted.getThread("bound:root")?.historyCursorTs).toBe("100.000000");
+  });
+
+  it("reclaims old command-only traffic before checking the cap", () => {
+    const { path } = tempStore("receipt-gc-cap");
+    mkdirSync(join(FIXTURES, "receipt-gc-cap"), { recursive: true });
+    const old = Date.now() - UNBOUND_RECEIPT_HORIZON_MS - 60_000;
+    const ts = `${Math.floor(old / 1000)}.000001`;
+    const receipts = Object.fromEntries(Array.from({ length: MAX_MESSAGE_RECEIPTS }, (_, i) =>
+      [`C${i}:${ts}`, { threadKey: `C${i}:root`, ts, disposition: "accepted", updatedAt: old }]));
+    writeFileSync(path, JSON.stringify({ threads: {}, projects: {}, receipts, recoveryPaused: true }));
+    const s = new StateStore(path);
+    const fresh = `${Math.floor(Date.now() / 1000)}.000001`;
+    expect(s.claimMessage("new:root", fresh)).toBe("claimed");
+    expect(s.recoveryStatus()).toEqual({ paused: false, receipts: 1, uncertain: 0 });
+    expect(new StateStore(path).messageReceipts()).toHaveLength(1);
+  });
+
+  it("requires exact user message evidence and preserves the submission association across restart", () => {
+    const { store: s, path } = tempStore("receipt-evidence");
+    s.setThread("C:100", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: "100.000001" });
+    s.claimMessage("C:100", "100.000002");
+    s.associatePrompt("C:100", "100.000002", { projectDir: "/p/./", sessionId: "s", messageId: "msg_exact" });
+    const restarted = new StateStore(path);
+    const info = { id: "msg_exact", sessionID: "s", role: "user" };
+    expect(restarted.getReceipt("C:100", "100.000002")?.disposition).toBe("uncertain");
+    expect(restarted.reconcilePromptAcceptance("/other", info)).toEqual([]);
+    expect(restarted.reconcilePromptAcceptance("/p", { ...info, role: "assistant" })).toEqual([]);
+    expect(restarted.reconcilePromptAcceptance("/p", { ...info, id: "msg_later" })).toEqual([]);
+    expect(restarted.reconcilePromptAcceptance("/p", { ...info, sessionID: "different" })).toEqual([]);
+    expect(restarted.reconcilePromptAcceptance("/p/", info)).toHaveLength(1);
+    restarted.settleMessage("C:100", "100.000002", "uncertain"); // late HTTP timeout cannot undo evidence
+    expect(new StateStore(path).getReceipt("C:100", "100.000002")?.disposition).toBe("accepted");
+    expect(restarted.getThread("C:100")?.historyCursorTs).toBe("100.000001");
+    expect(restarted.reconcilePromptAcceptance("/p", info)).toEqual([]);
+    expect(restarted.confirmHistory("C:100", "100.000002")).toBe(true);
   });
 });
 

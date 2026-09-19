@@ -20,7 +20,8 @@ import {
 } from "../opencode/client.js";
 import type { CmdCtx, CmdDef } from "./registry.js";
 import { allCommands, registerCommand } from "./registry.js";
-import { invalidatePickerCache, pickerList, pickerResolve, renderPickerList, type SessionRef } from "./picker.js";
+import { cacheProjectList, projectListSnapshot, invalidateProjectList, invalidatePickerCache, pickerList, pickerResolve, renderPickerList, type SessionRef } from "./picker.js";
+import { canonicalDir } from "../paths.js";
 import { chunkText, dur, esc, mdToMrkdwn, shortId, shortPath, truncate } from "../util.js";
 import type { ThreadState, VerboseMode } from "../state.js";
 import { deleteView, getView, SessionView, describeActiveRuns, finalizeViewsForProject } from "../slack/render.js";
@@ -37,6 +38,13 @@ async function serverFor(ctx: CmdCtx, thread: ThreadState): Promise<PoolEntry> {
   return ctx.pool.ensure(thread.projectDir);
 }
 
+async function withServerLease<T>(ctx: CmdCtx, dir: string, work: (entry: PoolEntry) => Promise<T>): Promise<T> {
+  const lease = typeof ctx.pool.acquire === "function" ? await ctx.pool.acquire(canonicalDir(dir))
+    : { entry: await ctx.pool.ensure(canonicalDir(dir)), release: () => {} };
+  try { return await work(lease.entry); }
+  finally { lease.release(); }
+}
+
 function requireDir(ctx: CmdCtx, dir: string): string {
   // Expand a leading ~ to the actual home dir (whatever it is on this machine).
   if (dir === "~") dir = homedir();
@@ -44,12 +52,12 @@ function requireDir(ctx: CmdCtx, dir: string): string {
   const abs = resolve(ctx.cwd, dir);
   const st = statSync(abs, { throwIfNoEntry: false });
   if (!st?.isDirectory()) throw new Error(`${abs} is not a directory (use an absolute path)`);
-  return abs;
+  return canonicalDir(abs);
 }
 
 function newThreadState(sessionId: string, projectDir: string): ThreadState {
   const now = Date.now();
-  return { sessionId, projectDir, verbose: "on", createdAt: now, lastUsedAt: now };
+  return { sessionId, projectDir: canonicalDir(projectDir), verbose: "on", createdAt: now, lastUsedAt: now };
 }
 
 /**
@@ -66,13 +74,15 @@ async function rebindThread(
   note: string,
   opts: { teardown?: boolean } = {},
 ): Promise<void> {
+  dir = canonicalDir(dir);
   const old = ctx.thread;
   if (old) {
     if (opts.teardown !== false) {
       try {
-        const oldEntry = await ctx.pool.ensure(old.projectDir);
-        await sessionAbort(oldEntry.client!, old.sessionId).catch(() => {});
-        await sessionDelete(oldEntry.client!, old.sessionId).catch(() => {});
+        await withServerLease(ctx, old.projectDir, async (oldEntry) => {
+          await sessionAbort(oldEntry.client!, old.sessionId).catch(() => {});
+          await sessionDelete(oldEntry.client!, old.sessionId).catch(() => {});
+        });
         // Kill the server ONLY when no other thread still uses this project —
         // opencode serve is shared per dir, and killing it would destroy
         // other threads' in-flight runs. Sessions persist on disk anyway.
@@ -85,8 +95,7 @@ async function rebindThread(
     }
     deleteView(old.sessionId);
   }
-  const entry = await ctx.pool.ensure(dir);
-  const sess = await sessionCreate(entry.client!, `SlackOC ${new Date().toISOString().slice(0, 16)}`);
+  const sess = await withServerLease(ctx, dir, (entry) => sessionCreate(entry.client!, `SlackOC ${new Date().toISOString().slice(0, 16)}`));
   ctx.state.setThread(ctx.threadKey, newThreadState(sess.id, dir));
   const kept =
     opts.teardown === false && old
@@ -186,6 +195,8 @@ registerCommand({
     // behind (a torrent run or a slow Slack); a low one = replies are snappy.
     const oldest = qd ? oldestPendingAgeMs() : 0;
     if (qd || dropped) lines.push(`*Slack queue:* ${qd} pending${oldest ? ` (oldest ${dur(oldest)})` : ""} · ${dropped} dropped`);
+    const recovery = ctx.state.recoveryStatus();
+    if (recovery.paused || recovery.uncertain) lines.push(`*Recovery:* ${recovery.paused ? "paused (receipt capacity) · " : ""}${recovery.uncertain} uncertain · ${recovery.receipts} receipts retained; uncertain work is not automatically replayed.`);
     await ctx.postToThread(lines.join("\n"));
   },
 });
@@ -330,7 +341,7 @@ registerCommand({
       } catch {
         /* older server without GET /config — fall through to the live probe */
       }
-      if (!m) m = await detectDefaultModel(entry.client!, dir);
+      if (!m) m = await withServerLease(ctx, dir, (leased) => detectDefaultModel(leased.client!, canonicalDir(dir)));
       return m;
     };
     // ★ trails the line (user-mandated): start-of-line markers crowded the code
@@ -416,8 +427,8 @@ registerCommand({
 
 /** All known project dirs (state list + running pool), current first. */
 function knownProjectDirs(ctx: CmdCtx): string[] {
-  const current = ctx.state.currentProjectDir ?? ctx.cwd;
-  const dirs = new Set<string>([current, ...ctx.pool.list().map((s) => s.dir), ...ctx.state.listProjects().map((p) => p.dir)]);
+  const current = canonicalDir(ctx.state.currentProjectDir ?? ctx.cwd);
+  const dirs = new Set<string>([current, ...ctx.pool.list().map((s) => s.dir), ...ctx.state.listProjects().map((p) => p.dir)].map(canonicalDir));
   return [...dirs];
 }
 
@@ -431,23 +442,34 @@ registerCommand({
   async run(ctx, args) {
     const q = args.trim();
     if (!q) {
-      const current = ctx.state.currentProjectDir ?? ctx.cwd;
+      const current = canonicalDir(ctx.state.currentProjectDir ?? ctx.cwd);
       const dirs = knownProjectDirs(ctx);
       const lines = [`*Current:* \`${current}\``];
       const rest = dirs.filter((d) => d !== current);
       rest.forEach((d, i) => {
-        const pool = ctx.pool.list().find((s) => s.dir === d);
-        lines.push(`${i + 1}) \`${projectName(d)}\` — ${d}${pool ? ` (server ${pool.status})` : ""}`);
+        const pool = ctx.pool.list().find((s) => canonicalDir(s.dir) === d);
+        lines.push(`${i + 1}) \`${esc(projectName(d))}\` — ${esc(d)}${pool ? ` (server ${pool.status})` : ""}`);
       });
       if (!rest.length) lines.push("(no other known projects yet — use `\\cd /abs/path` once)");
       lines.push("`\\project <name|#>` to switch.");
+      invalidateProjectList(ctx);
       await ctx.postToThread(lines.join("\n"));
+      cacheProjectList(ctx, rest);
       return;
     }
-    const dirs = knownProjectDirs(ctx).filter((d) => d !== (ctx.state.currentProjectDir ?? ctx.cwd));
-    const n = Number(q);
+    const dirs = knownProjectDirs(ctx).filter((d) => d !== canonicalDir(ctx.state.currentProjectDir ?? ctx.cwd));
+    const numeric = /^#?\d+$/.test(q);
+    const n = Number(q.replace(/^#/, ""));
     let dir: string | undefined;
-    if (Number.isInteger(n) && n >= 1 && n <= dirs.length) dir = dirs[n - 1];
+    if (numeric) {
+      const displayed = projectListSnapshot(ctx);
+      if (!displayed) {
+        await ctx.postToThread("No fresh project list in this thread — run `\\project` and pick a number from that list.");
+        return;
+      }
+      dir = displayed[n - 1];
+      if (!dir) throw new Error(`no project #${n} in the list you saw — \\project refreshes it`);
+    }
     else {
       const ql = q.toLowerCase();
       const hits = dirs.filter((d) => projectName(d).toLowerCase() === ql || d.toLowerCase().includes(ql));
@@ -844,7 +866,7 @@ registerCommand({
       return;
     }
     await ctx.postToThread(`⏳ Summarizing \`${shortId(t.sessionId)}\` via a throwaway session — one extra model call…`);
-    const text = await runSummaryProbe(entry.client!, transcript, ctx.thread?.model);
+    const text = await withServerLease(ctx, t.projectDir, (leased) => runSummaryProbe(leased.client!, transcript, ctx.thread?.model));
     for (const chunk of chunkText(`*Summary of* \`${shortId(t.sessionId)}\`\n\n${mdToMrkdwn(text)}`)) await ctx.postToThread(chunk);
   },
 });
@@ -938,8 +960,7 @@ registerCommand({
     const space = args.indexOf(" ");
     const command = space < 0 ? args : args.slice(0, space);
     const commandArgs = space < 0 ? "" : args.slice(space + 1);
-    const entry = await serverFor(ctx, th);
-    const result = (await sessionCommand(entry.client!, th.sessionId, command, commandArgs)) as {
+    const result = (await withServerLease(ctx, th.projectDir, (entry) => sessionCommand(entry.client!, th.sessionId, command, commandArgs))) as {
       parts?: Array<{ type: string; text?: string }>;
     };
     const texts = (result?.parts ?? []).filter((p) => p.type === "text" && p.text).map((p) => p.text!);

@@ -18,6 +18,8 @@ import { sessionList } from "../opencode/client.js";
 import type { OcSession } from "../opencode/api.js";
 import { age, esc, shortId, truncate } from "../util.js";
 import type { CmdCtx } from "./registry.js";
+import { canonicalDir } from "../paths.js";
+import type { StateStore } from "../state.js";
 
 export interface SessionRef {
   sessionId: string;
@@ -85,7 +87,25 @@ export function invalidatePickerCache(threadKey: string): void {
   listCache.delete(threadKey);
 }
 
-const normDir = (d: string): string => (d ?? "").replace(/\/+$/, "");
+const projectLists = new WeakMap<StateStore, Map<string, { dirs: string[]; at: number }>>();
+
+/** Store only AFTER the list was successfully displayed. Bounded and thread-local. */
+export function cacheProjectList(ctx: CmdCtx, dirs: string[]): void {
+  let cache = projectLists.get(ctx.state);
+  if (!cache) { cache = new Map(); projectLists.set(ctx.state, cache); }
+  cache.delete(ctx.threadKey);
+  cache.set(ctx.threadKey, { dirs: [...dirs], at: Date.now() });
+  if (cache.size > 100) cache.delete(cache.keys().next().value!);
+}
+
+export function projectListSnapshot(ctx: CmdCtx, now = Date.now()): string[] | null {
+  const hit = projectLists.get(ctx.state)?.get(ctx.threadKey);
+  return hit && now - hit.at <= LIST_TTL_MS ? [...hit.dirs] : null;
+}
+
+export function invalidateProjectList(ctx: CmdCtx): void {
+  projectLists.get(ctx.state)?.delete(ctx.threadKey);
+}
 
 /** Sort by recency and build display refs (markers, bound-thread info). */
 function toRefs(ctx: CmdCtx, sessions: OcSession[], serverDir: string): SessionRef[] {
@@ -98,7 +118,7 @@ function toRefs(ctx: CmdCtx, sessions: OcSession[], serverDir: string): SessionR
       const act = activity.get(s.id);
       return {
         sessionId: s.id,
-        projectDir: s.directory ?? serverDir,
+        projectDir: canonicalDir(s.directory ?? serverDir),
         title: s.title ?? "",
         updated: s.time.updated,
         summary: s.summary
@@ -117,7 +137,7 @@ function toRefs(ctx: CmdCtx, sessions: OcSession[], serverDir: string): SessionR
  * local server lists every session in the shared on-disk storage (spike 2).
  */
 export async function pickerRefs(ctx: CmdCtx): Promise<SessionRef[]> {
-  const serverDir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+  const serverDir = canonicalDir(ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd);
   const entry = await ctx.pool.ensure(serverDir);
   const raw = (await sessionList(entry.client!)) as OcSession[];
   return toRefs(ctx, raw, serverDir);
@@ -137,7 +157,7 @@ export async function pickerList(
   const serverDir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
   const q = opts.filter?.trim().toLowerCase();
   const inScope = all
-    .filter((r) => (opts.scope === "all" ? true : normDir(r.projectDir) === normDir(serverDir)))
+    .filter((r) => (opts.scope === "all" ? true : canonicalDir(r.projectDir) === canonicalDir(serverDir)))
     .filter((r) => (q ? r.title.toLowerCase().includes(q) || r.sessionId.toLowerCase().includes(q) : true));
   const capped = inScope.slice(0, SESSION_LIST_CAP);
   if (capped.length) cacheStore(ctx.threadKey, capped);

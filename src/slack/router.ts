@@ -1,4 +1,5 @@
 import type { SlackocConfig } from "../config.js";
+import { randomBytes } from "node:crypto";
 import { promptAsync, sessionCreate } from "../opencode/client.js";
 import type { ServerPool } from "../opencode/server.js";
 import type { StateStore, ThreadState } from "../state.js";
@@ -7,6 +8,9 @@ import { parseBackslash } from "../commands/parse.js";
 import "../commands/handlers.js"; // registers all commands on import
 import { SessionView, getView, reactLogged, type RenderDeps } from "./render.js";
 import { slackToPlain, truncate } from "../util.js";
+import { canonicalDir } from "../paths.js";
+import { logErr } from "../log.js";
+import { abortableFetch } from "../http.js";
 import {
   MAX_ATTACHMENT_BYTES,
   MAX_IMAGE_DOWNLOAD_BYTES,
@@ -51,6 +55,7 @@ export interface BridgeDeps {
   render: RenderDeps;
   botUserId: string;
   cwd: string;
+  isStopping?: () => boolean;
   /** Bridge self-report for \status (uptime, owner-DM reachability). */
   bridgeInfo?: { startedAt: number; dmAvailable: () => boolean };
   /** Archives permalink for a state threadKey — null when the team URL is unknown. */
@@ -64,7 +69,8 @@ function threadRootTs(msg: SlackMsg): string {
 /**
  * Slack Events often delivers the same message twice (a thread reply that
  * @mentions the bot arrives as both `message` and `app_mention`; Socket Mode
- * also retries on slow acks). Claim channel:ts exactly once — 60 s window.
+ * also retries on slow acks). Legacy utility retained for callers; the router
+ * itself uses StateStore.claimMessage's durable evidence, not this TTL cache.
  */
 const claimedEvents = new Map<string, number>();
 
@@ -112,17 +118,53 @@ function attachable(mime: string | undefined): boolean {
  * Central message gate. THE SECURITY INVARIANT: events from any user other
  * than the paired owner are dropped before anything else happens.
  */
-export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps): Promise<void> {
-  // file_share is the only subtype we let through — it carries user attachments.
-  if ((msg.subtype && msg.subtype !== "file_share") || msg.bot_id) return; // message_changed, bot echoes, etc.
-  if (!claimEvent(msg.channel, msg.ts)) return; // duplicate delivery (mention+message, retries)
-  if (!msg.user || msg.user !== d.config.ownerSlackUserId) return; // owner-only
+export type IncomingOutcome = "accepted" | "processing" | "uncertain" | "retry" | "paused" | "ignored";
+interface ProcessingAttempt { effectsStarted: boolean }
 
-  // Catch-up watermark: the sweep (slack/catchup.ts) re-reads the thread past
-  // this point if a socket-mode envelope is ever lost. Marked pre-hush-gate so
-  // deliberately-ignored (hushed) messages don't replay on a later unhush.
+export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps): Promise<IncomingOutcome> {
+  if (d.isStopping?.()) return "retry";
+  // file_share is the only subtype we let through — it carries user attachments.
+  if ((msg.subtype && msg.subtype !== "file_share") || msg.bot_id) return "ignored";
+  if (!msg.user || msg.user !== d.config.ownerSlackUserId) return "ignored";
+
   const threadKey = d.state.threadKey(msg.channel, threadRootTs(msg));
-  d.state.markThreadSeen(threadKey, msg.ts);
+  const parsed = parseBackslash(cleanMentionText(slackToPlain(msg.text ?? ""), d.botUserId));
+  const claim = d.state.claimMessage(threadKey, msg.ts, { recoveryCommand: parsed?.name === "restart" });
+  if (claim !== "claimed") {
+    // At hard capacity, status is a read-only escape hatch. Only its Slack reply
+    // has best-effort (process-local) dedup; restart NEVER bypasses durable claims.
+    if (claim === "paused" && parsed?.name === "status") {
+      if (!claimEvent(msg.channel, msg.ts)) return "ignored";
+      await execute(parsed, buildCtx(msg, d, d.state.getThread(threadKey)));
+      return "accepted";
+    }
+    return claim;
+  }
+  const attempt: ProcessingAttempt = { effectsStarted: false };
+  try {
+    d.state.markThreadSeen(threadKey, msg.ts);
+    const outcome = await processMessage(msg, d, attempt);
+    d.state.initializeHistory(threadKey, msg.ts === threadRootTs(msg) ? previousTs(msg.ts) : threadRootTs(msg));
+    d.state.markThreadSeen(threadKey, msg.ts);
+    if (outcome === "retry") d.state.releaseMessage(threadKey, msg.ts);
+    else d.state.settleMessage(threadKey, msg.ts, outcome);
+    return d.state.isMessageAccepted(threadKey, msg.ts) ? "accepted" : outcome;
+  } catch (err) {
+    if (d.state.isMessageAccepted(threadKey, msg.ts)) return "accepted";
+    const outcome = attempt.effectsStarted ? "uncertain" : "retry";
+    if (outcome === "retry") d.state.releaseMessage(threadKey, msg.ts);
+    else d.state.settleMessage(threadKey, msg.ts, "uncertain");
+    logErr(`message ${msg.channel}:${msg.ts}: ${outcome} — ${String(err)}`);
+    await d.render.post(msg.channel, threadRootTs(msg), outcome === "uncertain"
+      ? "⚠️ This message may have caused partial side effects. It will not be replayed automatically; inspect the session before sending it again."
+      : "⚠️ This message was not submitted. Recovery can retry it once the connection is available.",
+    undefined, { unfurl: false, lane: "interactive" }).catch(() => {});
+    return outcome;
+  }
+}
+
+async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingAttempt): Promise<"accepted" | "uncertain" | "retry"> {
+  const threadKey = d.state.threadKey(msg.channel, threadRootTs(msg));
 
   const raw = msg.text ?? "";
   const explicitMention = raw.includes(`<@${d.botUserId}>`);
@@ -151,6 +193,7 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps): Promi
   const thread = d.state.getThread(threadKey);
 
   if (!text) {
+    attempt.effectsStarted = true;
     await d.render.post(
       msg.channel,
       threadRootTs(msg),
@@ -158,25 +201,38 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps): Promi
       undefined,
       { unfurl: false },
     );
-    return;
+    return "accepted";
   }
 
   const action = hushAction(thread, explicitMention, parsed !== null);
-  if (action === "ignore") return;
+  if (action === "ignore") return "accepted";
   if (action === "unhush" && thread) {
     d.state.setThread(threadKey, { ...thread, hushed: false });
   }
 
   if (parsed) {
     const ctx = buildCtx(msg, d, thread);
+    // execute reports failures instead of throwing. Observe its failure reaction
+    // so a command that already mutated state never becomes a replayable failure.
+    let failed = false;
+    const react = ctx.react;
+    ctx.react = async (name, add) => {
+      if (name === "x" && add !== false) failed = true;
+      await react?.(name, add);
+    };
+    attempt.effectsStarted = true;
     await execute(parsed, ctx);
-    return;
+    if (failed) {
+      await ctx.postToThread("⚠️ Command side effects may be partial. Automatic replay is disabled for this message.");
+      return "uncertain";
+    }
+    return "accepted";
   }
   const fileParts = await downloadAttachments(attachments, msg, d);
   // Every attachment failed to download AND there's no real caption — warnings
   // already posted; a text-only "look at this file" prompt would mislead.
-  if (attachments.length && !fileParts.length && !cleanMentionText(slackToPlain(raw), d.botUserId).trim()) return;
-  await runPrompt(text, msg, d, fileParts);
+  if (attachments.length && !fileParts.length && !cleanMentionText(slackToPlain(raw), d.botUserId).trim()) return "accepted";
+  return runPrompt(text, msg, d, attempt, fileParts);
 }
 
 /** Download Slack file attachments and convert to OpenCode data-URI file parts. */
@@ -188,7 +244,8 @@ async function downloadAttachments(
   const parts: ImagePart[] = [];
   for (const f of files ?? []) {
     try {
-      const res = await fetch(f.url_private_download!, {
+      if (d.isStopping?.()) break;
+      const res = await abortableFetch(f.url_private_download!, {
         headers: { authorization: `Bearer ${d.config.slackBotToken}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -307,15 +364,24 @@ function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = nul
  * The follower awaits the leader and continues through the normal bound path
  * (picking up the queued-prompt ack from the view the leader created).
  */
-const creatingThreads = new Map<string, Promise<ThreadState>>();
+const creatingByStore = new WeakMap<StateStore, Map<string, Promise<ThreadState>>>();
+
+/** Older test doubles have ensure only; real pools always reserve a request lease. */
+async function acquire(pool: ServerPool, dir: string) {
+  return typeof pool.acquire === "function" ? pool.acquire(dir)
+    : { entry: await pool.ensure(dir), release: () => {} };
+}
 
 /**
  * New root message → fresh OpenCode session in the current project.
  * Thread reply → continue the bound session (or bind a fresh one).
  */
-async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: ImagePart[] = []): Promise<void> {
+async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: ProcessingAttempt, fileParts: ImagePart[] = []): Promise<"accepted" | "uncertain" | "retry"> {
+  if (d.isStopping?.()) return "retry";
   const threadTs = threadRootTs(msg);
   const threadKey = d.state.threadKey(msg.channel, threadTs);
+  let creatingThreads = creatingByStore.get(d.state);
+  if (!creatingThreads) { creatingThreads = new Map(); creatingByStore.set(d.state, creatingThreads); }
 
   // \watch gate: this thread is mirroring a session driven on the computer —
   // plain replies would interleave with the TUI's own turns. \ commands pass
@@ -329,7 +395,7 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: 
       undefined,
       { unfurl: false },
     );
-    return;
+    return "accepted";
   }
 
   // 👀 liveness ack — the owner learns the bridge is up and saw their
@@ -357,7 +423,7 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: 
       const ack = await d.render.post(
         msg.channel,
         threadTs,
-        ":hourglass: OpenCode is on it…",
+        "⏳ OpenCode is on it…",
         undefined,
         { unfurl: false, lane: "interactive" },
       );
@@ -368,55 +434,75 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, fileParts: 
   }
 
   if (!thread) {
-    const dir = d.state.currentProjectDir ?? d.cwd;
+    // The ack above yielded: another message may have installed the creation
+    // lock while Slack was posting it. Re-check before starting any creation.
+    const creating = creatingThreads.get(threadKey);
+    if (creating) await creating.catch(() => null);
+    thread = d.state.getThread(threadKey);
+  }
+  if (d.isStopping?.()) return "retry";
+  if (!thread) {
+    const dir = canonicalDir(d.state.currentProjectDir ?? d.cwd);
     const create = (async (): Promise<ThreadState> => {
-      const entry = await d.pool.ensure(dir);
-      const sess = await sessionCreate(entry.client!, truncate(text, 60));
-      const now = Date.now();
-      // Seed the catch-up watermark with the creating message (it IS the
-      // newest processed one) — otherwise a freshly-bound thread has no
-      // boundary and the sweep could replay its very first prompt.
-      const fresh: ThreadState = { sessionId: sess.id, projectDir: dir, verbose: "on", lastSeenTs: msg.ts, createdAt: now, lastUsedAt: now };
-      d.state.setThread(threadKey, fresh);
-      return fresh;
+      const lease = await acquire(d.pool, dir);
+      try {
+        if (d.isStopping?.()) throw new Error("bridge stopping before session creation");
+        attempt.effectsStarted = true;
+        const sess = await sessionCreate(lease.entry.client!, truncate(text, 60));
+        const now = Date.now();
+        // Start at the thread boundary; live receipt evidence protects this
+        // creating prompt while history can still discover an earlier gap.
+        const fresh: ThreadState = { sessionId: sess.id, projectDir: dir, verbose: "on", lastSeenTs: msg.ts,
+          historyCursorTs: threadTs === msg.ts ? previousTs(msg.ts) : threadTs, createdAt: now, lastUsedAt: now };
+        d.state.setThread(threadKey, fresh);
+        attempt.effectsStarted = false; // binding is durable; retry can reuse it
+        return fresh;
+      } finally { lease.release(); }
     })();
     creatingThreads.set(threadKey, create);
     try {
       thread = await create;
     } catch (err) {
       await failBoot(msg, d, ackTs, err);
-      return;
+      throw err;
     } finally {
       creatingThreads.delete(threadKey);
     }
   }
 
-  let entry: Awaited<ReturnType<typeof d.pool.ensure>>;
+  let lease: Awaited<ReturnType<typeof acquire>>;
   try {
-    entry = await d.pool.ensure(thread.projectDir);
+    lease = await acquire(d.pool, thread.projectDir);
   } catch (err) {
     await failBoot(msg, d, ackTs, err);
-    return;
+    return "retry";
   }
 
-  let view = getView(thread.sessionId);
-  if (!view) {
-    view = new SessionView({
-      sessionId: thread.sessionId,
-      projectDir: thread.projectDir,
-      channel: msg.channel,
-      threadTs,
-      threadKey,
-      client: entry.client!,
-      deps: d.render,
-      state: d.state,
-      threadState: thread,
-      statusTs: ackTs ?? undefined,
-    });
-  }
-  await view.beginPrompt(msg.ts);
-
-  await sendPrompt(d, thread, text, entry.client!, threadKey, msg, fileParts);
+  try {
+    const entry = lease.entry;
+    if (d.isStopping?.()) return "retry";
+    let view = getView(thread.sessionId);
+    if (!view) {
+      view = new SessionView({
+        sessionId: thread.sessionId,
+        projectDir: thread.projectDir,
+        channel: msg.channel,
+        threadTs,
+        threadKey,
+        client: entry.client!,
+        deps: d.render,
+        state: d.state,
+        threadState: thread,
+        statusTs: ackTs ?? undefined,
+      });
+    } else if (ackTs) {
+      await d.render.delete(msg.channel, ackTs).catch(() => {});
+    }
+    await view.beginPrompt(msg.ts);
+    if (d.isStopping?.()) return "retry";
+    attempt.effectsStarted = true;
+    return await sendPrompt(d, thread, text, entry.client!, threadKey, msg, fileParts);
+  } finally { lease.release(); }
 }
 
 /**
@@ -446,55 +532,72 @@ async function sendPrompt(
   threadKey: string,
   msg: SlackMsg,
   fileParts: ImagePart[] = [],
-): Promise<void> {
+): Promise<"accepted" | "uncertain"> {
   try {
-    await promptAsync(client, thread.sessionId, text, { model: thread.model, agent: thread.agent, files: fileParts });
+    const messageID = newPromptMessageID();
+    d.state.associatePrompt(threadKey, msg.ts, { projectDir: thread.projectDir, sessionId: thread.sessionId, messageId: messageID });
+    await promptAsync(client, thread.sessionId, text, { model: thread.model, agent: thread.agent, files: fileParts, messageID });
+    return "accepted";
   } catch (err) {
+    if (d.state.isMessageAccepted(threadKey, msg.ts)) return "accepted";
     const msgText = String((err as Error)?.message ?? err);
-    if (/not.?found|404/i.test(msgText)) {
+    if (isMissingSession(err)) {
       // Session vanished (server data wiped, etc.) — rebind a fresh session, once.
       let reboundSessionId: string | null = null;
       try {
         const dir = thread.projectDir;
-        const entry2 = await d.pool.ensure(dir);
-        const sess = await sessionCreate(entry2.client!, truncate(text, 60));
-        reboundSessionId = sess.id;
-        const now = Date.now();
-        const fresh: ThreadState = {
-          sessionId: sess.id,
-          projectDir: dir,
-          verbose: thread.verbose,
-          model: thread.model,
-          agent: thread.agent,
-          lastSeenTs: thread.lastSeenTs ?? msg.ts,
-          createdAt: now,
-          lastUsedAt: now,
-        };
-        d.state.setThread(threadKey, fresh);
-        // Keep the same view (and its ⏳ → ✅ lifecycle) pointed at the new
-        // session, so its SSE events still render and the reaction resolves.
-        getView(thread.sessionId)?.retargetSession(sess.id);
-        await promptAsync(entry2.client!, sess.id, text, { model: fresh.model, agent: fresh.agent, files: fileParts });
+        const lease = await acquire(d.pool, dir);
+        try {
+          const sess = await sessionCreate(lease.entry.client!, truncate(text, 60));
+          reboundSessionId = sess.id;
+          const fresh: ThreadState = {
+            ...(d.state.getThread(threadKey) ?? thread),
+            sessionId: sess.id, projectDir: dir, lastUsedAt: Date.now(),
+          };
+          d.state.setThread(threadKey, fresh);
+          // Keep the view, preferences and pending-run metadata through a rebind.
+          getView(thread.sessionId)?.retargetSession(sess.id);
+          const messageID = newPromptMessageID();
+          d.state.associatePrompt(threadKey, msg.ts, { projectDir: dir, sessionId: sess.id, messageId: messageID });
+          await promptAsync(lease.entry.client!, sess.id, text, { model: fresh.model, agent: fresh.agent, files: fileParts, messageID });
+          return "accepted";
+        } finally { lease.release(); }
       } catch (err2) {
-        // The retried prompt failed too — finalize via the (retargeted) view so
-        // the thread gets its ❌ + error line + failure DM instead of hanging at
-        // ⏳ until the watchdog. Fallback line only if the view is truly gone.
-        const reason = `prompt failed after rebind: ${String((err2 as Error)?.message ?? err2).slice(0, 200)} — \`\\new\` starts a fresh session`;
-        const view2 = reboundSessionId ? getView(reboundSessionId) : undefined;
-        if (view2) await view2.finalize(reason);
-        else {
-          await d.render.post(
-            msg.channel,
-            msg.thread_ts ?? msg.ts,
-            `⚠️ ${reason}`,
-            undefined,
-            { unfurl: false },
-          );
-        }
+        return reportUncertain(d, msg, `after rebind${reboundSessionId ? ` (${reboundSessionId})` : ""}: ${String((err2 as Error)?.message ?? err2)}`);
       }
-      return;
     }
-    const view = getView(thread.sessionId);
-    await view?.finalize(`prompt failed: ${msgText.slice(0, 200)}`);
+    return reportUncertain(d, msg, msgText);
   }
+}
+
+function isMissingSession(err: unknown): boolean {
+  const e = err as { status?: number; response?: { status?: number }; message?: string };
+  return e?.status === 404 || e?.response?.status === 404 || /^(?:HTTP )?404(?: not found)?$/i.test(e?.message ?? "");
+}
+
+async function reportUncertain(d: BridgeDeps, msg: SlackMsg, reason: string): Promise<"accepted" | "uncertain"> {
+  const key = d.state.threadKey(msg.channel, threadRootTs(msg));
+  if (d.state.isMessageAccepted(key, msg.ts)) return "accepted";
+  // Persist BEFORE attempting to report. A failed Slack post must not erase evidence.
+  d.state.settleMessage(d.state.threadKey(msg.channel, threadRootTs(msg)), msg.ts, "uncertain");
+  logErr(`prompt submission uncertain (${msg.channel}:${msg.ts}): ${reason}`);
+  await d.render.post(msg.channel, threadRootTs(msg),
+    `⚠️ Prompt acceptance is uncertain: ${truncate(reason, 200)}. It may still be running. I will not automatically resubmit; inspect the session before sending it again.`,
+    undefined, { unfurl: false, lane: "interactive" }).catch(() => {});
+  return d.state.isMessageAccepted(key, msg.ts) ? "accepted" : "uncertain";
+}
+
+let lastPromptIDTime = 0n;
+/** Sortable msg_ prefix plus random suffix; correlation only, never a license to retry. */
+function newPromptMessageID(): string {
+  const now = BigInt(Date.now()) * 0x1000n;
+  lastPromptIDTime = now > lastPromptIDTime ? now : lastPromptIDTime + 1n;
+  return `msg_${lastPromptIDTime.toString(16).padStart(12, "0")}${randomBytes(7).toString("hex")}`;
+}
+
+function previousTs(ts: string): string {
+  const [seconds, fraction = ""] = ts.split(".");
+  const micros = BigInt(seconds!) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
+  const previous = micros > 0n ? micros - 1n : 0n;
+  return `${previous / 1_000_000n}.${String(previous % 1_000_000n).padStart(6, "0")}`;
 }

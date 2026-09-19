@@ -31,6 +31,9 @@
  */
 
 import { logErr } from "../log.js";
+import { withDeadline } from "../http.js";
+import { withSlackOperation } from "./transport.js";
+export { SLACK_UPLOAD_TIMEOUT_MS, slackWebClientOptions } from "./transport.js";
 
 export const SLACK_OP_TIMEOUT_MS = 30_000;
 /** Pacing between op starts within one channel lane. */
@@ -45,6 +48,10 @@ export interface EnqueueOpts {
   channel: string;
   /** "interactive" jumps ahead of queued background work in the same channel. */
   lane?: SlackLane;
+  /** End-to-end budget per attempt; uploads should use SLACK_UPLOAD_TIMEOUT_MS. */
+  timeoutMs?: number;
+  /** Multi-stage uploads should disable replay of the entire operation on 429. */
+  retryRateLimits?: boolean;
 }
 
 interface QueuedOp {
@@ -107,15 +114,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function withTimeout<T>(p: Promise<T>): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`slack call timed out (${SLACK_OP_TIMEOUT_MS / 1000}s)`)), SLACK_OP_TIMEOUT_MS),
-    ),
-  ]);
-}
-
 /** Next op to run: starving background first, then interactive, then background FIFO. */
 function takeNext(lane: ChannelLane): QueuedOp | undefined {
   const bgOldest = lane.background[0];
@@ -127,7 +125,7 @@ function takeNext(lane: ChannelLane): QueuedOp | undefined {
   return lane.background.shift();
 }
 
-export function enqueue<T>(op: () => Promise<T>, opts: EnqueueOpts): Promise<T> {
+export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: EnqueueOpts): Promise<T> {
   const lane = getLane(opts.channel);
   const laneKind = opts.lane ?? "background";
   return new Promise<T>((resolve, reject) => {
@@ -135,25 +133,31 @@ export function enqueue<T>(op: () => Promise<T>, opts: EnqueueOpts): Promise<T> 
       enqueuedAt: Date.now(),
       lane: laneKind,
       run: async () => {
-        // Pacing: this lane starts ops at most once per SLACK_PACE_MS.
-        const gap = SLACK_PACE_MS - (Date.now() - lane.lastCall);
-        if (gap > 0) await sleep(gap);
-        // Brake: a 429 anywhere holds everyone for Retry-After.
-        const brake = globalCooldownUntil - Date.now();
-        if (brake > 0) await sleep(brake);
-        lane.lastCall = Date.now();
         for (let attempt = 0; ; attempt++) {
           try {
-            resolve(await withTimeout(op()));
+            // Re-check after every wake: another lane may have extended the brake.
+            for (;;) {
+              const wait = Math.max(lane.lastCall + SLACK_PACE_MS, globalCooldownUntil) - Date.now();
+              if (wait <= 0) break;
+              await sleep(wait);
+            }
+            lane.lastCall = Date.now();
+            const timeoutMs = opts.timeoutMs ?? SLACK_OP_TIMEOUT_MS;
+            resolve(await withDeadline(
+              (signal) => withSlackOperation(signal, timeoutMs, () => op(signal)),
+              { timeoutMs }, "slack call",
+            ));
             return;
           } catch (err) {
-            const e = err as { data?: { retry_after?: number }; message?: string };
-            const retryAfter = e?.data?.retry_after;
-            if (attempt < 3 && (retryAfter || /rate.?limit|429/i.test(String(e?.message)))) {
-              const waitMs = retryAfter ? retryAfter * 1000 : 2000 * 2 ** attempt;
+            const e = err as { code?: string; statusCode?: number; retryAfter?: number; data?: { retry_after?: number }; message?: string };
+            const value = e?.retryAfter ?? e?.data?.retry_after;
+            const retryAfter = typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+            const limited = e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 ||
+              retryAfter !== undefined || /^HTTP 429\b/i.test(e?.message ?? "");
+            if (limited) {
+              const waitMs = retryAfter !== undefined ? retryAfter * 1000 : 2000 * 2 ** Math.min(attempt, 2);
               globalCooldownUntil = Math.max(globalCooldownUntil, Date.now() + waitMs);
-              await sleep(waitMs);
-              continue;
+              if (attempt < 3 && opts.retryRateLimits !== false) continue;
             }
             // Permanent failure — the op is dropped. NEVER silently: a summary
             // or answer can vanish this way, and from a phone there is no

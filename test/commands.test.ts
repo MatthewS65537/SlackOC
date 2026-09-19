@@ -1,8 +1,15 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { homedir } from "node:os";
+import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
 import { getCommand, allCommands, execute, registerCommand, type CmdCtx } from "../src/commands/registry.js";
 import { newThreadState, HELP_SECTIONS } from "../src/commands/handlers.js";
 import { StateStore } from "../src/state.js";
+import { canonicalDir } from "../src/paths.js";
+import { pickerList } from "../src/commands/picker.js";
+
+const IDENTITY_FIXTURES = join(import.meta.dirname, ".fixtures", "commands-identity");
+afterAll(() => rmSync(IDENTITY_FIXTURES, { recursive: true, force: true }));
 
 /** Minimal CmdCtx with recording output; command fakes add what they need. */
 function baseCtx(state: StateStore, out: string[], thread: CmdCtx["thread"] = null, extra: Partial<CmdCtx> = {}) {
@@ -42,6 +49,80 @@ function hushCtx(state: StateStore) {
     out,
   };
 }
+
+describe("canonical project choices", () => {
+  it("deduplicates real aliases, keeps same basenames distinct, and selects the displayed number after pool reorder", async () => {
+    const a = join(IDENTITY_FIXTURES, "a", "project");
+    const b = join(IDENTITY_FIXTURES, "b", "project");
+    const c = join(IDENTITY_FIXTURES, "c", "project");
+    for (const dir of [a, b, c]) mkdirSync(dir, { recursive: true });
+    const alias = join(IDENTITY_FIXTURES, "alias");
+    symlinkSync(a, alias);
+    const state = new StateStore(join(IDENTITY_FIXTURES, "state.json"));
+    state.setCurrentProject(alias + "/./");
+    state.touchProject(a + "/");
+    state.touchProject(b);
+    state.touchProject(c);
+    let listed = [alias, b, c];
+    const acquired: string[] = [];
+    const release = vi.fn();
+    const client = { session: { create: async () => ({ data: { id: "identity-new" } }) } };
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, { cwd: a, threadKey: "identity:1", pool: {
+      list: () => listed.map((dir) => ({ dir, status: "ready" })),
+      acquire: async (dir: string) => { acquired.push(dir); return { entry: { client }, release }; },
+    } as never });
+    await getCommand("project")!.run(ctx, "");
+    expect(out[0]).toContain(`*Current:* \`${canonicalDir(a)}\``);
+    expect(out[0]).toContain(`1) \`project\` — ${canonicalDir(b)}`);
+    expect(out[0]).toContain(`2) \`project\` — ${canonicalDir(c)}`);
+    expect(out[0]).not.toContain("3)");
+    listed = [c, a, b];
+    state.setCurrentProject(b); // another thread changed the global default too
+    await getCommand("project")!.run(ctx, "2");
+    expect(acquired).toEqual([canonicalDir(c)]);
+    expect(release).toHaveBeenCalledOnce();
+    expect(state.getThread(ctx.threadKey)?.projectDir).toBe(canonicalDir(c));
+
+    const sessionCtx = { ...ctx, thread: null, cwd: alias, pool: { ensure: async () => ({ client: {
+      session: { list: async () => ({ data: [
+        { id: "in", directory: alias, title: "in", time: { updated: Date.now() } },
+        { id: "out", directory: b, title: "out", time: { updated: Date.now() } },
+      ] }) },
+    } }) } as never };
+    state.setCurrentProject(a);
+    const scoped = await pickerList(sessionCtx, { scope: "project" });
+    expect(scoped.refs.map((r) => r.sessionId)).toEqual(["in"]);
+    expect(scoped.refs[0]?.projectDir).toBe(canonicalDir(a));
+  });
+
+  it("requires a fresh successfully displayed per-thread list for numeric choices", async () => {
+    const state = new StateStore(join(IDENTITY_FIXTURES, "fresh-state.json"));
+    state.setCurrentProject("/current");
+    const create = vi.fn();
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, { pool: {
+      list: () => [{ dir: "/other", status: "ready" }],
+      ensure: async () => ({ client: { session: { create } } }),
+    } as never });
+    await getCommand("project")!.run(ctx, "1");
+    expect(out.at(-1)).toContain("No fresh project list");
+    await getCommand("project")!.run(ctx, "");
+    await getCommand("project")!.run({ ...ctx, threadKey: "another:thread" }, "1");
+    expect(out.at(-1)).toContain("No fresh project list");
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 11 * 60_000);
+    try {
+      await getCommand("project")!.run(ctx, "1");
+      expect(out.at(-1)).toContain("No fresh project list");
+    } finally { clock.mockRestore(); }
+    await expect(getCommand("project")!.run({ ...ctx, postToThread: async () => { throw new Error("Slack offline"); } }, ""))
+      .rejects.toThrow("Slack offline");
+    await getCommand("project")!.run(ctx, "1");
+    expect(out.at(-1)).toContain("No fresh project list");
+    expect(create).not.toHaveBeenCalled();
+  });
+});
 
 /**
  * CmdCtx wired to a stubbed OpenCode server that returns a fixture providers map.

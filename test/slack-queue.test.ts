@@ -27,6 +27,28 @@ describe("Slack queue: per-op guards (B2)", () => {
     await assertion;
   });
 
+  it("signals cancellation to the actual operation and cleans its timer", async () => {
+    let canceled = false;
+    const rejected = expect(enqueue((signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => { canceled = true; reject(signal.reason); }, { once: true });
+    }), { channel: "C1", timeoutMs: 100 })).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejected;
+    expect(canceled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cleans the deadline after success and does not retry ambiguous network failures", async () => {
+    await enqueue(async () => 42, { channel: "C1" });
+    expect(vi.getTimerCount()).toBe(0);
+    const op = vi.fn(async () => { throw new Error("network lost after a rate limit warning"); });
+    const rejected = expect(enqueue(op, { channel: "C2" })).rejects.toThrow("network lost");
+    await vi.advanceTimersByTimeAsync(50_000);
+    await rejected;
+    expect(op).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("a timed-out op does not block operations queued behind it", async () => {
     const stuck = enqueue(() => new Promise(() => { }), { channel: "C1" }).catch((e: Error) => e.message);
     const next = enqueue(() => Promise.resolve("made it"), { channel: "C1" });
@@ -63,7 +85,8 @@ describe("Slack queue: per-op guards (B2)", () => {
     expect(droppedOpCount()).toBe(0);
     const p1 = enqueue(() => Promise.reject(new Error("HTTP 429")), { channel: "C1" }).catch(() => {});
     const p2 = enqueue(() => Promise.reject(new Error("channel_not_found")), { channel: "C1" }).catch(() => {});
-    await vi.advanceTimersByTimeAsync(20_000);
+    // The final 429 still brakes following operations, even after this op gives up.
+    await vi.advanceTimersByTimeAsync(40_000);
     await Promise.all([p1, p2]);
     expect(droppedOpCount()).toBe(2);
   });
@@ -192,6 +215,29 @@ describe("Slack queue: per-channel lanes (#5)", () => {
     await expect(a).resolves.toBe("a-ok");
     await expect(b).resolves.toBe("b-ok");
     expect(aCalls).toBe(2);
+  });
+
+  it("rechecks a cooldown extended by a second in-flight lane", async () => {
+    let aCalls = 0;
+    let bCalls = 0;
+    const start = Date.now();
+    const a = enqueue(async () => {
+      if (++aCalls === 1) throw Object.assign(new Error("limited"), { retryAfter: 2 });
+      return Date.now();
+    }, { channel: "CA" });
+    const b = enqueue(async () => {
+      if (++bCalls === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        throw Object.assign(new Error("limited"), { retryAfter: 10 });
+      }
+      return Date.now();
+    }, { channel: "CB" });
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(aCalls).toBe(1);
+    expect(bCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(await a).toBe(start + 10_500);
+    expect(await b).toBe(start + 10_500);
   });
 });
 

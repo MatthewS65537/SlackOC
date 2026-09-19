@@ -49,14 +49,13 @@ function fakeDeps(log: CallLog): RenderDeps {
   };
 }
 
-/** Stub OCClient: summary fetch fails quietly; session.messages is configurable. */
-function stubClient(messages: Array<{ info: { role: string; id?: string; time?: { created: number } }; parts: Array<{ id: string; type: string; text?: string }> }> = []): OCClient {
+/** Stub OCClient: session identity exists, no summary; messages are configurable. */
+function stubClient(messages: Array<{ info: { role: string; id?: string; time?: { created: number } }; parts: Array<{ id: string; type: string; text?: string }> }> = [], idleSession?: string): OCClient {
   return {
     session: {
-      get: async () => {
-        throw new Error("no summary in tests");
-      },
+      get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }),
       messages: async () => ({ data: messages }),
+      status: async () => ({ data: idleSession ? { [idleSession]: { type: "idle" } } : {} }),
     },
   } as never;
 }
@@ -181,7 +180,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
     expect(log.posted).toEqual([]); // buffered until flush
     await v.finalize();
     // divider + first tool line travel as ONE atomic message
-    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 npm test");
+    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `npm test`");
     deleteView("sess-tool-a");
   });
 
@@ -193,7 +192,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
       properties: { part: { id: "t2", type: "tool", tool: "edit", callID: "c2", state: { status: "running", input: { filePath: "/a/b/src/x.ts" } } } },
     } as never);
     await v.finalize();
-    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n✏️ edit /a/b/src/x.ts");
+    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n✏️ edit `/a/b/src/x.ts`");
     deleteView("sess-tool-b");
   });
 
@@ -214,11 +213,11 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
       properties: { part: { id: "t3", type: "tool", tool: "grep", callID: "c3", state: { status: "running", input: { pattern: "foo" } } } },
     } as never);
     await v.finalize();
-    expect(log.posted.filter((p) => p.includes('🔍 grep "foo"')).length).toBe(1); // exactly one tool line
+    expect(log.posted.filter((p) => p.includes('🔍 grep `foo`')).length).toBe(1); // exactly one tool line
     deleteView("sess-tool-c");
   });
 
-  it("uses OpenCode's state.title verbatim once present (read tool)", async () => {
+  it("keeps known tool labels consistent even with a state.title", async () => {
     const log = blank();
     const v = makeView(log, "sess-tool-d", { verbose: "on" });
     await v.handle({
@@ -226,7 +225,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
       properties: { part: { id: "t4", type: "tool", tool: "read", callID: "c4", state: { status: "running", input: { filePath: "/big/repo/src/main.ts" }, title: "Read /big/repo/src/main.ts" } } },
     } as never);
     await v.finalize();
-    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\nRead /big/repo/src/main.ts");
+    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n📄 read `/big/repo/src/main.ts`");
     deleteView("sess-tool-d");
   });
 
@@ -238,7 +237,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
       properties: { part: { id: "t8", type: "tool", tool: "bash", callID: "c8", state: { status: "running", input: { command: `echo ${"x".repeat(100)}` } } } },
     } as never);
     await v.finalize();
-    expect(log.posted[0]).toBe(`⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 echo ${"x".repeat(54)}…`);
+    expect(log.posted[0]).toBe(`⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 \`echo ${"x".repeat(54)}…\``);
     deleteView("sess-tool-g");
   });
 
@@ -250,7 +249,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
       properties: { part: { id: "t9", type: "tool", tool: "bash", callID: "c9", state: { status: "running", input: { command: "git commit -m 'wip'\n\nlong body continues here\nand here" } } } },
     } as never);
     await v.finalize();
-    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 git commit -m 'wip'");
+    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `git commit -m 'wip'`");
     deleteView("sess-tool-h");
   });
 
@@ -263,8 +262,8 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
     } as never);
     await v.finalize();
     const line = (log.posted[0] ?? "").split("\n").pop() ?? "";
-    expect(line.length).toBeLessThanOrEqual(60);
-    expect(line.startsWith("Read /big/repo/src/very/deeply/nested/p")).toBe(true);
+    expect(line.length).toBeLessThanOrEqual(75);
+    expect(line.startsWith("🔧 `custom` · Read /big/repo/src/very/deeply/nested/p")).toBe(true);
     expect(line.endsWith("…")).toBe(true);
     deleteView("sess-tool-i");
   });
@@ -306,7 +305,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
       properties: { part: { id: "t7", type: "tool", tool: "read", callID: "c7", state: { status: "running", input: { filePath: "/etc/hosts" } } } },
     } as never);
     await v.finalize();
-    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n📄 read src/state.ts\n📄 read /etc/hosts");
+    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n📄 read `src/state.ts`\n📄 read `/etc/hosts`");
     deleteView("sess-tool-f");
   });
 
@@ -321,7 +320,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
     }
     expect(log.posted).toEqual([]); // still buffered
     await v.finalize();
-    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 ls\n🔧 pwd");
+    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `ls`\n🔧 `pwd`");
     deleteView("sess-tool-batch");
   });
 
@@ -336,7 +335,7 @@ describe("SessionView tool lines (compact, icon-prefixed)", () => {
     }
     // 8th buffered line triggers a flush — no finalize yet.
     expect(log.posted.length).toBe(1);
-    expect(log.posted[0]).toContain("🔧 echo 8");
+    expect(log.posted[0]).toContain("🔧 `echo 8`");
     deleteView("sess-tool-cap");
   });
 });
@@ -354,7 +353,7 @@ describe("SessionView section dividers", () => {
       properties: { part: { id: "d2", messageID: "dm", type: "text", text: "here is the result", time: { end: 1 } } },
     } as never);
     // dividers ride with their first line — atomic
-    expect(log.posted).toEqual(["⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 ls", "⎯⎯⎯ response ⎯⎯⎯\n\nhere is the result"]);
+    expect(log.posted).toEqual(["⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `ls`", "⎯⎯⎯ response ⎯⎯⎯\n\nhere is the result"]);
     deleteView("sess-div-a");
   });
 
@@ -390,7 +389,7 @@ describe("SessionView section dividers", () => {
     } as never);
     // Only separators between actual section flips — intro is bare, the
     // tools divider precedes the tool, and outro gets its response divider.
-    expect(log.posted).toEqual(["intro", "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 ls", "⎯⎯⎯ response ⎯⎯⎯\n\noutro"]);
+    expect(log.posted).toEqual(["intro", "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `ls`", "⎯⎯⎯ response ⎯⎯⎯\n\noutro"]);
     deleteView("sess-div-b2");
   });
 
@@ -422,9 +421,9 @@ describe("SessionView section dividers", () => {
     // separate yet); every later flip gets its divider.
     expect(log.posted).toEqual([
       "first analysis",
-      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 ls",
+      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `ls`",
       "⎯⎯⎯ response ⎯⎯⎯\n\nmiddle thoughts",
-      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 pwd",
+      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `pwd`",
       "⎯⎯⎯ response ⎯⎯⎯\n\nfinal answer",
     ]);
     deleteView("sess-div-d");
@@ -493,7 +492,7 @@ describe("SessionView section dividers", () => {
         part: { id: "f3", messageID: "fm", type: "file", mime: "image/png", filename: "chart2.png", url: "data:image/png;base64,aXBobw==" },
       },
     } as never);
-    expect(log.posted).toEqual(["⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 ls", "⎯⎯⎯ response ⎯⎯⎯"]);
+    expect(log.posted).toEqual(["⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `ls`", "⎯⎯⎯ response ⎯⎯⎯"]);
     expect(log.uploads.length).toBe(2);
     deleteView("sess-div-g");
   });
@@ -524,9 +523,9 @@ describe("SessionView event serialization (ordering race)", () => {
     // Tool → text → tool arrived in that order; posts must land in it too
     // (tool lines batch, so the trailing one lands on the finalize flush).
     expect(log.posted.slice(0, 3)).toEqual([
-      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 ls",
+      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `ls`",
       "⎯⎯⎯ response ⎯⎯⎯\n\nanswer text",
-      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 pwd",
+      "⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `pwd`",
     ]);
     deleteView("sess-race-a");
   });
@@ -547,7 +546,7 @@ describe("SessionView event serialization (ordering race)", () => {
     // finalize fires while the tool event render is still queued.
     await v.finalize();
     await pending;
-    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 sleep"); // tool line first, backstop after
+    expect(log.posted[0]).toBe("⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `sleep`"); // tool line first, backstop after
     expect(log.posted).toContain("⎯⎯⎯ response ⎯⎯⎯\n\nbackstop answer");
     deleteView("sess-race-b");
   });
@@ -560,7 +559,7 @@ describe("SessionView status line", () => {
     await v.beginPrompt("111.700");
     await v.handle({ type: "message.part.updated", properties: { part: { id: "s1", messageID: "m1", type: "step-start" } } } as never);
     await new Promise((r) => setTimeout(r, 1300)); // let the 1s status ticker fire
-    expect(log.updates.at(-1)).toMatch(/:hourglass(_flowing_sand)?:/);
+    expect(log.updates.at(-1)).toMatch(/[⏳⌛]/);
     expect(log.updates.at(-1)).toContain("thinking…");
     expect(log.updates.at(-1)).not.toContain("Tools");
     deleteView("sess-status-a");
@@ -577,10 +576,10 @@ describe("SessionView live-status ticker (1s, alternating ⏳⌛)", () => {
       expect(log.updates).toEqual([]); // nothing fires before the first beat
       await vi.advanceTimersByTimeAsync(3_200);
       expect(log.updates.length).toBe(3);
-      expect(log.updates[0]).toContain(":hourglass_flowing_sand:");
-      expect(log.updates[0]).not.toContain(":hourglass: ");
-      expect(log.updates[1]).toContain(":hourglass: ");
-      expect(log.updates[2]).toContain(":hourglass_flowing_sand:");
+      expect(log.updates[0]).toContain("⌛");
+      expect(log.updates[0]).not.toContain("⏳");
+      expect(log.updates[1]).toContain("⏳");
+      expect(log.updates[2]).toContain("⌛");
       // Elapsed time ticks along with the beats.
       expect(log.updates[0]).toContain("(1s)");
       expect(log.updates[1]).toContain("(2s)");
@@ -1175,7 +1174,7 @@ describe("stale-run reconcile (RB2)", () => {
 
   it("finalizes a run the server proves completed — and the backstop redelivers its answer", async () => {
     const log = blank();
-    makeView(log, "sess-rec-a", { client: stubClient(doneMsg()) });
+    makeView(log, "sess-rec-a", { client: stubClient(doneMsg(), "sess-rec-a") });
     await getView("sess-rec-a")!.beginPrompt("111.601");
     expect(await reconcileStaleViews(0)).toBe(1); // staleMs 0 = check now
     expect(log.reacted).toEqual([["111.601", "white_check_mark"]]);
@@ -1356,7 +1355,7 @@ function gateableStatusPosts(log: CallLog): { deps: RenderDeps; release: () => P
   const deps = fakeDeps(log);
   const basePost = deps.post;
   deps.post = async (c, t, text, blocks, opts) => {
-    if (text.includes(":hourglass") && log.posted.length > 0) {
+    if (/[⏳⌛]/.test(text) && log.posted.length > 0) {
       active += 1;
       max = Math.max(max, active);
       await gate;
@@ -1391,7 +1390,7 @@ describe("SessionView strict-bottom sink (#6)", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(log.posted).toHaveLength(3); // ack + content + re-homed bar
       expect(log.posted[1]).toContain("some answer");
-      expect(log.posted.at(-1)).toMatch(/:hourglass/); // bar is bottom-most
+      expect(log.posted.at(-1)).toMatch(/[⏳⌛]/); // bar is bottom-most
       expect(log.deleted).toEqual(["status-1"]);
       deleteView("sess-sink-b");
     } finally {
@@ -1413,9 +1412,9 @@ describe("SessionView strict-bottom sink (#6)", () => {
       expect(gated.maxActive()).toBe(1); // never two overlapping status posts
       await gated.release(); // round 1 adopts; contentBelow re-armed → round 2 follows
       await vi.advanceTimersByTimeAsync(0);
-      const bars = log.posted.filter((p) => p.includes(":hourglass"));
+      const bars = log.posted.filter((p) => /[⏳⌛]/.test(p));
       expect(bars).toHaveLength(3); // ack + 2 chase rounds (one after each content)
-      expect(log.posted.at(-1)).toMatch(/:hourglass/); // ends strictly at the bottom
+      expect(log.posted.at(-1)).toMatch(/[⏳⌛]/); // ends strictly at the bottom
       expect(gated.maxActive()).toBe(1);
       deleteView("sess-sink-c");
     } finally {
@@ -1435,13 +1434,13 @@ describe("SessionView strict-bottom sink (#6)", () => {
       await v.beginPrompt("111.brk");
       await v.handle(textPart("t1", "answer one"));
       await vi.advanceTimersByTimeAsync(2_000); // ticks fire; every sink attempt hits the breaker
-      expect(log.posted.filter((p) => p.includes(":hourglass"))).toHaveLength(1); // ack only — no sink
+      expect(log.posted.filter((p) => /[⏳⌛]/.test(p))).toHaveLength(1); // ack only — no sink
       // The lane drains — the NEXT content post re-homes the bar.
       spy.mockReturnValue(0);
       await v.handle(textPart("t2", "answer two"));
       await vi.advanceTimersByTimeAsync(0);
-      expect(log.posted.filter((p) => p.includes(":hourglass"))).toHaveLength(2);
-      expect(log.posted.at(-1)).toMatch(/:hourglass/);
+      expect(log.posted.filter((p) => /[⏳⌛]/.test(p))).toHaveLength(2);
+      expect(log.posted.at(-1)).toMatch(/[⏳⌛]/);
       deleteView("sess-sink-brk");
     } finally {
       spy.mockRestore();
@@ -1478,11 +1477,11 @@ describe("SessionView strict-bottom sink (#6)", () => {
       await v.beginPrompt("111.sink4");
       await v.handle(textPart("t3", "content"));
       await vi.advanceTimersByTimeAsync(0); // the sink round completes BEFORE finalize
-      const barsBefore = log.posted.filter((p) => p.includes(":hourglass")).length;
+      const barsBefore = log.posted.filter((p) => /[⏳⌛]/.test(p)).length;
       expect(barsBefore).toBe(2); // ack + re-homed bar (strict bottom at work)
       await v.finalize();
       await vi.advanceTimersByTimeAsync(3_000);
-      expect(log.posted.filter((p) => p.includes(":hourglass"))).toHaveLength(barsBefore);
+      expect(log.posted.filter((p) => /[⏳⌛]/.test(p))).toHaveLength(barsBefore);
       deleteView("sess-sink-d");
     } finally {
       _resetQueueForTests();
@@ -1589,9 +1588,8 @@ describe("SessionView.attach (watch a computer-driven session)", () => {
       let snapshot: unknown[] | null = null;
       const client = {
         session: {
-          get: async () => {
-            throw new Error("no summary");
-          },
+          status: async () => ({ data: { "ses-watch-b": { type: "idle" } } }),
+          get: async () => ({ data: { id: "ses-watch-b" } }),
           messages: async () => {
             if (!snapshot) {
               const now = Date.now();
@@ -1629,9 +1627,8 @@ describe("SessionView.attach (watch a computer-driven session)", () => {
       const log = blank();
       const client = {
         session: {
-          get: async () => {
-            throw new Error("no summary");
-          },
+          status: async () => ({ data: { "ses-watch-c": { type: "idle" } } }),
+          get: async () => ({ data: { id: "ses-watch-c" } }),
           messages: async () => ({
             data: [
               { info: { id: "m1", role: "user", time: { created: OLD } }, parts: [] },

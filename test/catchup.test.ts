@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { sweepMissedMessages, type CatchupDeps } from "../src/slack/catchup.js";
+import { createCatchupCoordinator, sweepMissedMessages, type CatchupDeps } from "../src/slack/catchup.js";
 import { handleIncomingMessage, type BridgeDeps, type SlackMsg } from "../src/slack/router.js";
 import type { RenderDeps } from "../src/slack/render.js";
 import type { ServerPool } from "../src/opencode/server.js";
@@ -73,6 +73,7 @@ function harness(
         (async (m) => {
           dispatched.push(m);
           store.markThreadSeen(`${m.channel}:${m.thread_ts ?? m.ts}`, m.ts);
+          return "accepted";
         }),
     },
     dispatched,
@@ -111,7 +112,7 @@ describe("missed-message catch-up sweep", () => {
     expect(fetches).toEqual([]);
   });
 
-  it("skips threads idle beyond the 12h window and caps a pass at 10 threads", async () => {
+  it("includes overnight threads, lends the spare older slot, and rotates beyond ten candidates", async () => {
     const mk = (rootTs: string, lastUsedAt: number): ThreadState => ({
       sessionId: "ses_x",
       projectDir: "/p",
@@ -125,8 +126,10 @@ describe("missed-message catch-up sweep", () => {
     const store = storeWithThreads("cu-window", threads);
     const { deps, fetches } = harness(store, {});
     await sweepMissedMessages(deps);
-    expect(fetches.some((f) => f.startsWith("C9:9200.000001"))).toBe(false); // window excluded it
-    expect(fetches.length).toBeLessThanOrEqual(10); // pass cap
+    expect(fetches.some((f) => f.startsWith("C9:9200.000001"))).toBe(true);
+    expect(fetches.length).toBe(10);
+    await sweepMissedMessages(deps);
+    expect(new Set(fetches).size).toBe(12);
   });
 
   it("a failed replay keeps the watermark and retries on the next pass", async () => {
@@ -140,6 +143,7 @@ describe("missed-message catch-up sweep", () => {
         calls += 1;
         if (calls === 1) throw new Error("transient boom");
         store.markThreadSeen("C9:9300.000001", msg.ts);
+        return "accepted";
       });
       await sweepMissedMessages(deps); // first pass: throws before the watermark moves
       expect(store.getThread("C9:9300.000001")?.lastSeenTs).toBe("9300.000050");
@@ -163,7 +167,7 @@ describe("missed-message catch-up sweep", () => {
         if (fetchCalls === 1) throw new Error("not_in_channel");
         return [{ channel: "C9", user: OWNER, text: "late", ts: "9400.000051", thread_ts: "9400.000001" }];
       },
-      dispatch: async (m) => store.markThreadSeen("C9:9400.000001", m.ts),
+      dispatch: async (m) => { store.markThreadSeen("C9:9400.000001", m.ts); return "accepted"; },
     };
     await sweepMissedMessages(deps);
     expect(store.getThread("C9:9400.000001")?.lastSeenTs).toBe("9400.000050");
@@ -217,7 +221,7 @@ describe("missed-message catch-up sweep", () => {
     expect(dispatched[0]?.thread_ts).toBe("9600.000001");
   });
 
-  it("skips a message the socket delivered mid-pass (live watermark advanced after fetch)", async () => {
+  it("skips a message accepted live mid-pass using its receipt, not lastSeen", async () => {
     const store = tempStore("cu-race");
     bind(store, "C9", "9700.000001", "9700.000000");
     const dispatched: string[] = [];
@@ -231,8 +235,13 @@ describe("missed-message catch-up sweep", () => {
       // Simulate the socket delivering "second" while the sweep is between
       // fetch and dispatch — the live watermark jumps past it.
       dispatch: async (m) => {
-        if (m.ts === "9700.000010") store.markThreadSeen("C9:9700.000001", "9700.000020");
+        if (m.ts === "9700.000010") {
+          store.claimMessage("C9:9700.000001", "9700.000020");
+          store.markThreadSeen("C9:9700.000001", "9700.000020");
+          store.settleMessage("C9:9700.000001", "9700.000020", "accepted");
+        }
         dispatched.push(m.ts);
+        return "accepted";
       },
     };
     const n = await sweepMissedMessages(deps);
@@ -259,5 +268,81 @@ describe("missed-message catch-up sweep", () => {
     expect(n).toBe(1);
     expect(dispatched.map((m) => m.text)).toEqual(["lost while dead"]);
     expect(store.getThread("C9:9800.000001")?.lastSeenTs).toBe(`${sec + 5}.000500`);
+  });
+});
+
+describe("fairness and coordinator budgets", () => {
+  it("reserves eight recent and two older slots, advances failures, and lends to older threads", async () => {
+    const mk = (old: boolean): ThreadState => ({ sessionId: "s", projectDir: "/p", verbose: "on",
+      lastSeenTs: "100.000001", createdAt: NOW, lastUsedAt: old ? NOW - 24 * 60 * 60_000 : NOW });
+    const threads = Object.fromEntries([
+      ...Array.from({ length: 11 }, (_, i) => [`R:${i}`, mk(false)]),
+      ...Array.from({ length: 5 }, (_, i) => [`O:${i}`, mk(true)]),
+    ]) as Record<string, ThreadState>;
+    const store = storeWithThreads("fair-rotation", threads);
+    const fetched: string[] = [];
+    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER, dispatch: async () => "accepted",
+      fetchReplies: async (channel, ts) => { fetched.push(`${channel}:${ts}`); throw new Error("offline"); } };
+    for (let i = 0; i < 3; i++) await sweepMissedMessages(deps);
+    expect(fetched.slice(0, 10).filter((k) => k.startsWith("R:"))).toHaveLength(8);
+    expect(fetched.slice(0, 10).filter((k) => k.startsWith("O:"))).toHaveLength(2);
+    expect(new Set(fetched).size).toBe(16);
+    const older = storeWithThreads("fair-lending", Object.fromEntries([
+      ["R:1", mk(false)], ...Array.from({ length: 12 }, (_, i) => [`O:${i}`, mk(true)]),
+    ]));
+    const { deps: lending, fetches } = harness(older, {});
+    await sweepMissedMessages(lending);
+    expect(fetches.filter((k) => k.startsWith("O:"))).toHaveLength(9);
+  });
+
+  it("coalesces overlapping boot/timer/reconnect requests into a serial extra pass", async () => {
+    const store = tempStore("coordinator");
+    bind(store, "C", "100.000001", "100.000002");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER, dispatch: async () => "accepted",
+      fetchReplies: async () => { calls++; active++; maxActive = Math.max(active, maxActive); await gate; active--; return []; } };
+    const coordinator = createCatchupCoordinator(deps);
+    const first = coordinator.request();
+    await vi.waitFor(() => expect(calls).toBe(1));
+    const second = sweepMissedMessages(deps);
+    const third = coordinator.request();
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    release();
+    await Promise.all([first, second, third]);
+    expect(calls).toBe(2);
+    expect(maxActive).toBe(1);
+  });
+
+  it("bounds page reservations and continues a partial history from confirmed messages", async () => {
+    const store = tempStore("pages");
+    for (let i = 0; i < 10; i++) bind(store, `C${i}`, "100.000000", "100.000001");
+    const budgets: number[] = [];
+    const oldestValues: string[] = [];
+    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER, dispatch: async () => "accepted",
+      fetchReplies: async (channel, _root, oldest, budget) => {
+        budgets.push(budget.maxPages);
+        oldestValues.push(oldest);
+        return { messages: [{ channel, user: OWNER, ts: oldest === "100.000001" ? "100.000002" : "100.000003" }], hasMore: true, pagesUsed: 2 };
+      } };
+    await sweepMissedMessages(deps);
+    expect(budgets).toEqual(Array(10).fill(2));
+    expect(budgets.reduce((a, b) => a + b, 0)).toBe(20);
+    await sweepMissedMessages(deps);
+    expect(oldestValues.slice(10)).toEqual(Array(10).fill("100.000002"));
+  });
+
+  it("does not infer consumption from a void dispatch that merely observed a message", async () => {
+    const store = tempStore("void-outcome");
+    bind(store, "C", "100.000000", "100.000001");
+    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER,
+      fetchReplies: async () => [{ channel: "C", user: OWNER, ts: "100.000002" }],
+      dispatch: async () => { store.markThreadSeen("C:100.000000", "100.000002"); } };
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(store.getThread("C:100.000000")?.historyCursorTs).toBe("100.000001");
   });
 });

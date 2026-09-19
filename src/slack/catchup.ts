@@ -1,91 +1,131 @@
-/**
- * Missed-message catch-up sweep — the inbound resilience backstop.
- *
- * Slack Socket Mode delivers each envelope to ONE connection and does NOT
- * store/forward: anything undeliverable (restart gap, network flap, a zombie
- * connection Slack hasn't reaped, a second bridge elsewhere with the same
- * app token) is silently discarded. When that happens mid-conversation the
- * bridge's outbound path keeps working (status ticker, summaries), so the
- * thread just goes quiet with no error anywhere — "the thread died".
- *
- * The sweep makes permanent silence structurally impossible for bound
- * threads: every minute it re-reads each recently-used thread past its
- * watermark (ThreadState.lastSeenTs) and routes any not-yet-processed owner
- * messages through the exact same handler the socket feeds. A lost envelope
- * then costs ≤ ~1 minute of latency instead of the whole message.
- */
-
+/** Bounded, fair recovery from retained Slack threads; live observations never confirm history. */
 import type { StateStore } from "../state.js";
 import { logErr } from "../log.js";
-import type { SlackMsg } from "./router.js";
+import type { IncomingOutcome, SlackMsg } from "./router.js";
+
+export interface RepliesPage {
+  /** Contiguous ascending history after oldest; do not return only the newest page. */
+  messages: SlackMsg[];
+  /** More history remains. The next sweep continues after the last confirmed message. */
+  hasMore: boolean;
+  pagesUsed: number;
+}
 
 export interface CatchupDeps {
   state: StateStore;
   ownerSlackUserId: string;
-  /** conversations.replies past the watermark (ascending, parent excluded server-side). */
-  fetchReplies(channel: string, rootTs: string, oldest: string): Promise<SlackMsg[]>;
-  /** Route a replayed message exactly as if the socket had just delivered it. */
-  dispatch(msg: SlackMsg): Promise<void>;
+  /**
+   * The callback owns Slack pagination, honoring maxPages (including empty pages).
+   * On a page failure, throw or return only the contiguous successful prefix.
+   * Arrays remain supported for a SINGLE page. Never silently fetch unbounded pages.
+   */
+  fetchReplies(channel: string, rootTs: string, oldest: string, budget: { maxPages: number }): Promise<RepliesPage | SlackMsg[]>;
+  /** Return the real router outcome, or persist its receipt before resolving. */
+  dispatch(msg: SlackMsg): Promise<IncomingOutcome | void>;
 }
 
-/** Threads untouched longer than this aren't swept — a busy box would otherwise burn one API call per ancient thread per minute. */
-const SWEEP_WINDOW_MS = 12 * 60 * 60 * 1000;
-/** Threads per pass (LRU-first); a bigger backlog drains over subsequent passes. */
-const MAX_THREADS_PER_SWEEP = 10;
+export const MAX_THREADS_PER_SWEEP = 10;
+export const MAX_PAGES_PER_SWEEP = 20;
+export const MAX_PAGES_PER_THREAD = 2;
+const RECENT_WINDOW_MS = 12 * 60 * 60 * 1000;
 
-/** Threads whose replies fetch already failed this process — report once, not every minute. */
-const fetchFailed = new Set<string>();
+interface Scheduler {
+  flight?: Promise<number>;
+  requested: boolean;
+  sequence: number;
+  polled: Map<string, number>;
+  fetchFailed: Set<string>;
+}
+const schedulers = new WeakMap<StateStore, Scheduler>();
 
-export async function sweepMissedMessages(deps: CatchupDeps): Promise<number> {
+/** Boot/timer/reconnect can all call request; concurrent triggers share one coalesced flight. */
+export function createCatchupCoordinator(deps: CatchupDeps): { request: () => Promise<number> } {
+  return { request: () => sweepMissedMessages(deps) };
+}
+
+/** Single-flight even when callers do not explicitly use the coordinator. */
+export function sweepMissedMessages(deps: CatchupDeps): Promise<number> {
+  let scheduler = schedulers.get(deps.state);
+  if (!scheduler) {
+    scheduler = { requested: false, sequence: 0, polled: new Map(), fetchFailed: new Set() };
+    schedulers.set(deps.state, scheduler);
+  }
+  if (scheduler.flight) { scheduler.requested = true; return scheduler.flight; }
+  const s = scheduler;
+  s.flight = Promise.resolve().then(async () => {
+    let replayed = 0;
+    do {
+      s.requested = false;
+      replayed += await sweep(deps, s);
+    } while (s.requested);
+    return replayed;
+  }).finally(() => { s.flight = undefined; });
+  return s.flight;
+}
+
+async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
   const { state, ownerSlackUserId, fetchReplies, dispatch } = deps;
-  const candidates = state.threadsForCatchup(Date.now() - SWEEP_WINDOW_MS).slice(0, MAX_THREADS_PER_SWEEP);
+  state.pruneAcceptedUnboundReceipts();
+  const all = state.threadsForCatchup().filter(({ thread }) => thread.historyCursorTs);
+  const retained = new Set(all.map((c) => c.key));
+  for (const key of scheduler.polled.keys()) if (!retained.has(key)) scheduler.polled.delete(key);
+  for (const key of scheduler.fetchFailed) if (!retained.has(key)) scheduler.fetchFailed.delete(key);
+  all.sort((a, b) => (scheduler.polled.get(a.key) ?? 0) - (scheduler.polled.get(b.key) ?? 0) || a.key.localeCompare(b.key));
+  const cutoff = Date.now() - RECENT_WINDOW_MS;
+  const recent = all.filter(({ thread }) => (thread.lastUsedAt ?? thread.createdAt ?? 0) >= cutoff);
+  const older = all.filter(({ thread }) => (thread.lastUsedAt ?? thread.createdAt ?? 0) < cutoff);
+  const candidates = [...recent.splice(0, 8), ...older.splice(0, 2)];
+  candidates.push(...[...recent, ...older].slice(0, MAX_THREADS_PER_SWEEP - candidates.length));
+
   let replayed = 0;
-  for (const { key, thread } of candidates) {
-    // Threads that predate watermarking are never swept: without a known-good
-    // boundary the sweep could replay their original prompt and double-run it.
-    if (!thread.lastSeenTs) continue;
+  let pagesLeft = MAX_PAGES_PER_SWEEP;
+  for (const { key } of candidates) {
+    if (!pagesLeft) break;
+    // Advance even on failure/blocked receipts: bad threads cannot starve others.
+    scheduler.polled.set(key, ++scheduler.sequence);
+    const oldest = state.getThread(key)?.historyCursorTs;
+    if (!oldest) continue;
     const [channel, rootTs] = key.split(":") as [string, string];
+    const maxPages = Math.min(MAX_PAGES_PER_THREAD, pagesLeft);
     let replies: SlackMsg[];
     try {
-      replies = await fetchReplies(channel, rootTs, thread.lastSeenTs);
-      fetchFailed.delete(key);
+      const page = await fetchReplies(channel, rootTs, oldest, { maxPages });
+      const used = Array.isArray(page) ? 1 : page.pagesUsed;
+      if (!Number.isInteger(used) || used < 1 || used > maxPages) throw new Error("fetchReplies exceeded/omitted its page budget");
+      pagesLeft -= used;
+      replies = Array.isArray(page) ? page : page.messages;
+      scheduler.fetchFailed.delete(key);
     } catch (err) {
-      if (!fetchFailed.has(key)) {
-        fetchFailed.add(key);
-        // logErr (ring + stderr): this line is the tell when a thread's
-        // backstop is broken — it must reach bridge.log too, not just \logs.
-        logErr(`catch-up: replies fetch failed for ${key} (${String((err as Error)?.message ?? err)}) — retrying every minute`);
+      // A failing callback may have spent the entire reservation.
+      pagesLeft -= maxPages;
+      if (!scheduler.fetchFailed.has(key)) {
+        scheduler.fetchFailed.add(key);
+        logErr(`catch-up: replies fetch failed for ${key} (${String(err)}) — retrying on its next rotation`);
       }
       continue;
     }
-    for (const m of replies) {
-      if (m.ts === rootTs) continue; // parent (belt-and-braces; `oldest` already excludes it)
-      if (m.bot_id) continue;
-      if (m.subtype && m.subtype !== "file_share") continue; // mirrors the socket handler's own gate
-      if (!m.user || m.user !== ownerSlackUserId) continue;
-      // Re-check against the LIVE watermark: the copy from threadsForCatchup
-      // is frozen at pass start, and the socket may have delivered this same
-      // message (advancing the real watermark) while we were fetching.
-      if (m.ts <= (state.getThread(key)?.lastSeenTs ?? thread.lastSeenTs)) continue;
-      try {
-        // The dispatch path advances the watermark (markThreadSeen), so a
-        // replayed message is permanently consumed exactly once…
-        // NOTE: history-API message objects lack `channel` (socket events have
-        // it) — stamp it (and the thread root) so handlers/API calls see the
-        // same shape as a live delivery.
-        await dispatch({ ...m, channel, thread_ts: m.thread_ts ?? rootTs });
-        replayed += 1;
-      } catch (err) {
-        // …unless it fails: the watermark stays put and the next pass retries
-        // it (at-least-once beats silently losing it — the disease this cures).
-        logErr(`catch-up replay failed (${key} ${m.ts}): ${String((err as Error)?.message ?? err)} — will retry`);
-        break;
+    for (const m of [...replies].sort((a, b) => a.ts.localeCompare(b.ts))) {
+      if (m.ts <= (state.getThread(key)?.historyCursorTs ?? oldest)) continue;
+      const relevant = !m.bot_id && (!m.subtype || m.subtype === "file_share") && m.user === ownerSlackUserId;
+      if (relevant) {
+        const receipt = state.getReceipt(key, m.ts);
+        if (receipt?.disposition === "processing" || receipt?.disposition === "uncertain") break;
+        if (!receipt) {
+          try {
+            const outcome = await dispatch({ ...m, channel, thread_ts: rootTs });
+            const disposition = state.getReceipt(key, m.ts)?.disposition;
+            if (disposition !== "accepted" && outcome !== "accepted" && outcome !== "ignored") break;
+            replayed += 1;
+          } catch (err) {
+            // Only the router can decide whether effects happened. Never release its claim here.
+            logErr(`catch-up replay failed (${key} ${m.ts}): ${String(err)} — disposition retained`);
+            break;
+          }
+        }
       }
+      if (!state.confirmHistory(key, m.ts)) break;
     }
   }
-  if (replayed)
-    // logErr (ring + stderr): a replay means an envelope DIDN'T arrive live —
-    // during a ghost-connection incident these lines are the evidence trail.
-    logErr(`catch-up: replayed ${replayed} missed message(s) from Slack history`);
+  if (replayed) logErr(`catch-up: replayed ${replayed} missed message(s) from Slack history`);
   return replayed;
 }

@@ -22,7 +22,10 @@ let totalPushed = 0;
 
 /** Start appending to a persistent log file (default: ~/.config/slackoc/bridge.log). */
 export function enableFileLog(path: string = LOG_PATH): void {
-  fileLog = path;
+  // The managed supervisor is the only disk writer. Its pipes capture raw
+  // stdout/stderr as well as ring-only info lines, without rotation fd races.
+  fileLog = process.env.SLACKOC_SERVICE === "bridge" ? join(CONFIG_DIR, "logs", "bridge.log") : path;
+  if (process.env.SLACKOC_SERVICE === "bridge") return;
   try {
     mkdirSync(dirname(path), { recursive: true });
   } catch {
@@ -53,6 +56,10 @@ export function pushLog(line: string): void {
   totalPushed++;
   if (fileLog) {
     try {
+      if (process.env.SLACKOC_SERVICE === "bridge") {
+        process.stdout.write(`${now.toISOString().replace(/\.\d{3}Z$/, "Z")} ${line}\n`);
+        return;
+      }
       rotateIfNeeded();
       // Full ISO stamp in the file — a post-mortem spanning days needs dates.
       appendFileSync(fileLog, `${now.toISOString().replace(/\.\d{3}Z$/, "Z")} ${line}\n`);
