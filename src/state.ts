@@ -2,6 +2,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { dirname } from "node:path";
 import { canonicalDir } from "./paths.js";
 import { logErr } from "./log.js";
+import { compareTs, replayAge, replayFloor, timestampMicros, type RecoveryDecision } from "./slack/recovery-policy.js";
+import type { SlackMsg } from "./slack/router.js";
 
 export type VerboseMode = "off" | "on" | "full";
 
@@ -17,6 +19,8 @@ export interface ThreadState {
   hushed?: boolean;
   /** \notify toggle: when true, run completions are DM'd to the owner */
   notify?: boolean;
+  /** Private context owned by a durable scheduled report, not a replayed prompt. */
+  scheduledRunId?: string;
   /**
    * \watch mode: the thread mirrors a session driven OUTSIDE Slack (TUI/IDE on
    * the computer). Plain replies are rejected (read-only until \resume takes
@@ -32,8 +36,29 @@ export interface ThreadState {
   lastSeenTs?: string;
   /** Only the history poll advances this, after verifying contiguous dispositions. */
   historyCursorTs?: string;
+  recovery?: ThreadRecovery;
   createdAt: number;
   lastUsedAt: number;
+}
+
+export interface ThreadRecovery {
+  version: 1;
+  ownerActivityTs?: string;
+  replayFloorTs: string;
+  trustedAfterTs?: string;
+  bindingGeneration: number;
+  intentVersion: number;
+  canceledThroughTs?: string;
+  latestAcceptedTs?: string;
+  /** A missed state-changing command makes subsequent historical context ambiguous. */
+  needsFreshIntent?: boolean;
+  lastRun?: { generation: number; sessionId: string; userMsgTs: string[]; messageIds: string[];
+    outcome: "active" | "completed" | "stopped" | "failed" | "interrupted"; completedThroughTs?: string };
+  scan?: { upperTs: string; afterTs: string; cursor?: string; generation: number; intentVersion: number;
+    candidates: SlackMsg[]; complete: boolean };
+  counts?: { recovered: number; held: number; expired: number; canceled: number };
+  reasons?: Record<string, number>;
+  lastDecision?: { ts: string; decision: RecoveryDecision["decision"]; reason: string };
 }
 
 interface ProjectInfo {
@@ -58,6 +83,10 @@ export interface MessageReceipt {
   updatedAt: number;
   /** Persisted before HTTP submission; exact user-message evidence can settle uncertainty. */
   submission?: PromptSubmission;
+  recoveryDecision?: RecoveryDecision;
+  source?: "live" | "history";
+  generation?: number;
+  cancellationBoundary?: boolean;
 }
 export interface PromptSubmission {
   projectDir: string;
@@ -76,7 +105,7 @@ export const UNBOUND_RECEIPT_HORIZON_MS = 24 * 60 * 60_000;
 export class StateStore {
   private state: SlackocState;
 
-  constructor(private path: string) {
+  constructor(private path: string, readonly now: () => number = Date.now) {
     this.state = { threads: {}, projects: {} };
     if (existsSync(path)) {
       try {
@@ -90,13 +119,119 @@ export class StateStore {
     }
     this.normalizeProjects();
     for (const t of Object.values(this.state.threads)) {
-      // Existing lastSeen is the migration boundary; never replay from epoch.
-      t.historyCursorTs ??= t.lastSeenTs;
+      // Last-seen is observation, not acceptance. Keep legacy gaps conservative.
+      t.recovery ??= this.newRecovery(t);
     }
     for (const r of Object.values(this.state.receipts ?? {})) {
       // A process died with the claim held: effects may already have happened.
       if (r.disposition === "processing") r.disposition = "uncertain";
     }
+  }
+
+  private newRecovery(t: ThreadState): ThreadRecovery {
+    return { version: 1, ownerActivityTs: replayAge(t.lastSeenTs, this.now()).reason !== "invalid_timestamp" ? t.lastSeenTs : undefined,
+      replayFloorTs: maxTs(replayFloor(this.now()), this.state.unboundReceiptFloorTs)!, trustedAfterTs: t.historyCursorTs,
+      bindingGeneration: 1, intentVersion: 0 };
+  }
+
+  /** Idempotent versioned migration; never seed owner activity from maintenance time. */
+  migrateRecovery(): number {
+    let changed = 0;
+    for (const t of Object.values(this.state.threads)) {
+      if (!t.recovery) { t.recovery = this.newRecovery(t); changed++; }
+    }
+    this.save();
+    return changed;
+  }
+
+  bindingGeneration(key: string): number { return this.state.threads[key]?.recovery?.bindingGeneration ?? 0; }
+
+  /** Persist before awaiting abort/rebind, including threads with no renderer. */
+  cancelRecovery(key: string, ts?: string, replaceBinding = false): void {
+    const t = this.state.threads[key];
+    const command = ts ? this.state.receipts?.[this.receiptKey(key, ts)] : undefined;
+    if (command) command.cancellationBoundary = true;
+    if (!t) { if (command) this.save(); return; }
+    const r = t.recovery ??= this.newRecovery(t);
+    const boundary = ts ?? r.ownerActivityTs;
+    if (boundary && r.canceledThroughTs && compareTs(boundary, r.canceledThroughTs) <= 0) return;
+    if (timestampMicros(boundary) !== undefined) r.canceledThroughTs = maxTs(r.canceledThroughTs, boundary);
+    r.intentVersion++;
+    if (replaceBinding) r.bindingGeneration++;
+    if (r.lastRun?.outcome === "active") r.lastRun.outcome = "stopped";
+    this.save();
+  }
+
+  cancellationThrough(key: string): string | undefined {
+    return this.messageReceipts(key).filter((r) => r.cancellationBoundary)
+      .reduce((latest, r) => maxTs(latest, r.ts), this.state.threads[key]?.recovery?.canceledThroughTs);
+  }
+
+  noteLiveIntent(key: string): void {
+    const t = this.state.threads[key];
+    if (!t) return;
+    const r = t.recovery ??= this.newRecovery(t);
+    r.intentVersion++;
+    r.needsFreshIntent = false;
+    this.save();
+  }
+
+  holdHistoricalContext(key: string): void {
+    const t = this.state.threads[key];
+    if (!t) return;
+    (t.recovery ??= this.newRecovery(t)).needsFreshIntent = true;
+    this.save();
+  }
+
+  recordRunOutcome(key: string, sessionId: string, outcome: NonNullable<ThreadRecovery["lastRun"]>["outcome"], userMsgTs?: string[]): void {
+    const t = this.state.threads[key];
+    if (!t || t.sessionId !== sessionId) return;
+    const r = t.recovery ??= this.newRecovery(t);
+    const timestamps = userMsgTs ?? t.pendingRun?.userMsgTs ?? r.lastRun?.userMsgTs ?? [];
+    if (!timestamps.length) return;
+    // An idle/error echo after owner cancellation cannot turn stopped work into completion.
+    const stopped = timestamps.every((ts) => r.canceledThroughTs && compareTs(ts, r.canceledThroughTs) <= 0);
+    r.lastRun = { generation: r.bindingGeneration, sessionId, userMsgTs: [...timestamps],
+      messageIds: timestamps.flatMap((ts) => this.getReceipt(key, ts)?.submission?.messageId ?? []),
+      outcome: stopped ? "stopped" : outcome,
+      ...(outcome === "completed" && !stopped ? { completedThroughTs: timestamps.reduce((a, b) => maxTs(a, b)!) } : {}) };
+    this.save();
+  }
+
+  setRecoveryScan(key: string, scan: ThreadRecovery["scan"]): void {
+    const t = this.state.threads[key];
+    if (!t) return;
+    (t.recovery ??= this.newRecovery(t)).scan = scan ? structuredClone(scan) : undefined;
+    this.save();
+  }
+
+  recordRecoveryDecision(key: string, ts: string, decision: RecoveryDecision): void {
+    const t = this.state.threads[key];
+    const receipt = this.state.receipts?.[this.receiptKey(key, ts)];
+    if (receipt?.recoveryDecision?.reason === decision.reason) return;
+    if (receipt && decision.decision !== "recover" && decision.decision !== "already_handled") receipt.recoveryDecision = decision;
+    if (t) {
+      const r = t.recovery ??= this.newRecovery(t);
+      if (r.lastDecision?.ts === ts && r.lastDecision.reason === decision.reason) return;
+      const counts = r.counts ??= { recovered: 0, held: 0, expired: 0, canceled: 0 };
+      if (decision.decision === "recover") counts.recovered++;
+      else if (decision.decision !== "already_handled") counts[decision.decision]++;
+      if (decision.decision !== "recover" && decision.decision !== "already_handled") {
+        const reasons = r.reasons ??= {};
+        reasons[decision.reason] = (reasons[decision.reason] ?? 0) + 1;
+      }
+      r.lastDecision = { ts, ...decision };
+    }
+    this.save();
+  }
+
+  /** Retirement is scan progress only, never acceptance/completion evidence. */
+  retireHistory(key: string, ts: string): void {
+    const t = this.state.threads[key];
+    if (!t) return;
+    const r = t.recovery ??= this.newRecovery(t);
+    r.replayFloorTs = maxTs(r.replayFloorTs, ts)!;
+    this.save();
   }
 
   get currentProjectDir(): string | undefined {
@@ -109,16 +244,20 @@ export class StateStore {
 
   getThread(key: string): ThreadState | null {
     const t = this.state.threads[key];
-    return t ? { ...t } : null;
+    return t ? structuredClone(t) : null;
   }
 
   setThread(key: string, thread: ThreadState): void {
     const old = this.state.threads[key];
     this.state.threads[key] = {
-      ...thread, projectDir: canonicalDir(thread.projectDir), lastUsedAt: Date.now(),
+      ...thread, projectDir: canonicalDir(thread.projectDir), lastUsedAt: old?.lastUsedAt ?? this.now(),
       lastSeenTs: maxTs(old?.lastSeenTs, thread.lastSeenTs),
-      historyCursorTs: old ? old.historyCursorTs : maxTs(thread.historyCursorTs ?? thread.lastSeenTs, this.state.unboundReceiptFloorTs),
+      historyCursorTs: old ? old.historyCursorTs : thread.historyCursorTs ?? thread.lastSeenTs,
+      recovery: old?.recovery ?? thread.recovery ?? this.newRecovery({ ...thread, historyCursorTs: thread.historyCursorTs ?? thread.lastSeenTs }),
     };
+    if (old && (old.sessionId !== thread.sessionId || canonicalDir(old.projectDir) !== canonicalDir(thread.projectDir))) {
+      this.state.threads[key]!.recovery!.bindingGeneration++;
+    }
     this.touchProject(thread.projectDir);
     this.save();
   }
@@ -138,62 +277,39 @@ export class StateStore {
   threadsWithPendingRun(): Array<{ key: string; thread: ThreadState }> {
     return Object.entries(this.state.threads)
       .filter(([, t]) => t.pendingRun)
-      .map(([key, t]) => ({ key, thread: { ...t } }));
+      .map(([key, t]) => ({ key, thread: structuredClone(t) }));
   }
 
-  /**
-   * Record observation only, leaving the history cursor untouched (Slack ts
-   * strings are zero-padded to a fixed integer width, so lexical order ==
-   * chronological order). No-op without a binding — bindings created later
-   * seed the watermark themselves.
-   */
+  /** Validated owner observation only; neither maintenance nor a replay attempt refreshes its age. */
   markThreadSeen(key: string, ts: string): void {
     const t = this.state.threads[key];
     if (!t) return;
-    if (t.lastSeenTs && t.lastSeenTs >= ts) return;
+    if (replayAge(ts, this.now()).reason === "invalid_timestamp") return;
+    if (t.lastSeenTs && compareTs(t.lastSeenTs, ts) >= 0) return;
     t.lastSeenTs = ts;
+    (t.recovery ??= this.newRecovery(t)).ownerActivityTs = ts;
+    t.lastUsedAt = Number(timestampMicros(ts)! / 1000n);
     this.save();
   }
 
-  /**
-   * One-time watermark migration for threads that predate catch-up: seed each
-   * missing watermark from the thread's last known-good activity so the sweep
-   * replays only messages sent AFTER the bridge last demonstrably heard the
-   * thread — the genuinely lost ones, never anything already handled. Slack ts
-   * strings are fixed-width (lexical order == chronological order), so the
-   * fraction must be zero-padded to 6 digits. Idempotent: fills gaps only.
-   * Returns how many threads were seeded. (The save's 60d-idle prune applies
-   * as always — truly ancient bindings age out here rather than seed; a
-   * pendingRun tombstone keeps one alive, so degenerate bindings missing
-   * lastUsedAt still get a sane boundary instead of epoch-zero.)
-   */
+  /** Compatibility entry point: persists recovery migration, never invents owner watermarks. */
   seedMissingWatermarks(): number {
-    let n = 0;
-    for (const t of Object.values(this.state.threads)) {
-      const missing = !t.lastSeenTs || !t.historyCursorTs;
-      if (!t.lastSeenTs) {
-        const ms = t.lastUsedAt || t.createdAt || Date.now();
-        t.lastSeenTs = `${Math.floor(ms / 1000)}.${String(ms % 1000).padStart(3, "0")}000`;
-      }
-      t.historyCursorTs ??= t.lastSeenTs;
-      if (missing) n += 1;
-    }
-    if (n) this.save();
-    return n;
+    return this.migrateRecovery();
   }
 
-  /** Catch-up sweep candidates: threads used within `sinceMs`, most recent first. */
+  /** Owner-activity candidates; omit the window for bounded dormant discovery. */
   threadsForCatchup(sinceMs = 0): Array<{ key: string; thread: ThreadState }> {
     return Object.entries(this.state.threads)
-      .filter(([, t]) => (t.lastUsedAt ?? 0) >= sinceMs)
-      .sort((a, b) => b[1].lastUsedAt - a[1].lastUsedAt)
-      .map(([key, t]) => ({ key, thread: { ...t } }));
+      .filter(([, t]) => !sinceMs || Number((timestampMicros(t.recovery?.ownerActivityTs) ?? 0n) / 1000n) >= sinceMs)
+      .sort((a, b) => compareTs(b[1].recovery?.ownerActivityTs ?? "0.0", a[1].recovery?.ownerActivityTs ?? "0.0"))
+      .map(([key, t]) => ({ key, thread: structuredClone(t) }));
   }
 
   /** Clear a thread's interrupted-run tombstone after the boot sweep handled it. */
   clearPendingRun(key: string): void {
     const t = this.state.threads[key];
-    if (!t) return;
+    if (!t?.pendingRun) return;
+    if (!t.recovery?.lastRun || t.recovery.lastRun.outcome === "active") this.recordRunOutcome(key, t.sessionId, "interrupted");
     delete t.pendingRun;
     this.save();
   }
@@ -205,7 +321,7 @@ export class StateStore {
   }
 
   touchProject(dir: string): void {
-    this.state.projects[canonicalDir(dir)] = { lastUsedAt: Date.now() };
+    this.state.projects[canonicalDir(dir)] = { lastUsedAt: this.now() };
   }
 
   listProjects(): Array<{ dir: string; lastUsedAt: number }> {
@@ -217,7 +333,7 @@ export class StateStore {
 
   findThreadBySession(sessionId: string): { key: string; thread: ThreadState } | null {
     for (const [key, t] of Object.entries(this.state.threads)) {
-      if (t.sessionId === sessionId) return { key, thread: { ...t } };
+      if (t.sessionId === sessionId) return { key, thread: structuredClone(t) };
     }
     return null;
   }
@@ -246,7 +362,7 @@ export class StateStore {
   messageReceipts(threadKey?: string): MessageReceipt[] {
     return Object.values(this.state.receipts ?? {})
       .filter((r) => !threadKey || r.threadKey === threadKey)
-      .sort((a, b) => a.ts.localeCompare(b.ts))
+      .sort((a, b) => compareTs(a.ts, b.ts))
       .map((r) => ({ ...r, ...(r.submission ? { submission: { ...r.submission } } : {}) }));
   }
 
@@ -254,17 +370,19 @@ export class StateStore {
   initializeHistory(threadKey: string, ts: string): void {
     const t = this.state.threads[threadKey];
     if (!t || t.historyCursorTs) return;
-    t.historyCursorTs = maxTs(ts, this.state.unboundReceiptFloorTs);
+    t.historyCursorTs = ts;
     this.save();
   }
 
   /** Synchronous durable claim shared by live and history delivery, before any await/effect. */
-  claimMessage(threadKey: string, ts: string, options: { recoveryCommand?: boolean } = {}): "claimed" | MessageDisposition | "paused" {
+  claimMessage(threadKey: string, ts: string, options: { recoveryCommand?: boolean; source?: "live" | "history" } = {}): "claimed" | MessageDisposition | "paused" | "held" {
     this.pruneAcceptedUnboundReceipts();
     const existing = this.getReceipt(threadKey, ts);
     if (existing) return existing.disposition;
-    if (ts <= (this.state.threads[threadKey]?.historyCursorTs ?? "")) return "accepted";
-    if (!this.state.threads[threadKey] && ts <= (this.state.unboundReceiptFloorTs ?? "")) return "accepted";
+    const floor = this.state.threads[threadKey]?.recovery?.replayFloorTs ?? this.state.unboundReceiptFloorTs;
+    if (floor && compareTs(ts, floor) < 0) return "held";
+    const cursor = this.state.threads[threadKey]?.historyCursorTs;
+    if (cursor && compareTs(ts, cursor) <= 0) return "accepted";
     const receipts = this.state.receipts ??= {};
     const count = Object.keys(receipts).length;
     if (count >= MAX_MESSAGE_RECEIPTS) {
@@ -275,7 +393,8 @@ export class StateStore {
       }
       if (!options.recoveryCommand || count >= MAX_MESSAGE_RECEIPTS + RECOVERY_RECEIPT_RESERVE) return "paused";
     }
-    receipts[this.receiptKey(threadKey, ts)] = { threadKey, ts, disposition: "processing", updatedAt: Date.now() };
+    receipts[this.receiptKey(threadKey, ts)] = { threadKey, ts, disposition: "processing", updatedAt: this.now(), source: options.source,
+      generation: this.bindingGeneration(threadKey) };
     this.save();
     return "claimed";
   }
@@ -295,8 +414,16 @@ export class StateStore {
     // Evidence can arrive over SSE before the HTTP request times out. Never downgrade it.
     if (r.disposition === "accepted") return;
     r.disposition = disposition;
-    r.updatedAt = Date.now();
+    if (disposition === "accepted" && r.submission) this.noteAcceptedPrompt(r);
+    r.updatedAt = this.now();
     this.save();
+  }
+
+  private noteAcceptedPrompt(receipt: MessageReceipt): void {
+    const t = this.state.threads[receipt.threadKey];
+    if (!t || t.sessionId !== receipt.submission?.sessionId) return;
+    const r = t.recovery ??= this.newRecovery(t);
+    r.latestAcceptedTs = maxTs(r.latestAcceptedTs, receipt.ts);
   }
 
   /** Pin correlation before sending. Failure to persist must prevent submission. */
@@ -304,14 +431,18 @@ export class StateStore {
     const r = this.state.receipts?.[this.receiptKey(threadKey, ts)];
     if (!r || r.disposition !== "processing") throw new Error("prompt submission requires a processing receipt");
     r.submission = { ...submission, projectDir: canonicalDir(submission.projectDir) };
-    r.updatedAt = Date.now();
+    r.generation = this.bindingGeneration(threadKey);
+    r.updatedAt = this.now();
     this.save();
   }
 
   isMessageAccepted(threadKey: string, ts: string): boolean {
     const receipt = this.getReceipt(threadKey, ts);
     if (receipt) return receipt.disposition === "accepted";
-    return ts <= (this.state.threads[threadKey]?.historyCursorTs ?? "");
+    const floor = this.state.threads[threadKey]?.recovery?.replayFloorTs;
+    if (floor && compareTs(ts, floor) < 0) return false;
+    const cursor = this.state.threads[threadKey]?.historyCursorTs;
+    return !!cursor && compareTs(ts, cursor) <= 0;
   }
 
   /**
@@ -327,7 +458,8 @@ export class StateStore {
       const s = r.submission;
       if (r.disposition === "accepted" || !s || s.messageId !== info.id || s.sessionId !== info.sessionID || canonicalDir(s.projectDir) !== dir) continue;
       r.disposition = "accepted";
-      r.updatedAt = Date.now();
+      this.noteAcceptedPrompt(r);
+      r.updatedAt = this.now();
       matched.push({ ...r, submission: { ...s } });
     }
     if (matched.length) this.save();
@@ -335,12 +467,13 @@ export class StateStore {
   }
 
   /** Accepted, never-bound command traffic has a durable 24h dedup horizon. */
-  pruneAcceptedUnboundReceipts(now = Date.now()): number {
+  pruneAcceptedUnboundReceipts(now = this.now()): number {
     const cutoff = now - UNBOUND_RECEIPT_HORIZON_MS;
     const floor = `${Math.floor(cutoff / 1000)}.${String(cutoff % 1000).padStart(3, "0")}000`;
     let removed = 0;
     for (const [key, r] of Object.entries(this.state.receipts ?? {})) {
       if (r.disposition !== "accepted" || this.state.threads[r.threadKey] || r.updatedAt > cutoff) continue;
+      if (r.cancellationBoundary && replayAge(r.ts, now).decision !== "expired") continue;
       // Both receipt age and Slack timestamp must have passed the horizon.
       if (!/^\d+\.\d+$/.test(r.ts) || Number(r.ts) * 1000 > cutoff) continue;
       delete this.state.receipts![key];
@@ -359,20 +492,24 @@ export class StateStore {
     const t = this.state.threads[threadKey];
     if (!t) return false;
     const receipts = Object.entries(this.state.receipts ?? {});
-    if (receipts.some(([, r]) => r.threadKey === threadKey && r.ts <= ts && r.disposition !== "accepted")) return false;
+    if (receipts.some(([, r]) => r.threadKey === threadKey && compareTs(r.ts, ts) <= 0 && r.disposition !== "accepted")) return false;
     t.historyCursorTs = maxTs(t.historyCursorTs, ts);
     for (const [key, r] of receipts) {
-      if (r.threadKey === threadKey && r.ts <= ts) delete this.state.receipts![key];
+      if (r.threadKey === threadKey && compareTs(r.ts, ts) <= 0 && !t.pendingRun?.userMsgTs.includes(r.ts)) delete this.state.receipts![key];
     }
     if (Object.keys(this.state.receipts ?? {}).length < MAX_MESSAGE_RECEIPTS) this.state.recoveryPaused = false;
     this.save();
     return true;
   }
 
-  recoveryStatus(): { paused: boolean; receipts: number; uncertain: number } {
+  recoveryStatus() {
     const receipts = Object.values(this.state.receipts ?? {});
+    const threads = Object.entries(this.state.threads).flatMap(([key, t]) => t.recovery?.lastDecision ? [{ key, ...t.recovery.lastDecision,
+      reasons: { ...t.recovery.reasons }, recent: replayAge(t.recovery.ownerActivityTs, this.now()).decision === "recover" }] : []);
+    const counts = { recovered: 0, held: 0, expired: 0, canceled: 0 };
+    for (const t of Object.values(this.state.threads)) for (const key of Object.keys(counts) as Array<keyof typeof counts>) counts[key] += t.recovery?.counts?.[key] ?? 0;
     return { paused: !!this.state.recoveryPaused, receipts: receipts.length,
-      uncertain: receipts.filter((r) => r.disposition === "uncertain").length };
+      uncertain: receipts.filter((r) => r.disposition === "uncertain").length, ...counts, threads };
   }
 
   /** tmp + rename: a crash mid-write can corrupt the tmp file, never the live state.json. */
@@ -395,7 +532,7 @@ export class StateStore {
    * no deployment needs more than a thousand of them (LRU beyond the cap).
    */
   private prune(): void {
-    const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
+    const cutoff = this.now() - 60 * 24 * 60 * 60 * 1000;
     const protectedKeys = new Set(Object.values(this.state.receipts ?? {}).map((r) => r.threadKey));
     const protectedThreads = Object.entries(this.state.threads).filter(([k, t]) => t.pendingRun || protectedKeys.has(k));
     const rest = Object.entries(this.state.threads)
@@ -406,5 +543,5 @@ export class StateStore {
 }
 
 function maxTs(a: string | undefined, b: string | undefined): string | undefined {
-  return a && b ? (a > b ? a : b) : a ?? b;
+  return a && b ? (compareTs(a, b) > 0 ? a : b) : a ?? b;
 }

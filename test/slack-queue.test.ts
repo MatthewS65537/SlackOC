@@ -9,6 +9,7 @@ import {
   queueDepth,
   SLACK_OP_TIMEOUT_MS,
   SLACK_PACE_MS,
+  SLACK_HISTORY_PACE_MS,
 } from "../src/slack/queue.js";
 
 // The queue is a module-global singleton — reset pacing state between cases
@@ -47,6 +48,29 @@ describe("Slack queue: per-op guards (B2)", () => {
     await rejected;
     expect(op).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps updates and history off the per-channel posting clock", async () => {
+    await enqueue(async () => {}, { channel: "C" });
+    const times: number[] = [];
+    const start = Date.now();
+    await Promise.all(["chat.update", "chat.delete", "conversations.replies"].map(method =>
+      enqueue(async () => { times.push(Date.now() - start); }, { channel: "C", method })));
+    expect(times).toEqual([0, 0, 0]);
+  });
+
+  it("a history rate limit holds only history, including across channels", async () => {
+    const limited = enqueue(async () => { throw { statusCode: 429, retryAfter: 10 }; },
+      { channel: "C", method: "conversations.replies", retryRateLimits: false }).catch(() => {});
+    await limited;
+    const history = vi.fn(async () => {});
+    const waiting = enqueue(history, { channel: "D", method: "conversations.replies" });
+    const update = vi.fn(async () => {});
+    await enqueue(update, { channel: "C", method: "chat.update" });
+    expect(update).toHaveBeenCalledOnce(); expect(history).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await waiting;
+    expect(history).toHaveBeenCalledOnce();
   });
 
   it("a timed-out op does not block operations queued behind it", async () => {
@@ -103,6 +127,73 @@ function blocker(channel = "C1"): { release: () => void } {
   void enqueue(() => p, { channel }).catch(() => {});
   return { release };
 }
+
+describe("Slack queue: shared history pacing", () => {
+  beforeEach(() => {
+    _resetQueueForTests();
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("spaces same-channel and simultaneous cross-channel history starts", async () => {
+    const start = Date.now();
+    const times: number[] = [];
+    const work = ["C1", "C1", "C2", "C3"].map(channel => enqueue(async () => {
+      times.push(Date.now() - start);
+    }, { channel, method: "conversations.replies" }));
+    await vi.advanceTimersByTimeAsync(SLACK_HISTORY_PACE_MS - 1);
+    expect(times).toEqual([0]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(times).toEqual([0, SLACK_HISTORY_PACE_MS]);
+    await vi.advanceTimersByTimeAsync(SLACK_HISTORY_PACE_MS * 2);
+    await Promise.all(work);
+    expect(times).toEqual([0, 1_500, 3_000, 4_500]);
+  });
+
+  it("paces zero-delay history retries without blocking interactive posts or updates", async () => {
+    const start = Date.now();
+    const times: number[] = [];
+    const work = enqueue(async () => {
+      times.push(Date.now() - start);
+      if (times.length === 1) throw { statusCode: 429, retryAfter: 0 };
+    }, { channel: "C", method: "conversations.replies" });
+    await vi.advanceTimersByTimeAsync(0);
+    const post = vi.fn(async () => {});
+    const update = vi.fn(async () => {});
+    await enqueue(post, { channel: "C", lane: "interactive" });
+    await enqueue(update, { channel: "C", method: "chat.update", lane: "interactive" });
+    expect(post).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledOnce();
+    expect(times).toEqual([0]);
+    await vi.advanceTimersByTimeAsync(SLACK_HISTORY_PACE_MS);
+    await work;
+    expect(times).toEqual([0, 1_500]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rechecks an extended history cooldown and spaces simultaneous retry waiters", async () => {
+    const start = Date.now();
+    const times: number[] = [];
+    const work = ["CA", "CB"].map((channel, i) => {
+      let attempts = 0;
+      return enqueue(async () => {
+        times.push(Date.now() - start);
+        if (++attempts === 1) {
+          await new Promise(resolve => setTimeout(resolve, i === 0 ? 2_000 : 1_000));
+          throw { statusCode: 429, retryAfter: i === 0 ? 2 : 10 };
+        }
+      }, { channel, method: "conversations.replies" });
+    });
+    await vi.advanceTimersByTimeAsync(12_499);
+    expect(times).toEqual([0, 1_500]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(times).toEqual([0, 1_500, 12_500]);
+    await vi.advanceTimersByTimeAsync(SLACK_HISTORY_PACE_MS);
+    await Promise.all(work);
+    expect(times).toEqual([0, 1_500, 12_500, 14_000]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
 
 describe("Slack queue: priority tiers in one channel lane (#5)", () => {
   beforeEach(() => {

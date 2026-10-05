@@ -8,9 +8,10 @@ import type { ServerPool } from "../src/opencode/server.js";
 import type { SlackocConfig } from "../src/config.js";
 import { MAX_MESSAGE_RECEIPTS, RECOVERY_RECEIPT_RESERVE, StateStore } from "../src/state.js";
 import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_EDGE, TARGET_IMAGE_BYTES } from "../src/image.js";
-import { deleteView } from "../src/slack/render.js";
+import { SessionView, deleteView } from "../src/slack/render.js";
 import { sweepMissedMessages } from "../src/slack/catchup.js";
 import { registerCommand } from "../src/commands/registry.js";
+import { MAX_REPLAY_AGE_MS, timestampFromMs } from "../src/slack/recovery-policy.js";
 
 describe("claimEvent (Slack double-delivery dedup)", () => {
   it("claims a channel+ts exactly once", () => {
@@ -51,6 +52,9 @@ describe("hushAction", () => {
 // silently taking the bound-session branch instead of creating a session).
 
 const FIXTURES = join(import.meta.dirname ?? __dirname, ".fixtures", "router");
+const NOW = Date.parse("2026-09-22T00:00:00Z");
+/** Stable realistic Slack timestamps; numbers below are seconds within the fixture day. */
+const ts = (offset: string) => `${1790000000 + Number(offset.split(".")[0])}.${offset.split(".")[1] ?? "000000"}`;
 
 afterAll(() => {
   rmSync(FIXTURES, { recursive: true, force: true });
@@ -103,12 +107,43 @@ function makeDeps(name: string, pool: ServerPool, render: RenderDeps): BridgeDep
     ownerSlackUserId: "U1",
     createdAt: "",
   } as SlackocConfig;
-  return { config, state: new StateStore(join(FIXTURES, name, "state.json")), pool, render, botUserId: "UBOT", cwd: "/p" };
+  return { config, state: new StateStore(join(FIXTURES, name, "state.json"), () => NOW), pool, render, botUserId: "UBOT", cwd: "/p" };
 }
 
 function ownerMsg(channel: string, ts: string, threadTs: string | undefined, text: string): SlackMsg {
-  return { channel, ts, thread_ts: threadTs, user: "U1", text };
+  return { channel, ts: fixtureTs(ts), thread_ts: threadTs ? fixtureTs(threadTs) : undefined, user: "U1", text };
 }
+function fixtureTs(value: string): string { return Number(value) < 1_000_000_000 ? ts(value) : value; }
+
+describe("scheduled report contexts", () => {
+  it("blocks prompts and session replacement while allowing explicit cancellation", async () => {
+    const prompt = vi.fn();
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps("scheduled-context", fakePool({ session: { promptAsync: prompt } }), fakeRender(log));
+    const key = `DOWNER:${ts("800.001")}`;
+    d.state.setThread(key, { sessionId: "sess-report", projectDir: "/p", verbose: "off", scheduledRunId: "run-report",
+      createdAt: NOW, lastUsedAt: NOW });
+    const cancelThread = vi.fn(async () => {});
+    d.schedules = { busy: k => k === key, cancelThread, run: vi.fn(async () => {}) };
+    expect(await handleIncomingMessage(ownerMsg("DOWNER", "800.002", "800.001", "change some files"), d)).toBe("accepted");
+    expect(await handleIncomingMessage(ownerMsg("DOWNER", "800.003", "800.001", "\\new"), d)).toBe("accepted");
+    expect(prompt).not.toHaveBeenCalled();
+    expect(d.state.getThread(key)?.sessionId).toBe("sess-report");
+    expect(log.posted.filter(text => text.includes("report is still running"))).toHaveLength(2);
+    expect(await handleIncomingMessage(ownerMsg("DOWNER", "800.004", "800.001", "\\stop"), d)).toBe("accepted");
+    expect(cancelThread).toHaveBeenCalledWith(key);
+    expect(log.posted.at(-1)).toContain("Future occurrences are unchanged");
+  });
+
+  it("never grants nonowners scheduled-run control", async () => {
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps("scheduled-owner", fakePool({}), fakeRender(log));
+    const busy = vi.fn(() => true); const cancelThread = vi.fn(async () => {});
+    d.schedules = { busy, cancelThread, run: vi.fn(async () => {}) };
+    await handleIncomingMessage({ ...ownerMsg("DOWNER", "801.002", "801.001", "\\stop"), user: "UOTHER" }, d);
+    expect(busy).not.toHaveBeenCalled(); expect(cancelThread).not.toHaveBeenCalled();
+  });
+});
 
 describe("rebind prompt failure (NB1)", () => {
   it("404 permits one rebind; an ambiguous retry retains evidence and reports uncertainty", async () => {
@@ -129,18 +164,18 @@ describe("rebind prompt failure (NB1)", () => {
     const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
     const d = makeDeps("router-nb1", fakePool(client), fakeRender(log));
     const msg = ownerMsg("C9", "900.001", undefined, "hello");
-    d.state.setThread("C9:900.001", { sessionId: "sess-old", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 });
+    d.state.setThread(`C9:${ts("900.001")}`, { sessionId: "sess-old", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW });
 
     expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
 
     expect(promptCalls).toBe(2); // original + the rebind retry
-    expect(log.reacted).toEqual([["900.001", "eyes"]]);
+    expect(log.reacted).toEqual([[ts("900.001"), "eyes"]]);
     expect(log.posted.some((p) => p.includes("Prompt acceptance is uncertain") && p.includes("boom"))).toBe(true);
     expect(log.deleted.length).toBe(0);
-    const t = d.state.getThread("C9:900.001");
+    const t = d.state.getThread(`C9:${ts("900.001")}`);
     expect(t?.sessionId).toBe("sess-new");
     expect(t?.pendingRun).toBeDefined(); // may still be running; reconciliation owns completion
-    expect(d.state.getReceipt("C9:900.001", msg.ts)?.disposition).toBe("uncertain");
+    expect(d.state.getReceipt(`C9:${ts("900.001")}`, msg.ts)?.disposition).toBe("uncertain");
     expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
     expect(promptCalls).toBe(2);
     deleteView("sess-new");
@@ -184,13 +219,13 @@ describe("concurrent cold-start prompts (NB3)", () => {
     expect(createCalls).toBe(1); // no duplicate session from the race
     expect(promptCalls).toBe(2); // both prompts delivered on the shared session
     expect(log.posted.some((p) => p.includes("Queued — runs after the current task"))).toBe(true);
-    expect(d.state.getThread("C9:900.100")?.sessionId).toBe("sess-1");
+    expect(d.state.getThread(`C9:${ts("900.100")}`)?.sessionId).toBe("sess-1");
   });
 });
 
 describe("real-router recovery receipts", () => {
-  const root = "1200.000000";
-  const baseline = "1200.000001";
+  const root = ts("1200.000000");
+  const baseline = ts("1200.000001");
   const blankLog = (): CallLog => ({ posted: [], deleted: [], reacted: [], dms: [] });
   function setup(name: string, prompt: (args: any) => Promise<unknown>) {
     const log = blankLog();
@@ -200,11 +235,11 @@ describe("real-router recovery receipts", () => {
     d.state.setThread(`C:${root}`, { sessionId: name, projectDir: "/p", verbose: "on", createdAt: 1,
       lastUsedAt: 1, lastSeenTs: baseline, notify: true });
     const catchup = (messages: SlackMsg[]) => sweepMissedMessages({ state: d.state, ownerSlackUserId: "U1",
-      fetchReplies: async () => messages, dispatch: (m) => handleIncomingMessage(m, d) });
+      fetchReplies: async () => messages, dispatch: (m, context) => handleIncomingMessage(m, d, context) });
     return { d, log, client, catchup };
   }
 
-  it("a newer live submission does not hide an older history gap", async () => {
+  it("holds an older history gap overtaken by a newer accepted live prompt", async () => {
     const submitted: string[] = [];
     const { d, catchup } = setup("receipt-gap", async (args) => { submitted.push(args.body.parts[0].text); return { data: {} }; });
     try {
@@ -212,12 +247,11 @@ describe("real-router recovery receipts", () => {
       const older = ownerMsg("C", "1200.000002", root, "older missed");
       expect(await handleIncomingMessage(newer, d)).toBe("accepted");
       expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
-      expect(await catchup([newer, older])).toBe(1);
-      expect(submitted).toEqual(["newer live", "older missed"]);
-      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(newer.ts);
-      expect(d.state.recoveryStatus().receipts).toBe(0);
-      expect(await handleIncomingMessage(older, d)).toBe("accepted");
-      expect(submitted).toHaveLength(2);
+      expect(await catchup([newer, older])).toBe(0);
+      expect(submitted).toEqual(["newer live"]);
+      expect(d.state.recoveryStatus().held).toBe(1);
+      expect(await handleIncomingMessage(older, d)).toBe("held");
+      expect(submitted).toHaveLength(1);
     } finally { deleteView("receipt-gap"); }
   });
 
@@ -276,7 +310,7 @@ describe("real-router recovery receipts", () => {
       expect(release).toHaveBeenCalledOnce();
       expect(client.session.create).not.toHaveBeenCalled();
       expect(log.posted.some((s) => s.includes("will not automatically resubmit"))).toBe(true);
-      d.state = new StateStore(join(FIXTURES, "receipt-timeout", "state.json"));
+      d.state = new StateStore(join(FIXTURES, "receipt-timeout", "state.json"), () => NOW);
       expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
       expect(await catchup([msg])).toBe(0);
       expect(prompt).toHaveBeenCalledOnce();
@@ -289,8 +323,8 @@ describe("real-router recovery receipts", () => {
     let persistedSubmission: unknown;
     const prompt = vi.fn(async (args) => {
       sentID = args.body.messageID;
-      const persisted = new StateStore(join(FIXTURES, "receipt-correlated", "state.json"));
-      persistedSubmission = persisted.getReceipt(`C:${root}`, "1200.000002")?.submission;
+      const persisted = new StateStore(join(FIXTURES, "receipt-correlated", "state.json"), () => NOW);
+      persistedSubmission = persisted.getReceipt(`C:${root}`, ts("1200.000002"))?.submission;
       throw new Error("HTTP timeout after possible acceptance");
     });
     const { d, catchup } = setup("receipt-correlated", prompt);
@@ -299,13 +333,14 @@ describe("real-router recovery receipts", () => {
       expect(await handleIncomingMessage(msg, d)).toBe("uncertain");
       expect(sentID).toMatch(/^msg_[0-9a-f]+$/);
       expect(persistedSubmission).toEqual({ projectDir: "/p", sessionId: "receipt-correlated", messageId: sentID });
-      d.state = new StateStore(join(FIXTURES, "receipt-correlated", "state.json"));
+      d.state = new StateStore(join(FIXTURES, "receipt-correlated", "state.json"), () => NOW);
       expect(d.state.reconcilePromptAcceptance("/p", { id: "msg_later", sessionID: "receipt-correlated", role: "user" })).toEqual([]);
       expect(await catchup([msg])).toBe(0);
       expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
       expect(d.state.reconcilePromptAcceptance("/p", { id: sentID, sessionID: "receipt-correlated", role: "user" })).toHaveLength(1);
       expect(await catchup([msg])).toBe(0); // consumes evidence; no second submission
-      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(msg.ts);
+      expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(baseline);
+      expect(d.state.getReceipt(`C:${root}`, msg.ts)?.disposition).toBe("accepted");
       expect(prompt).toHaveBeenCalledOnce();
     } finally { deleteView("receipt-correlated"); }
   });
@@ -322,7 +357,7 @@ describe("real-router recovery receipts", () => {
       await vi.waitFor(() => expect(sentID).not.toBe(""));
       expect(d.state.reconcilePromptAcceptance("/p", { id: sentID, sessionID: "receipt-evidence-race", role: "user" })).toHaveLength(1);
       await catchup([msg]);
-      expect(d.state.getReceipt(`C:${root}`, msg.ts)).toBeUndefined();
+      expect(d.state.getReceipt(`C:${root}`, msg.ts)?.disposition).toBe("accepted"); // active evidence stays pinned
       fail();
       expect(await live).toBe("accepted");
       expect(prompt).toHaveBeenCalledOnce();
@@ -364,8 +399,10 @@ describe("real-router recovery receipts", () => {
       expect(create).toHaveBeenCalledOnce();
       expect(prompt).toHaveBeenCalledTimes(2);
       expect(held).toBe(0);
-      expect(log.posted.filter((text) => text.startsWith("⏳ OpenCode"))).toHaveLength(2);
-      expect(log.deleted.filter((ts) => ts === "ts-2")).toHaveLength(1); // follower's extra ack was not adopted
+      expect(log.posted.filter((text) => text.startsWith("⏳ OpenCode"))).toHaveLength(1);
+      expect(log.posted[1]).toContain("Queued");
+      expect(log.posted.at(-1)).toMatch(/^[⏳⌛]/);
+      expect(log.deleted).toEqual(["ts-1"]); // replacement bar follows the queued ack
     } finally { deleteView("receipt-cold"); }
   });
 });
@@ -375,15 +412,15 @@ describe("receipt capacity recovery commands", () => {
     const path = join(FIXTURES, name, "state.json");
     mkdirSync(join(FIXTURES, name), { recursive: true });
     const receipts = Object.fromEntries(Array.from({ length: count }, (_, i) => {
-      const ts = `1400.${String(i + 1).padStart(6, "0")}`;
-      return [`stuck:${ts}`, { threadKey: "stuck:1400.000000", ts, disposition: "uncertain", updatedAt: 1 }];
+      const timestamp = ts(`1400.${String(i + 1).padStart(6, "0")}`);
+      return [`stuck:${timestamp}`, { threadKey: `stuck:${ts("1400.000000")}`, ts: timestamp, disposition: "uncertain", updatedAt: NOW }];
     }));
     writeFileSync(path, JSON.stringify({ threads: {}, projects: {}, receipts }));
     const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
     const d = makeDeps(name, fakePool({}), fakeRender(log));
     d.cwd = "/capacity-recovery";
     const kill = vi.fn(async () => {});
-    d.pool.killOne = kill;
+    d.pool.reconnect = kill;
     return { d, log, kill, path };
   }
 
@@ -394,7 +431,7 @@ describe("receipt capacity recovery commands", () => {
     expect(await handleIncomingMessage(msg, d)).toBe("accepted");
     expect(kill).toHaveBeenCalledOnce();
     expect(d.state.recoveryStatus().receipts).toBe(MAX_MESSAGE_RECEIPTS + 1);
-    d.state = new StateStore(path);
+    d.state = new StateStore(path, () => NOW);
     expect(await handleIncomingMessage(msg, d)).toBe("accepted");
     expect(kill).toHaveBeenCalledOnce();
     expect(d.state.recoveryStatus().uncertain).toBe(MAX_MESSAGE_RECEIPTS);
@@ -460,7 +497,7 @@ describe("attachments key off files presence, not subtype", () => {
   function imgMsg(channel: string, ts: string, text: string | undefined, subtype?: string): SlackMsg {
     return {
       channel,
-      ts,
+      ts: fixtureTs(ts),
       user: "U1",
       text,
       subtype,
@@ -644,7 +681,7 @@ describe("eyes liveness ack", () => {
 
     await handleIncomingMessage(ownerMsg("C11", "911.001", undefined, "run something"), d);
 
-    expect(log.reacted[0]).toEqual(["911.001", "eyes"]); // first reaction on the message
+    expect(log.reacted[0]).toEqual([ts("911.001"), "eyes"]); // first reaction on the message
   });
 
   it("cold-start failure also clears the 👀 (❌ alone remains)", async () => {
@@ -656,9 +693,9 @@ describe("eyes liveness ack", () => {
 
     await handleIncomingMessage(ownerMsg("C11", "911.010", undefined, "run something"), d);
 
-    expect(log.reacted).toContainEqual(["911.010", "eyes"]);
-    expect(log.unreacted).toContainEqual(["911.010", "eyes"]);
-    expect(log.reacted[log.reacted.length - 1]).toEqual(["911.010", "x"]);
+    expect(log.reacted).toContainEqual([ts("911.010"), "eyes"]);
+    expect(log.unreacted).toContainEqual([ts("911.010"), "eyes"]);
+    expect(log.reacted[log.reacted.length - 1]).toEqual([ts("911.010"), "x"]);
     expect(log.posted.some((p) => p.includes("spawn blew up"))).toBe(true);
   });
 });
@@ -684,7 +721,7 @@ describe("watchOnly gate", () => {
     };
     const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
     const d = makeDeps("router-watchgate", fakePool(client), fakeRender(log));
-    d.state.setThread("C9:960.001", { sessionId: "sess-watch", projectDir: "/p", verbose: "on", watchOnly: true, createdAt: 1, lastUsedAt: 1 });
+    d.state.setThread(`C9:${ts("960.001")}`, { sessionId: "sess-watch", projectDir: "/p", verbose: "on", watchOnly: true, createdAt: NOW, lastUsedAt: NOW });
 
     await handleIncomingMessage(ownerMsg("C9", "960.002", "960.001", "hello"), d);
 
@@ -707,11 +744,167 @@ describe("watchOnly gate", () => {
     };
     const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
     const d = makeDeps("router-watchgate-off", fakePool(client), fakeRender(log));
-    d.state.setThread("C9:970.001", { sessionId: "sess-now-mine", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 });
+    d.state.setThread(`C9:${ts("970.001")}`, { sessionId: "sess-now-mine", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW });
 
     await handleIncomingMessage(ownerMsg("C9", "970.002", "970.001", "hello"), d);
 
     expect(log.posted.join("\n")).not.toContain("watch-only");
-    expect(log.reacted).toContainEqual(["970.002", "eyes"]);
+    expect(log.reacted).toContainEqual([ts("970.002"), "eyes"]);
+  });
+});
+
+describe("original age and cancellation at effect boundaries", () => {
+  function gated(name: string, now: () => number = () => NOW) {
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const prompt = vi.fn(async () => ({ data: {} }));
+    const create = vi.fn(async () => ({ data: { id: name } }));
+    const pool = fakePool({ session: { promptAsync: prompt, create, messages: async () => ({ data: [] }) } });
+    const d = makeDeps(name, pool, fakeRender(log));
+    d.state = new StateStore(join(FIXTURES, name, "state.json"), now);
+    const root = timestampFromMs(NOW - 30 * 86400_000);
+    const key = `C:${root}`;
+    d.state.setThread(key, { sessionId: name, projectDir: "/p", verbose: "on", createdAt: NOW - 30 * 86400_000,
+      lastUsedAt: NOW, historyCursorTs: root, lastSeenTs: root });
+    return { d, key, root, log, prompt, create };
+  }
+
+  it("delayed live envelopes older than 72h never acquire a server, acknowledge, or execute commands", async () => {
+    const { d, root, log, prompt } = gated("expired-live");
+    const acquire = vi.spyOn(d.pool, "ensure");
+    const old = timestampFromMs(NOW - MAX_REPLAY_AGE_MS - 1);
+    expect(await handleIncomingMessage(ownerMsg("C", old, root, "do work"), d)).toBe("expired");
+    expect(await handleIncomingMessage(ownerMsg("C", old, root, "\\restart"), d)).toBe("expired");
+    expect(acquire).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
+    expect(log.posted).toEqual([]);
+    expect(log.reacted).toEqual([]);
+    expect(d.state.recoveryStatus().expired).toBe(1);
+  });
+
+  it("accepts a fresh reply in an old thread while its original old backlog stays expired", async () => {
+    const { d, root, key, prompt } = gated("fresh-old-thread");
+    try {
+      expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "new request"), d)).toBe("accepted");
+      expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 10 * 86400_000), root, "old backlog"), d, { source: "history" })).toBe("expired");
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(d.state.getThread(key)?.recovery?.ownerActivityTs).toBe(timestampFromMs(NOW - 1000));
+    } finally { deleteView("fresh-old-thread"); }
+  });
+
+  it("rechecks expiration after server acquisition, immediately before a model submission", async () => {
+    let now = NOW;
+    const { d, root, key, prompt, create, log } = gated("expires-await", () => now);
+    const ensure = d.pool.ensure.bind(d.pool);
+    d.pool.ensure = async (dir) => { now++; return ensure(dir); };
+    const message = ownerMsg("C", timestampFromMs(NOW - MAX_REPLAY_AGE_MS), root, "right on the boundary");
+    expect(await handleIncomingMessage(message, d)).toBe("expired");
+    expect(prompt).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(d.state.getReceipt(key, message.ts)).toBeUndefined();
+    expect(log.deleted).toEqual([]); // no status post before acquisition
+    expect(log.posted.some((text) => text.includes("failed") || text.includes("retry"))).toBe(false);
+  });
+
+  it("rechecks again after beginPrompt's asynchronous Slack work, immediately before promptAsync", async () => {
+    let now = NOW;
+    const { d, root, key, prompt } = gated("expires-final-gate", () => now);
+    const entry = await d.pool.ensure("/p");
+    const view = new SessionView({ sessionId: "expires-final-gate", projectDir: "/p", channel: "C", threadTs: root,
+      threadKey: key, client: entry.client!, deps: d.render, state: d.state, threadState: d.state.getThread(key)! });
+    const begin = view.beginPrompt.bind(view);
+    view.beginPrompt = async (messageTs) => { await begin(messageTs); now++; };
+    try {
+      expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - MAX_REPLAY_AGE_MS), root, "expires in the queue"), d)).toBe("expired");
+      expect(prompt).not.toHaveBeenCalled();
+      expect(d.state.getThread(key)?.pendingRun).toBeUndefined();
+    } finally { deleteView(view.sessionId); }
+  });
+
+  it("a duplicate while awaiting startup does not poison the original processing claim", async () => {
+    const { d, root, prompt } = gated("duplicate-startup");
+    const ensure = d.pool.ensure.bind(d.pool);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = vi.fn();
+    d.pool.ensure = async (dir) => { entered(); await gate; return ensure(dir); };
+    const message = ownerMsg("C", timestampFromMs(NOW - 1000), root, "once");
+    const running = handleIncomingMessage(message, d);
+    await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+    expect(await handleIncomingMessage(message, d)).toBe("processing");
+    release();
+    expect(await running).toBe("accepted");
+    expect(prompt).toHaveBeenCalledOnce();
+    deleteView("duplicate-startup");
+  });
+
+  it("a stop with no live view is durable before a stalled server acquisition returns", async () => {
+    const { d, root, key, prompt } = gated("stop-await");
+    const ensure = d.pool.ensure.bind(d.pool);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = vi.fn();
+    d.pool.ensure = async (dir) => { entered(); await gate; return ensure(dir); };
+    const running = handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 2000), root, "work"), d);
+    await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+    expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "\\stop"), d)).toBe("accepted");
+    expect(d.state.getThread(key)?.recovery?.canceledThroughTs).toBe(timestampFromMs(NOW - 1000));
+    release();
+    expect(await running).toBe("canceled");
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("hush cancels an already claimed prompt while its attachment is downloading", async () => {
+    const { d, root, key, prompt } = gated("hush-download");
+    let release!: (value: unknown) => void;
+    const fetch = vi.fn(() => new Promise((resolve) => { release = resolve; }));
+    vi.stubGlobal("fetch", fetch);
+    const running = handleIncomingMessage({ ...ownerMsg("C", timestampFromMs(NOW - 2000), root, "inspect"),
+      files: [{ mimetype: "text/plain", name: "a.txt", url_private_download: "https://files.example/a.txt" }] }, d);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "\\hush"), d)).toBe("accepted");
+    expect(d.state.getThread(key)?.hushed).toBe(true);
+    release({ ok: true, arrayBuffer: async () => new ArrayBuffer(0) });
+    expect(await running).toBe("canceled");
+    expect(prompt).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("a replaced binding suppresses a prompt that was waiting for its old server", async () => {
+    const { d, root, key, prompt } = gated("rebound-await");
+    const ensure = d.pool.ensure.bind(d.pool);
+    d.pool.ensure = async (dir) => {
+      d.state.cancelRecovery(key, timestampFromMs(NOW - 500), true);
+      d.state.setThread(key, { ...d.state.getThread(key)!, sessionId: "replacement" });
+      return ensure(dir);
+    };
+    expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "work"), d)).toBe("canceled");
+    expect(prompt).not.toHaveBeenCalled();
+    expect(d.state.getThread(key)?.sessionId).toBe("replacement");
+  });
+
+  it("history context blocks unknown mutating commands even when called directly", async () => {
+    const { d, root } = gated("history-command-gate");
+    const effect = vi.fn(async () => {});
+    registerCommand({ name: "historyeffect", summary: "", usage: "", run: effect });
+    expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "\\historyeffect"), d, { source: "history" })).toBe("held");
+    expect(effect).not.toHaveBeenCalled();
+  });
+
+  it("a stop during first-ever cold start cancels the unbound prompt before session creation", async () => {
+    const { d, root, key, prompt, create } = gated("unbound-stop");
+    d.state.deleteThread(key);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ensure = d.pool.ensure.bind(d.pool);
+    const entered = vi.fn();
+    d.pool.ensure = async (dir) => { entered(); await gate; return ensure(dir); };
+    const running = handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 2000), root, "cold work"), d);
+    await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+    await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "\\stop"), d);
+    expect(d.state.cancellationThrough(key)).toBe(timestampFromMs(NOW - 1000));
+    release();
+    expect(await running).toBe("canceled");
+    expect(create).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
   });
 });

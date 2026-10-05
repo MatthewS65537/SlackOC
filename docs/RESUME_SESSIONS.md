@@ -1,5 +1,15 @@
 # Design: Resume & Monitor Sessions Started on the Computer
 
+> **Historical V1 design and investigation (September 2026).** The remainder of
+> this document records the original proposal and OpenCode 1.18.31 probes, not
+> the current architecture. V2 uses one authenticated shared service with explicit
+> project locations, not separate per-project `opencode serve` processes. Its
+> model selection does not require the old “ping” probe. For current behavior,
+> see [V2 integration](V2.md) and the [README command reference](../README.md#command-surface).
+> The implemented `\sessions`, `\resume`, `\watch`, `\unwatch`, `\history`, and
+> `\summary` commands retain the workflows described here; old line numbers,
+> API endpoints, process-ownership assumptions and spike results are historical.
+
 Feature request: resume sessions started on the computer (TUI) directly in Slack — with
 history viewing, an optional AI catch-up summary, live monitoring of ongoing sessions,
 and the usual `\command <#>` switching schema with a smart cap.

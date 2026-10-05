@@ -1,348 +1,205 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { createCatchupCoordinator, sweepMissedMessages, type CatchupDeps } from "../src/slack/catchup.js";
-import { handleIncomingMessage, type BridgeDeps, type SlackMsg } from "../src/slack/router.js";
-import type { RenderDeps } from "../src/slack/render.js";
-import type { ServerPool } from "../src/opencode/server.js";
-import type { SlackocConfig } from "../src/config.js";
+import { createCatchupCoordinator, MAX_SNAPSHOT_CANDIDATES, sweepMissedMessages, type CatchupDeps } from "../src/slack/catchup.js";
 import { StateStore, type ThreadState } from "../src/state.js";
+import { MAX_REPLAY_AGE_MS, replayFloor, timestampFromMs } from "../src/slack/recovery-policy.js";
+import type { SlackMsg } from "../src/slack/router.js";
 
-// Test fixtures stay inside the project (never the system tmpdir), in this
-// suite's own subdir (parallel suites share the .fixtures root).
-const FIXTURES = join(import.meta.dirname ?? __dirname, ".fixtures", "catchup");
-
-afterAll(() => {
-  rmSync(FIXTURES, { recursive: true, force: true });
-});
-
-const OWNER = "U1";
-
-function tempStore(name: string): StateStore {
-  return new StateStore(join(FIXTURES, name, "state.json"));
-}
-
-/** setThread bumps lastUsedAt to now — hand-write state when a stale one is needed. */
-function storeWithThreads(name: string, threads: Record<string, ThreadState>): StateStore {
-  const dir = join(FIXTURES, name);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, "state.json");
-  writeFileSync(path, JSON.stringify({ threads, projects: {} }));
-  return new StateStore(path);
-}
-
-const NOW = Date.now();
-
-function bind(store: StateStore, channel: string, rootTs: string, lastSeenTs: string | undefined): void {
-  store.setThread(`${channel}:${rootTs}`, {
-    sessionId: "ses_x",
-    projectDir: "/p",
-    verbose: "on",
-    ...(lastSeenTs ? { lastSeenTs } : {}),
-    createdAt: NOW,
-    lastUsedAt: NOW,
-  });
-}
-
-/** History-API realism: conversations.replies messages lack `channel` (socket events have it). */
-function asApiMessages(msgs: SlackMsg[]): SlackMsg[] {
-  return msgs.map((m) => {
-    const { channel: _c, ...rest } = m;
-    return rest as SlackMsg;
-  });
-}
-
-/** A minimal harness: fake replies source + recording dispatch. */
-function harness(
-  store: StateStore,
-  replies: Record<string, SlackMsg[]>,
-  dispatch?: CatchupDeps["dispatch"],
-): { deps: CatchupDeps; dispatched: SlackMsg[]; fetches: string[] } {
+const FIXTURES = join(import.meta.dirname, ".fixtures", "catchup");
+const NOW = Date.parse("2026-09-22T00:00:00Z");
+const ts = (seconds: number) => timestampFromMs(NOW - 60_000 + seconds * 1000);
+const key = `C:${ts(0)}`;
+afterAll(() => rmSync(FIXTURES, { recursive: true, force: true }));
+function fixture(name: string) {
+  const state = new StateStore(join(FIXTURES, name, "state.json"), () => NOW);
+  state.setThread(key, { sessionId: name, projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW,
+    lastSeenTs: ts(1), historyCursorTs: ts(1) });
   const dispatched: SlackMsg[] = [];
-  const fetches: string[] = [];
-  return {
-    deps: {
-      state: store,
-      ownerSlackUserId: OWNER,
-      fetchReplies: async (channel, rootTs, oldest) => {
-        fetches.push(`${channel}:${rootTs}@${oldest}`);
-        return asApiMessages(replies[`${channel}:${rootTs}`] ?? []);
-      },
-      dispatch:
-        dispatch ??
-        (async (m) => {
-          dispatched.push(m);
-          store.markThreadSeen(`${m.channel}:${m.thread_ts ?? m.ts}`, m.ts);
-          return "accepted";
-        }),
-    },
-    dispatched,
-    fetches,
-  };
+  const deps: CatchupDeps = { state, ownerSlackUserId: "U1", fetchReplies: async () => [], dispatch: async (m) => {
+    dispatched.push(m);
+    state.claimMessage(key, m.ts, { source: "history" });
+    state.settleMessage(key, m.ts, "accepted");
+    return "accepted";
+  } };
+  return { state, deps, dispatched };
 }
+const msg = (seconds: number, text = "work"): SlackMsg => ({ channel: "C", thread_ts: ts(0), ts: ts(seconds), user: "U1", text });
 
-describe("missed-message catch-up sweep", () => {
-  it("replays only post-watermark owner messages, skipping parent/bots/subtypes/others", async () => {
-    const store = tempStore("cu-filter");
-    bind(store, "C9", "9000.000001", "9000.000050");
-    const good: SlackMsg = { channel: "C9", user: OWNER, text: "hello", ts: "9000.000051", thread_ts: "9000.000001" };
-    const replies = {
-      "C9:9000.000001": [
-        { channel: "C9", user: OWNER, text: "parent", ts: "9000.000001" }, // parent
-        good,
-        { channel: "C9", user: "U2", text: "intruder", ts: "9000.000052", thread_ts: "9000.000001" },
-        { channel: "C9", user: "U9", bot_id: "B1", text: "bot", ts: "9000.000053", thread_ts: "9000.000001" },
-        { channel: "C9", user: OWNER, text: "edited", ts: "9000.000054", thread_ts: "9000.000001", subtype: "message_changed" },
-        { channel: "C9", user: OWNER, text: "old", ts: "9000.000049", thread_ts: "9000.000001" }, // pre-watermark
-      ] as SlackMsg[],
+describe("bounded classified history", () => {
+  it("filters parent, bots, subtypes and other users, stamping channel-less owner rows", async () => {
+    const { state, deps, dispatched } = fixture("filter");
+    deps.fetchReplies = async () => [msg(0), msg(2), { ...msg(3), user: "other" }, { ...msg(4), bot_id: "B" },
+      { ...msg(5), subtype: "message_changed" }].map(({ channel, ...row }) => row as SlackMsg);
+    expect(await sweepMissedMessages(deps)).toBe(1);
+    expect(dispatched).toEqual([msg(2)]);
+    expect(state.getThread(key)?.recovery?.ownerActivityTs).toBe(ts(2));
+  });
+
+  it("does not execute page one before a page-three stop; persists snapshot through restart", async () => {
+    let { state, deps, dispatched } = fixture("page-stop");
+    const fetch = vi.fn<CatchupDeps["fetchReplies"]>()
+      .mockResolvedValueOnce({ messages: [msg(2)], hasMore: true, pagesUsed: 2, nextCursor: "page3" })
+      .mockResolvedValueOnce({ messages: [msg(4, "\\stop")], hasMore: false, pagesUsed: 1 });
+    deps.fetchReplies = fetch;
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(state.getThread(key)?.historyCursorTs).toBe(ts(1));
+    state = new StateStore(join(FIXTURES, "page-stop", "state.json"), () => NOW);
+    deps = { ...deps, state };
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(fetch.mock.calls[1]![2]).toBe(ts(2).replace(".000000", ".000001"));
+    expect(fetch.mock.calls[1]![3]).toMatchObject({ latest: timestampFromMs(NOW), maxPages: 2 });
+    expect(dispatched).toEqual([]);
+    expect(state.getThread(key)?.recovery?.canceledThroughTs).toBe(ts(4));
+    expect(state.isMessageAccepted(key, ts(2))).toBe(false);
+    expect(state.recoveryStatus().canceled).toBe(2);
+  });
+
+  it("holds an overflow instead of truncating it into executable work", async () => {
+    const { state, deps, dispatched } = fixture("overflow");
+    deps.fetchReplies = async () => Array.from({ length: MAX_SNAPSHOT_CANDIDATES + 1 }, (_, i) => ({ ...msg(2), ts: `${ts(2).split(".")[0]}.${String(i).padStart(6, "0")}` }));
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(state.recoveryStatus().threads[0]?.reason).toBe("backlog_overflow");
+    expect(state.getThread(key)?.recovery?.scan).toBeUndefined();
+  });
+
+  it("waits for the previous classified task to finish, then sends the next in order", async () => {
+    const { state, deps, dispatched } = fixture("sequential");
+    deps.fetchReplies = async () => [msg(2), msg(3)];
+    const dispatch = deps.dispatch;
+    deps.dispatch = async (m, context) => {
+      const result = await dispatch(m, context);
+      state.setThread(key, { ...state.getThread(key)!, pendingRun: { userMsgTs: [m.ts] } });
+      return result;
     };
-    const { deps, dispatched } = harness(store, replies);
-    const n = await sweepMissedMessages(deps);
-    expect(n).toBe(1);
-    expect(dispatched).toEqual([good]);
-    expect(store.getThread("C9:9000.000001")?.lastSeenTs).toBe("9000.000051");
+    expect(await sweepMissedMessages(deps)).toBe(1);
+    expect(dispatched.map((m) => m.ts)).toEqual([ts(2)]);
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    state.recordRunOutcome(key, "sequential", "completed");
+    state.setThread(key, { ...state.getThread(key)!, pendingRun: undefined });
+    expect(await sweepMissedMessages(deps)).toBe(1);
+    expect(dispatched.map((m) => m.ts)).toEqual([ts(2), ts(3)]);
   });
 
-  it("never sweeps a thread without a watermark (double-run protection for pre-watermark bindings)", async () => {
-    const store = tempStore("cu-nowm");
-    bind(store, "C9", "9100.000001", undefined);
-    const { deps, fetches } = harness(store, { "C9:9100.000001": [{ channel: "C9", user: OWNER, text: "x", ts: "9100.000002" }] });
-    const n = await sweepMissedMessages(deps);
-    expect(n).toBe(0);
-    expect(fetches).toEqual([]);
+  it("new live intent invalidates a collected snapshot before any replay", async () => {
+    const { state, deps, dispatched } = fixture("invalidated");
+    deps.fetchReplies = vi.fn<CatchupDeps["fetchReplies"]>()
+      .mockResolvedValueOnce({ messages: [msg(2)], hasMore: true, pagesUsed: 2, nextCursor: "next" })
+      .mockResolvedValue([]);
+    await sweepMissedMessages(deps);
+    state.noteLiveIntent(key);
+    await sweepMissedMessages(deps);
+    expect(dispatched).toEqual([]);
+    expect(state.recoveryStatus().threads[0]?.reason).toBe("snapshot_invalidated");
   });
 
-  it("includes overnight threads, lends the spare older slot, and rotates beyond ten candidates", async () => {
-    const mk = (rootTs: string, lastUsedAt: number): ThreadState => ({
-      sessionId: "ses_x",
-      projectDir: "/p",
-      verbose: "on",
-      lastSeenTs: "9200.000050",
-      createdAt: NOW,
-      lastUsedAt,
+  it("a missed project/hush command holds later prompts until fresh live intent", async () => {
+    const { state, deps, dispatched } = fixture("context-barrier");
+    deps.fetchReplies = async () => [msg(2, "\\cd /elsewhere"), msg(3, "run here")];
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(state.getThread(key)?.recovery?.needsFreshIntent).toBe(true);
+    expect(state.recoveryStatus().threads[0]?.reason).toBe("historical_command_context");
+    state.noteLiveIntent(key);
+    expect(state.getThread(key)?.recovery?.needsFreshIntent).toBe(false);
+  });
+
+  it("never blindly replays mutating commands or historical permission answers", async () => {
+    const { deps, dispatched } = fixture("commands");
+    deps.fetchReplies = async () => [msg(2, "\\permission per_old always"), msg(3, "\\cmd deploy"), msg(4, "\\help")];
+    expect(await sweepMissedMessages(deps)).toBe(0); // diagnostic replies aren't ghost replays
+    expect(dispatched.map((m) => m.text)).toEqual(["\\help"]);
+  });
+
+  it("holds uncertain work while allowing scan progress without forging acceptance", async () => {
+    const { state, deps, dispatched } = fixture("uncertain");
+    state.claimMessage(key, ts(2));
+    state.settleMessage(key, ts(2), "uncertain");
+    deps.fetchReplies = async () => [msg(2), msg(3, "\\help")];
+    await sweepMissedMessages(deps);
+    expect(dispatched.map((m) => m.ts)).toEqual([ts(3)]);
+    expect(state.getReceipt(key, ts(2))?.disposition).toBe("uncertain");
+    expect(state.isMessageAccepted(key, ts(2))).toBe(false);
+    expect(state.getThread(key)?.recovery?.replayFloorTs! > ts(3)).toBe(true);
+  });
+
+  it("retries a definite pre-submission failure and never consumes a void observer", async () => {
+    const { state, deps } = fixture("retry");
+    deps.fetchReplies = async () => [msg(2)];
+    deps.dispatch = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(undefined).mockImplementationOnce(async (m: SlackMsg) => {
+      state.claimMessage(key, m.ts); state.settleMessage(key, m.ts, "accepted"); return "accepted";
     });
-    const threads: Record<string, ThreadState> = { "C9:9200.000001": mk("9200.000001", NOW - 13 * 60 * 60 * 1000) };
-    for (let i = 0; i < 11; i++) threads[`C9:9210.0000${String(i).padStart(2, "0")}`] = mk("x", NOW);
-    const store = storeWithThreads("cu-window", threads);
-    const { deps, fetches } = harness(store, {});
-    await sweepMissedMessages(deps);
-    expect(fetches.some((f) => f.startsWith("C9:9200.000001"))).toBe(true);
-    expect(fetches.length).toBe(10);
-    await sweepMissedMessages(deps);
-    expect(new Set(fetches).size).toBe(12);
-  });
-
-  it("a failed replay keeps the watermark and retries on the next pass", async () => {
-    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      const store = tempStore("cu-retry");
-      bind(store, "C9", "9300.000001", "9300.000050");
-      const msg: SlackMsg = { channel: "C9", user: OWNER, text: "again", ts: "9300.000051", thread_ts: "9300.000001" };
-      let calls = 0;
-      const { deps } = harness(store, { "C9:9300.000001": [msg] }, async () => {
-        calls += 1;
-        if (calls === 1) throw new Error("transient boom");
-        store.markThreadSeen("C9:9300.000001", msg.ts);
-        return "accepted";
-      });
-      await sweepMissedMessages(deps); // first pass: throws before the watermark moves
-      expect(store.getThread("C9:9300.000001")?.lastSeenTs).toBe("9300.000050");
-      await sweepMissedMessages(deps); // retry: same message replayed again
-      expect(calls).toBe(2);
-      expect(store.getThread("C9:9300.000001")?.lastSeenTs).toBe("9300.000051");
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("a fetch failure is tolerated (reported once) and the thread is retried later", async () => {
-    const store = tempStore("cu-fetchfail");
-    bind(store, "C9", "9400.000001", "9400.000050");
-    let fetchCalls = 0;
-    const deps: CatchupDeps = {
-      state: store,
-      ownerSlackUserId: OWNER,
-      fetchReplies: async () => {
-        fetchCalls += 1;
-        if (fetchCalls === 1) throw new Error("not_in_channel");
-        return [{ channel: "C9", user: OWNER, text: "late", ts: "9400.000051", thread_ts: "9400.000001" }];
-      },
-      dispatch: async (m) => { store.markThreadSeen("C9:9400.000001", m.ts); return "accepted"; },
-    };
-    await sweepMissedMessages(deps);
-    expect(store.getThread("C9:9400.000001")?.lastSeenTs).toBe("9400.000050");
-    await sweepMissedMessages(deps);
-    expect(store.getThread("C9:9400.000001")?.lastSeenTs).toBe("9400.000051");
-    expect(fetchCalls).toBe(2);
-  });
-
-  it("routes a replayed message through the REAL handler (command path proves watermark advance + delivery)", async () => {
-    const store = tempStore("cu-real");
-    bind(store, "C9", "9500.000001", "9500.000050");
-    const posted: string[] = [];
-    const render: RenderDeps = {
-      post: async (_c, _t, text) => {
-        posted.push(text);
-        return { ts: "x" };
-      },
-      update: async () => {},
-      delete: async () => {},
-      react: async () => {},
-      unreact: async () => {},
-      upload: async () => {},
-    };
-    const bridge: BridgeDeps = {
-      config: { ownerSlackUserId: OWNER } as SlackocConfig,
-      state: store,
-      pool: {} as ServerPool, // \help never touches the pool
-      render,
-      botUserId: "UBOT",
-      cwd: "/p",
-    };
-    const deps: CatchupDeps = {
-      state: store,
-      ownerSlackUserId: OWNER,
-      // channel-less, like the real API — the sweep stamps it back (production bug: unstamped → invalid_arguments)
-      fetchReplies: async () => asApiMessages([{ channel: "C9", user: OWNER, text: "\\help", ts: "9500.000051", thread_ts: "9500.000001" }]),
-      dispatch: (m) => handleIncomingMessage(m, bridge),
-    };
-    const n = await sweepMissedMessages(deps);
-    expect(n).toBe(1);
-    expect(posted.some((p) => p.includes("\\model"))).toBe(true); // the \help listing actually posted
-    expect(store.getThread("C9:9500.000001")?.lastSeenTs).toBe("9500.000051");
-  });
-
-  it("stamps channel + thread_ts onto channel-less history messages before dispatch", async () => {
-    const store = tempStore("cu-stamp");
-    bind(store, "C9", "9600.000001", "9600.000050");
-    const { deps, dispatched } = harness(store, { "C9:9600.000001": [{ user: OWNER, text: "hi", ts: "9600.000051", thread_ts: "9600.000001" } as SlackMsg] });
-    await sweepMissedMessages(deps);
-    expect(dispatched[0]?.channel).toBe("C9");
-    expect(dispatched[0]?.thread_ts).toBe("9600.000001");
-  });
-
-  it("skips a message accepted live mid-pass using its receipt, not lastSeen", async () => {
-    const store = tempStore("cu-race");
-    bind(store, "C9", "9700.000001", "9700.000000");
-    const dispatched: string[] = [];
-    const deps: CatchupDeps = {
-      state: store,
-      ownerSlackUserId: OWNER,
-      fetchReplies: async () => asApiMessages([
-        { channel: "C9", user: OWNER, text: "first", ts: "9700.000010", thread_ts: "9700.000001" },
-        { channel: "C9", user: OWNER, text: "second", ts: "9700.000020", thread_ts: "9700.000001" },
-      ]),
-      // Simulate the socket delivering "second" while the sweep is between
-      // fetch and dispatch — the live watermark jumps past it.
-      dispatch: async (m) => {
-        if (m.ts === "9700.000010") {
-          store.claimMessage("C9:9700.000001", "9700.000020");
-          store.markThreadSeen("C9:9700.000001", "9700.000020");
-          store.settleMessage("C9:9700.000001", "9700.000020", "accepted");
-        }
-        dispatched.push(m.ts);
-        return "accepted";
-      },
-    };
-    const n = await sweepMissedMessages(deps);
-    expect(dispatched).toEqual(["9700.000010"]); // "second" was already handled live — not double-dispatched
-    expect(n).toBe(1);
-    expect(store.getThread("C9:9700.000001")?.lastSeenTs).toBe("9700.000020");
-  });
-
-  it("sweeps a seeded legacy thread, replaying only post-seed messages", async () => {
-    const store = tempStore("cu-legacy");
-    bind(store, "C9", "9800.000001", undefined); // pre-watermark binding: no lastSeenTs
-    expect(store.seedMissingWatermarks()).toBe(1);
-    const wm = store.getThread("C9:9800.000001")?.lastSeenTs;
-    expect(wm).toBeDefined();
-    // A message from BEFORE the seed (already handled long ago) and one after.
-    const sec = Number(wm!.split(".")[0]);
-    const { deps, dispatched } = harness(store, {
-      "C9:9800.000001": [
-        { channel: "C9", user: OWNER, text: "old handled", ts: `${sec - 5}.000500`, thread_ts: "9800.000001" },
-        { channel: "C9", user: OWNER, text: "lost while dead", ts: `${sec + 5}.000500`, thread_ts: "9800.000001" },
-      ],
-    });
-    const n = await sweepMissedMessages(deps);
-    expect(n).toBe(1);
-    expect(dispatched.map((m) => m.text)).toEqual(["lost while dead"]);
-    expect(store.getThread("C9:9800.000001")?.lastSeenTs).toBe(`${sec + 5}.000500`);
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(state.getThread(key)?.historyCursorTs).toBe(ts(1));
+    expect(await sweepMissedMessages(deps)).toBe(1);
   });
 });
 
-describe("fairness and coordinator budgets", () => {
-  it("reserves eight recent and two older slots, advances failures, and lends to older threads", async () => {
-    const mk = (old: boolean): ThreadState => ({ sessionId: "s", projectDir: "/p", verbose: "on",
-      lastSeenTs: "100.000001", createdAt: NOW, lastUsedAt: old ? NOW - 24 * 60 * 60_000 : NOW });
-    const threads = Object.fromEntries([
-      ...Array.from({ length: 11 }, (_, i) => [`R:${i}`, mk(false)]),
-      ...Array.from({ length: 5 }, (_, i) => [`O:${i}`, mk(true)]),
-    ]) as Record<string, ThreadState>;
-    const store = storeWithThreads("fair-rotation", threads);
+describe("recent eligibility and fair read-only discovery", () => {
+  it("clamps old maintenance-refreshed chats to 72h and discovers only genuinely recent owner input", async () => {
+    const { state, deps, dispatched } = fixture("dormant");
+    const old = timestampFromMs(NOW - 30 * 86400_000);
+    const path = join(FIXTURES, "dormant-legacy", "state.json");
+    mkdirSync(join(FIXTURES, "dormant-legacy"), { recursive: true });
+    writeFileSync(path, JSON.stringify({ threads: { [key]: { ...state.getThread(key), recovery: undefined,
+      historyCursorTs: old, lastSeenTs: old, lastUsedAt: NOW } }, projects: {} }));
+    deps.state = new StateStore(path, () => NOW);
+    const fetch = vi.fn<CatchupDeps["fetchReplies"]>().mockResolvedValue([msg(2), { ...msg(3), bot_id: "bot" }]);
+    deps.fetchReplies = fetch;
+    expect(await sweepMissedMessages(deps)).toBe(1);
+    expect(fetch.mock.calls[0]![2]).toBe(replayFloor(NOW));
+    expect(fetch.mock.calls[0]![3]).toMatchObject({ inclusive: true });
+    expect(dispatched.map((m) => m.ts)).toEqual([ts(2)]);
+  });
+
+  it("holds legacy no-boundary gaps rather than manufacturing a maintenance watermark", async () => {
+    const { state, deps, dispatched } = fixture("no-boundary");
+    const path = join(FIXTURES, "no-boundary", "state.json");
+    writeFileSync(path, JSON.stringify({ threads: { [key]: { sessionId: "legacy", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW } }, projects: {} }));
+    deps.state = new StateStore(path, () => NOW);
+    deps.state.seedMissingWatermarks();
+    expect(deps.state.getThread(key)?.lastSeenTs).toBeUndefined();
+    deps.fetchReplies = async () => [msg(2)];
+    expect(await sweepMissedMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(deps.state.getThread(key)?.lastSeenTs).toBe(ts(2)); // a real history observation, not migration
+    expect(deps.state.getThread(key)?.historyCursorTs).toBeUndefined();
+    expect(deps.state.recoveryStatus().threads[0]?.reason).toBe("legacy_without_boundary");
+  });
+
+  it("reserves eight recent and two dormant slots and rotates failures with a 20-page cap", async () => {
+    const { state, deps } = fixture("fair");
+    state.deleteThread(key);
+    for (let i = 0; i < 16; i++) {
+      const owner = timestampFromMs(NOW - (i < 11 ? 1000 : MAX_REPLAY_AGE_MS + 1000));
+      state.setThread(`${i < 11 ? "R" : "O"}:${i}`, { sessionId: `s${i}`, projectDir: "/p", verbose: "on", createdAt: NOW,
+        lastUsedAt: NOW, lastSeenTs: owner, historyCursorTs: owner });
+    }
     const fetched: string[] = [];
-    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER, dispatch: async () => "accepted",
-      fetchReplies: async (channel, ts) => { fetched.push(`${channel}:${ts}`); throw new Error("offline"); } };
+    const budgets: number[] = [];
+    deps.fetchReplies = async (channel, root, _oldest, budget) => { fetched.push(`${channel}:${root}`); budgets.push(budget.maxPages); throw new Error("offline"); };
     for (let i = 0; i < 3; i++) await sweepMissedMessages(deps);
     expect(fetched.slice(0, 10).filter((k) => k.startsWith("R:"))).toHaveLength(8);
     expect(fetched.slice(0, 10).filter((k) => k.startsWith("O:"))).toHaveLength(2);
     expect(new Set(fetched).size).toBe(16);
-    const older = storeWithThreads("fair-lending", Object.fromEntries([
-      ["R:1", mk(false)], ...Array.from({ length: 12 }, (_, i) => [`O:${i}`, mk(true)]),
-    ]));
-    const { deps: lending, fetches } = harness(older, {});
-    await sweepMissedMessages(lending);
-    expect(fetches.filter((k) => k.startsWith("O:"))).toHaveLength(9);
+    expect(budgets.slice(0, 10).reduce((a, b) => a + b)).toBe(20);
   });
 
-  it("coalesces overlapping boot/timer/reconnect requests into a serial extra pass", async () => {
-    const store = tempStore("coordinator");
-    bind(store, "C", "100.000001", "100.000002");
+  it("coalesces overlapping timer/reconnect calls", async () => {
+    const { deps } = fixture("coordinator");
     let release!: () => void;
-    const gate = new Promise<void>((r) => { release = r; });
-    let active = 0;
-    let maxActive = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
     let calls = 0;
-    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER, dispatch: async () => "accepted",
-      fetchReplies: async () => { calls++; active++; maxActive = Math.max(active, maxActive); await gate; active--; return []; } };
+    deps.fetchReplies = async () => { calls++; await gate; return []; };
     const coordinator = createCatchupCoordinator(deps);
     const first = coordinator.request();
     await vi.waitFor(() => expect(calls).toBe(1));
-    const second = sweepMissedMessages(deps);
-    const third = coordinator.request();
-    expect(second).toBe(first);
-    expect(third).toBe(first);
+    expect(coordinator.request()).toBe(first);
     release();
-    await Promise.all([first, second, third]);
+    await first;
     expect(calls).toBe(2);
-    expect(maxActive).toBe(1);
-  });
-
-  it("bounds page reservations and continues a partial history from confirmed messages", async () => {
-    const store = tempStore("pages");
-    for (let i = 0; i < 10; i++) bind(store, `C${i}`, "100.000000", "100.000001");
-    const budgets: number[] = [];
-    const oldestValues: string[] = [];
-    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER, dispatch: async () => "accepted",
-      fetchReplies: async (channel, _root, oldest, budget) => {
-        budgets.push(budget.maxPages);
-        oldestValues.push(oldest);
-        return { messages: [{ channel, user: OWNER, ts: oldest === "100.000001" ? "100.000002" : "100.000003" }], hasMore: true, pagesUsed: 2 };
-      } };
-    await sweepMissedMessages(deps);
-    expect(budgets).toEqual(Array(10).fill(2));
-    expect(budgets.reduce((a, b) => a + b, 0)).toBe(20);
-    await sweepMissedMessages(deps);
-    expect(oldestValues.slice(10)).toEqual(Array(10).fill("100.000002"));
-  });
-
-  it("does not infer consumption from a void dispatch that merely observed a message", async () => {
-    const store = tempStore("void-outcome");
-    bind(store, "C", "100.000000", "100.000001");
-    const deps: CatchupDeps = { state: store, ownerSlackUserId: OWNER,
-      fetchReplies: async () => [{ channel: "C", user: OWNER, ts: "100.000002" }],
-      dispatch: async () => { store.markThreadSeen("C:100.000000", "100.000002"); } };
-    expect(await sweepMissedMessages(deps)).toBe(0);
-    expect(store.getThread("C:100.000000")?.historyCursorTs).toBe("100.000001");
   });
 });

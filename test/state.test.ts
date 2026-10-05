@@ -3,15 +3,18 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { MAX_MESSAGE_RECEIPTS, StateStore, UNBOUND_RECEIPT_HORIZON_MS } from "../src/state.js";
 import { canonicalDir } from "../src/paths.js";
+import { replayFloor, timestampFromMs } from "../src/slack/recovery-policy.js";
 
 // Test fixtures stay inside the project (never the system tmpdir). This suite
 // owns its own subdir: suites run in parallel workers, so removing the shared
 // .fixtures root while another suite writes flakes with ENOTEMPTY.
 const FIXTURES = join(import.meta.dirname ?? __dirname, ".fixtures", "state");
+const NOW = Date.parse("2026-09-22T00:00:00Z");
+const ts = (n: number) => timestampFromMs(NOW - 60_000 + n);
 
 function tempStore(name: string): { store: StateStore; path: string } {
   const path = join(FIXTURES, name, "state.json");
-  return { store: new StateStore(path), path };
+  return { store: new StateStore(path, () => NOW), path };
 }
 
 afterAll(() => {
@@ -159,7 +162,8 @@ describe("canonical identity and durable recovery", () => {
     const s = new StateStore(path);
     expect(s.listProjects()).toEqual([{ dir: canonicalDir(real), lastUsedAt: 8 }]);
     expect(s.currentProjectDir).toBe(canonicalDir(real));
-    expect(s.getThread("C:100")).toEqual({ ...thread, projectDir: canonicalDir(real), historyCursorTs: thread.lastSeenTs });
+    expect(s.getThread("C:100")).toMatchObject({ ...thread, projectDir: canonicalDir(real), recovery: { version: 1, ownerActivityTs: thread.lastSeenTs } });
+    expect(s.getThread("C:100")?.historyCursorTs).toBeUndefined();
     expect(s.anyThreadInDir(alias)).toBe(true);
     s.save();
     const once = readFileSync(path, "utf8");
@@ -169,40 +173,40 @@ describe("canonical identity and durable recovery", () => {
 
   it("lastSeen and stale renderer snapshots cannot advance/regress history; crash-held claims become uncertain", () => {
     const { store: s, path } = tempStore("receipt-lifecycle");
-    s.setThread("C:100", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: "100.000001" });
+    s.setThread("C:100", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW, lastSeenTs: ts(1) });
     const stale = s.getThread("C:100")!;
-    expect(s.claimMessage("C:100", "100.000003")).toBe("claimed");
-    s.markThreadSeen("C:100", "100.000003");
-    expect(s.getThread("C:100")?.historyCursorTs).toBe("100.000001");
-    expect(s.claimMessage("C:100", "100.000003")).toBe("processing");
-    expect(s.confirmHistory("C:100", "100.000003")).toBe(false);
-    const restarted = new StateStore(path);
-    expect(restarted.claimMessage("C:100", "100.000003")).toBe("uncertain");
-    restarted.settleMessage("C:100", "100.000003", "accepted");
-    expect(restarted.confirmHistory("C:100", "100.000003")).toBe(true);
-    expect(restarted.getReceipt("C:100", "100.000003")).toBeUndefined();
-    restarted.setThread("C:100", { ...stale, pendingRun: { userMsgTs: ["100.000003"] } });
-    expect(restarted.getThread("C:100")?.historyCursorTs).toBe("100.000003");
-    expect(restarted.getThread("C:100")?.lastSeenTs).toBe("100.000003");
-    expect(restarted.claimMessage("C:100", "100.000002")).toBe("accepted");
+    expect(s.claimMessage("C:100", ts(3))).toBe("claimed");
+    s.markThreadSeen("C:100", ts(3));
+    expect(s.getThread("C:100")?.historyCursorTs).toBe(ts(1));
+    expect(s.claimMessage("C:100", ts(3))).toBe("processing");
+    expect(s.confirmHistory("C:100", ts(3))).toBe(false);
+    const restarted = new StateStore(path, () => NOW);
+    expect(restarted.claimMessage("C:100", ts(3))).toBe("uncertain");
+    restarted.settleMessage("C:100", ts(3), "accepted");
+    expect(restarted.confirmHistory("C:100", ts(3))).toBe(true);
+    expect(restarted.getReceipt("C:100", ts(3))).toBeUndefined();
+    restarted.setThread("C:100", { ...stale, pendingRun: { userMsgTs: [ts(3)] } });
+    expect(restarted.getThread("C:100")?.historyCursorTs).toBe(ts(3));
+    expect(restarted.getThread("C:100")?.lastSeenTs).toBe(ts(3));
+    expect(restarted.claimMessage("C:100", ts(2))).toBe("accepted");
   });
 
   it("pauses on receipt overflow without evicting evidence, then resumes when history drains", () => {
     const { path } = tempStore("receipt-overflow");
     mkdirSync(join(FIXTURES, "receipt-overflow"), { recursive: true });
     const receipts = Object.fromEntries(Array.from({ length: MAX_MESSAGE_RECEIPTS }, (_, i) => {
-      const ts = `100.${String(i + 1).padStart(6, "0")}`;
-      return [`C:${ts}`, { threadKey: "C:100", ts, disposition: "accepted", updatedAt: 1 }];
+      const timestamp = ts(i + 1);
+      return [`C:${timestamp}`, { threadKey: "C:100", ts: timestamp, disposition: "accepted", updatedAt: NOW }];
     }));
     writeFileSync(path, JSON.stringify({ threads: { "C:100": { sessionId: "s", projectDir: "/p", verbose: "on",
-      createdAt: 1, lastUsedAt: 1, historyCursorTs: "100.000000" } }, projects: {}, receipts }));
-    const s = new StateStore(path);
-    expect(s.claimMessage("C:100", "101.000000")).toBe("paused");
-    expect(s.recoveryStatus()).toEqual({ paused: true, receipts: MAX_MESSAGE_RECEIPTS, uncertain: 0 });
-    expect(s.getReceipt("C:100", "100.000001")?.disposition).toBe("accepted");
+      createdAt: NOW, lastUsedAt: NOW, historyCursorTs: ts(0) } }, projects: {}, receipts }));
+    const s = new StateStore(path, () => NOW);
+    expect(s.claimMessage("C:100", ts(3000))).toBe("paused");
+    expect(s.recoveryStatus()).toMatchObject({ paused: true, receipts: MAX_MESSAGE_RECEIPTS, uncertain: 0 });
+    expect(s.getReceipt("C:100", ts(1))?.disposition).toBe("accepted");
     expect(s.getThread("C:100")).not.toBeNull(); // old binding with evidence survives pruning
-    expect(s.confirmHistory("C:100", "100.000001")).toBe(true);
-    expect(s.claimMessage("C:100", "101.000000")).toBe("claimed");
+    expect(s.confirmHistory("C:100", ts(1))).toBe(true);
+    expect(s.claimMessage("C:100", ts(3000))).toBe("claimed");
   });
 
   it("GC expires only accepted unbound receipts, durably suppressing old deliveries and later-binding replay", () => {
@@ -230,11 +234,11 @@ describe("canonical identity and durable recovery", () => {
     expect(s.getReceipt("uncertain:root", ts)?.disposition).toBe("uncertain");
     expect(s.getReceipt("processing:root", ts)?.disposition).toBe("uncertain");
     const restarted = new StateStore(path);
-    expect(restarted.claimMessage("expire:root", ts)).toBe("accepted");
+    expect(restarted.claimMessage("expire:root", ts)).toBe("held");
     restarted.setThread("expire:root", { sessionId: "later", projectDir: "/p", verbose: "on", createdAt: now,
       lastUsedAt: now, historyCursorTs: "100.000000" });
-    expect(restarted.getThread("expire:root")!.historyCursorTs! > ts).toBe(true);
-    expect(restarted.claimMessage("expire:root", ts)).toBe("accepted");
+    expect(restarted.getThread("expire:root")!.historyCursorTs).toBe("100.000000");
+    expect(restarted.claimMessage("expire:root", ts)).toBe("held");
     // Existing bound history is not raised to a global age limit.
     expect(restarted.getThread("bound:root")?.historyCursorTs).toBe("100.000000");
   });
@@ -250,28 +254,28 @@ describe("canonical identity and durable recovery", () => {
     const s = new StateStore(path);
     const fresh = `${Math.floor(Date.now() / 1000)}.000001`;
     expect(s.claimMessage("new:root", fresh)).toBe("claimed");
-    expect(s.recoveryStatus()).toEqual({ paused: false, receipts: 1, uncertain: 0 });
+    expect(s.recoveryStatus()).toMatchObject({ paused: false, receipts: 1, uncertain: 0 });
     expect(new StateStore(path).messageReceipts()).toHaveLength(1);
   });
 
   it("requires exact user message evidence and preserves the submission association across restart", () => {
     const { store: s, path } = tempStore("receipt-evidence");
-    s.setThread("C:100", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: "100.000001" });
-    s.claimMessage("C:100", "100.000002");
-    s.associatePrompt("C:100", "100.000002", { projectDir: "/p/./", sessionId: "s", messageId: "msg_exact" });
-    const restarted = new StateStore(path);
+    s.setThread("C:100", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW, lastSeenTs: ts(1) });
+    s.claimMessage("C:100", ts(2));
+    s.associatePrompt("C:100", ts(2), { projectDir: "/p/./", sessionId: "s", messageId: "msg_exact" });
+    const restarted = new StateStore(path, () => NOW);
     const info = { id: "msg_exact", sessionID: "s", role: "user" };
-    expect(restarted.getReceipt("C:100", "100.000002")?.disposition).toBe("uncertain");
+    expect(restarted.getReceipt("C:100", ts(2))?.disposition).toBe("uncertain");
     expect(restarted.reconcilePromptAcceptance("/other", info)).toEqual([]);
     expect(restarted.reconcilePromptAcceptance("/p", { ...info, role: "assistant" })).toEqual([]);
     expect(restarted.reconcilePromptAcceptance("/p", { ...info, id: "msg_later" })).toEqual([]);
     expect(restarted.reconcilePromptAcceptance("/p", { ...info, sessionID: "different" })).toEqual([]);
     expect(restarted.reconcilePromptAcceptance("/p/", info)).toHaveLength(1);
-    restarted.settleMessage("C:100", "100.000002", "uncertain"); // late HTTP timeout cannot undo evidence
-    expect(new StateStore(path).getReceipt("C:100", "100.000002")?.disposition).toBe("accepted");
-    expect(restarted.getThread("C:100")?.historyCursorTs).toBe("100.000001");
+    restarted.settleMessage("C:100", ts(2), "uncertain"); // late HTTP timeout cannot undo evidence
+    expect(new StateStore(path, () => NOW).getReceipt("C:100", ts(2))?.disposition).toBe("accepted");
+    expect(restarted.getThread("C:100")?.historyCursorTs).toBe(ts(1));
     expect(restarted.reconcilePromptAcceptance("/p", info)).toEqual([]);
-    expect(restarted.confirmHistory("C:100", "100.000002")).toBe(true);
+    expect(restarted.confirmHistory("C:100", ts(2))).toBe(true);
   });
 });
 
@@ -279,13 +283,13 @@ describe("catch-up watermark (markThreadSeen / threadsForCatchup)", () => {
   it("advances the watermark monotonically and persists it", () => {
     const { store: s, path } = tempStore("wm");
     s.setThread("C:1", { sessionId: "ses_a", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 });
-    s.markThreadSeen("C:1", "100.000010");
-    expect(s.getThread("C:1")?.lastSeenTs).toBe("100.000010");
-    s.markThreadSeen("C:1", "100.000005"); // older — must not regress
-    expect(s.getThread("C:1")?.lastSeenTs).toBe("100.000010");
-    s.markThreadSeen("C:1", "100.000020");
-    expect(s.getThread("C:1")?.lastSeenTs).toBe("100.000020");
-    expect(new StateStore(path).getThread("C:1")?.lastSeenTs).toBe("100.000020"); // persisted
+    s.markThreadSeen("C:1", ts(10));
+    expect(s.getThread("C:1")?.lastSeenTs).toBe(ts(10));
+    s.markThreadSeen("C:1", ts(5)); // older — must not regress
+    expect(s.getThread("C:1")?.lastSeenTs).toBe(ts(10));
+    s.markThreadSeen("C:1", ts(20));
+    expect(s.getThread("C:1")?.lastSeenTs).toBe(ts(20));
+    expect(new StateStore(path, () => NOW).getThread("C:1")?.lastSeenTs).toBe(ts(20)); // persisted
   });
 
   it("is a no-op for unbound threads (a later binding seeds its own watermark)", () => {
@@ -296,61 +300,66 @@ describe("catch-up watermark (markThreadSeen / threadsForCatchup)", () => {
 
   it("threadsForCatchup filters by window, newest first", () => {
     const { store: s } = tempStore("wm-sweep");
-    const now = Date.now();
-    s.setThread("C:new", { sessionId: "a", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: now });
+    const now = NOW;
+    s.setThread("C:new", { sessionId: "a", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: now, lastSeenTs: timestampFromMs(now) });
+    s.setThread("C:recent", { sessionId: "b", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: now - 3600_000, lastSeenTs: timestampFromMs(now - 3600_000) });
     const stale = storeStale("wm-sweep", "C:old", now - 13 * 60 * 60 * 1000);
     expect(stale).toBeDefined(); // sanity
-    const s2 = new StateStore(join(FIXTURES, "wm-sweep", "state.json"));
+    const s2 = new StateStore(join(FIXTURES, "wm-sweep", "state.json"), () => now);
     const keys = s2.threadsForCatchup(now - 12 * 60 * 60 * 1000).map((r) => r.key);
-    expect(keys).toEqual(["C:new"]); // stale excluded
+    expect(keys).toEqual(["C:new", "C:recent"]); // stale excluded, newest first
   });
 
-  /** setThread bumps lastUsedAt to now — hand-write a stale binding. */
+  /** Exercise migration of a legacy binding without recovery metadata. */
   function storeStale(name: string, key: string, lastUsedAt: number): boolean {
     const dir = join(FIXTURES, name);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "state.json");
     const prev = JSON.parse(readFileSync(path, "utf8")) as { threads: Record<string, unknown>; projects: Record<string, unknown> };
-    prev.threads[key] = { sessionId: "old", projectDir: "/p", verbose: "on", lastSeenTs: "1.1", createdAt: lastUsedAt, lastUsedAt };
+    prev.threads[key] = { sessionId: "old", projectDir: "/p", verbose: "on", lastSeenTs: timestampFromMs(lastUsedAt), createdAt: lastUsedAt, lastUsedAt };
     writeFileSync(path, JSON.stringify(prev));
     return true;
   }
 });
 
-describe("seedMissingWatermarks (legacy-thread migration)", () => {
-  /** Hand-written state: exact lastUsedAt control (setThread would bump to now). */
+describe("versioned recovery migration (legacy-thread migration)", () => {
   function rawStore(name: string, threads: Record<string, unknown>): StateStore {
     const dir = join(FIXTURES, name);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "state.json");
     writeFileSync(path, JSON.stringify({ threads, projects: {} }));
-    return new StateStore(path);
+    return new StateStore(path, () => NOW);
   }
 
-  it("seeds only missing watermarks from lastUsedAt, in fixed 6-digit ts form", () => {
+  it("uses owner observation, never a recent maintenance timestamp, and never forges a cursor", () => {
     const s = rawStore("seed-basic", {
-      "C1:100.1": { sessionId: "s1", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1788763822098 },
-      // fresh lastUsedAt — the 60d-idle prune would evict a stale binding on save
-      "C2:200.2": { sessionId: "s2", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: Date.now(), lastSeenTs: "200.000002" },
-    });
-    expect(s.seedMissingWatermarks()).toBe(1);
-    expect(s.getThread("C1:100.1")?.lastSeenTs).toBe("1788763822.098000");
-    expect(s.getThread("C2:200.2")?.lastSeenTs).toBe("200.000002"); // already watermarked — untouched
-    expect(s.seedMissingWatermarks()).toBe(0); // idempotent
-  });
-
-  it("seeded ts keeps the lexical-order invariant (a 3-digit fraction would corrupt it)", () => {
-    const s = rawStore("seed-order", {
-      "C1:100.1": { sessionId: "s1", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1788763822098 },
+      "C1:100.1": { sessionId: "s1", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW },
+      "C2:200.2": { sessionId: "s2", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW, lastSeenTs: "1788220800.000002" },
     });
     s.seedMissingWatermarks();
-    s.markThreadSeen("C1:100.1", "1788763822.09"); // numerically bigger, lexically smaller — must not regress
-    expect(s.getThread("C1:100.1")?.lastSeenTs).toBe("1788763822.098000");
-    s.markThreadSeen("C1:100.1", "1788763823.000000");
-    expect(s.getThread("C1:100.1")?.lastSeenTs).toBe("1788763823.000000");
+    expect(s.getThread("C1:100.1")?.lastSeenTs).toBeUndefined();
+    expect(s.getThread("C1:100.1")?.recovery?.ownerActivityTs).toBeUndefined();
+    expect(s.getThread("C2:200.2")?.recovery).toMatchObject({ version: 1, ownerActivityTs: "1788220800.000002", replayFloorTs: replayFloor(NOW) });
+    expect(s.getThread("C2:200.2")?.historyCursorTs).toBeUndefined();
+    const once = readFileSync(join(FIXTURES, "seed-basic", "state.json"), "utf8");
+    s.seedMissingWatermarks();
+    expect(readFileSync(join(FIXTURES, "seed-basic", "state.json"), "utf8")).toBe(once);
   });
 
-  it("falls back to createdAt when lastUsedAt is missing (kept alive by a pending tombstone)", () => {
+  it("keeps confirmed cursors and compares owner observation at microsecond precision", () => {
+    const s = rawStore("seed-order", {
+      "C1:100.1": { sessionId: "s1", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW,
+        lastSeenTs: "1790035000.098000", historyCursorTs: "1790034999.000000" },
+    });
+    s.seedMissingWatermarks();
+    s.markThreadSeen("C1:100.1", "1790035000.09");
+    expect(s.getThread("C1:100.1")?.lastSeenTs).toBe("1790035000.098000");
+    s.markThreadSeen("C1:100.1", "1790035001.000000");
+    expect(s.getThread("C1:100.1")?.lastSeenTs).toBe("1790035001.000000");
+    expect(s.getThread("C1:100.1")?.historyCursorTs).toBe("1790034999.000000");
+  });
+
+  it("keeps ambiguous pending evidence without manufacturing owner activity from createdAt", () => {
     const s = rawStore("seed-fallback", {
       // missing lastUsedAt → prune-eligible; the pendingRun tombstone keeps it
       // through the seed save (a tombstoned thread must still get a sane
@@ -363,7 +372,44 @@ describe("seedMissingWatermarks (legacy-thread migration)", () => {
         pendingRun: { userMsgTs: [] },
       },
     });
-    expect(s.seedMissingWatermarks()).toBe(1);
-    expect(s.getThread("C1:100.1")?.lastSeenTs).toBe("1788763811.111000");
+    s.seedMissingWatermarks();
+    expect(s.getThread("C1:100.1")?.lastSeenTs).toBeUndefined();
+    expect(s.getThread("C1:100.1")?.pendingRun).toBeDefined();
+  });
+
+  it("maintenance does not refresh activity and cancellation/terminal evidence survives restart", () => {
+    const { store: s, path } = tempStore("lifecycle");
+    s.setThread("C:T", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: NOW,
+      lastUsedAt: NOW, lastSeenTs: ts(1), historyCursorTs: ts(0) });
+    s.markThreadSeen("C:T", ts(2));
+    const before = s.getThread("C:T")!;
+    s.setThread("C:T", { ...before, pendingRun: { userMsgTs: [ts(2)], statusTs: "status" } });
+    s.recordRunOutcome("C:T", "s", "active");
+    s.cancelRecovery("C:T", ts(3));
+    s.recordRunOutcome("C:T", "s", "completed"); // stale idle after stop cannot undo stop
+    s.setThread("C:T", { ...s.getThread("C:T")!, pendingRun: undefined });
+    const restarted = new StateStore(path, () => NOW + 86400_000);
+    expect(restarted.getThread("C:T")?.lastUsedAt).toBe(before.lastUsedAt);
+    expect(restarted.getThread("C:T")?.recovery?.lastRun?.outcome).toBe("stopped");
+    expect(restarted.getThread("C:T")?.recovery?.canceledThroughTs).toBe(ts(3));
+    expect(restarted.getThread("C:T")?.pendingRun).toBeUndefined();
+    const generation = restarted.bindingGeneration("C:T");
+    restarted.setThread("C:T", { ...restarted.getThread("C:T")!, sessionId: "replacement" });
+    expect(restarted.bindingGeneration("C:T")).toBe(generation + 1);
+  });
+
+  it("retirement advances the replay floor without changing uncertain acceptance evidence", () => {
+    const { store: s, path } = tempStore("retirement");
+    s.setThread("C:T", { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW, historyCursorTs: ts(0) });
+    s.claimMessage("C:T", ts(1));
+    s.settleMessage("C:T", ts(1), "uncertain");
+    s.recordRecoveryDecision("C:T", ts(1), { decision: "held", reason: "submission_uncertain" });
+    s.retireHistory("C:T", ts(3));
+    const restarted = new StateStore(path, () => NOW);
+    expect(restarted.getReceipt("C:T", ts(1))?.disposition).toBe("uncertain");
+    expect(restarted.isMessageAccepted("C:T", ts(1))).toBe(false);
+    expect(restarted.isMessageAccepted("C:T", ts(2))).toBe(false);
+    expect(restarted.claimMessage("C:T", ts(2))).toBe("held");
+    expect(restarted.getThread("C:T")?.historyCursorTs).toBe(ts(0));
   });
 });

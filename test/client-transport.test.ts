@@ -63,12 +63,12 @@ describe("OpenCode request deadlines", () => {
 
   it("reads actual SDK session-status map and leaves absent sessions absent", async () => {
     vi.stubGlobal("fetch", vi.fn(async (request: Request) => {
-      expect(request.url).toBe("http://localhost:4096/session/status");
-      return Response.json({ s1: { type: "busy" }, s2: { type: "retry", attempt: 1, message: "later", next: 123 } });
+      expect(request.url).toBe("http://localhost:4096/api/session/active");
+      return Response.json({ data: { s1: { type: "running" }, s2: { type: "running" } } });
     }));
     const statuses = await sessionStatus(makeClient("http://localhost:4096"));
     expect(statuses.s1).toEqual({ type: "busy" });
-    expect(statuses.s2?.type).toBe("retry");
+    expect(statuses.s2?.type).toBe("busy");
     expect(statuses.absent).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
   });

@@ -3,6 +3,12 @@ import type { ServerPool } from "../opencode/server.js";
 import type { StateStore, ThreadState } from "../state.js";
 import type { RenderDeps } from "../slack/render.js";
 import type { ParsedCmd } from "./parse.js";
+import type { PermissionResponseInput, PermissionResponseResult } from "../slack/permissions.js";
+
+export interface PermissionCommands {
+  list(context: PermissionResponseInput["context"], refresh?: boolean): Promise<string>;
+  respond(input: PermissionResponseInput): Promise<PermissionResponseResult>;
+}
 
 export interface CmdCtx {
   channelId: string;
@@ -10,6 +16,13 @@ export interface CmdCtx {
   threadTs: string;
   /** state key `${channel}:${threadTs}` */
   threadKey: string;
+  messageTs?: string;
+  source?: "live" | "history";
+  ownerDm?: boolean;
+  schedules?: ScheduleCommands;
+  permissions?: PermissionCommands;
+  questions?(context: { threadKey: string } | { dm: true }, beforeRefresh?: (status: string) => Promise<void>): Promise<string | void>;
+  resumeQuestions?(context: { threadKey: string; sessionId: string; generation: number; ownerTs: string }): Promise<void>;
   /** Bound OpenCode session for this thread, if any. */
   thread: ThreadState | null;
   state: StateStore;
@@ -35,6 +48,13 @@ export interface CmdCtx {
    * Optional everywhere else so non-Slack contexts (tests) can omit it.
    */
   render?: RenderDeps;
+}
+
+/** Scheduled work has its own authority and never masquerades as owner input. */
+export interface ScheduleCommands {
+  run(ctx: CmdCtx, args: string): Promise<void>;
+  busy(threadKey: string): boolean;
+  cancelThread(threadKey: string): Promise<void>;
 }
 
 export interface CmdDef {

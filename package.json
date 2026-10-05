@@ -13,6 +13,7 @@
     "dist",
     "manifest",
     "docs",
+    "skills",
     "README.md"
   ],
   "scripts": {
@@ -31,12 +32,15 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@opencode-ai/sdk": "^1.18.25",
+    "@opencode/client": "^2.0.12",
     "@slack/bolt": "^5.0.0",
+    "@slack/web-api": "8.1.1",
+    "cron-parser": "^5.10.1",
     "diff": "^9.0.0",
     "jimp": "^1.6.1"
   },
   "devDependencies": {
+    "@opencode/plugin": "2.0.12",
     "@types/diff": "^7.0.2",
     "@types/node": "^24",
     "tsup": "^8",

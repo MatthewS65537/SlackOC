@@ -25,6 +25,10 @@ Usage:
   slackoc daemon status     is the service loaded/active?
   slackoc daemon uninstall  remove the service
   slackoc doctor            sanity-check tokens + OpenCode install
+  slackoc send-file         send one file to an existing session's Slack thread
+      --file </abs/path>    required: local regular file, at most 50 MiB
+      --session <ses_…>     required: exact session (no DM fallback)
+      --comment <text>      optional: introduction, at most 2000 characters
   slackoc help              this text
   slackoc --version
 
@@ -90,6 +94,11 @@ async function main(): Promise<void> {
       parseFlags(rest, []);
       const { runDoctor } = await import("./doctor.js");
       process.exitCode = await runDoctor();
+      break;
+    }
+    case "send-file": {
+      const { runSendFileCommand } = await import("./send-file.js");
+      await runSendFileCommand(rest);
       break;
     }
     case "help":

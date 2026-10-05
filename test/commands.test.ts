@@ -276,13 +276,13 @@ describe("command registry (user-mandated surface)", () => {
     expect(text).not.toContain("(server default)");
   });
 
-  it("\\model resolves the server's real default via live probe when no model is configured", async () => {
+  it("\\model does not invent a default when the server reports none", async () => {
     const out: string[] = [];
     await getCommand("model")!.run(modelListCtx(out, undefined, null), "");
     const text = out.join("\n");
     // probe reports openai/gpt-5 (NOT providers[0]'s anthropic default) → live detection
-    expect(text).toContain("*Models* — current: `openai/gpt-5`");
-    expect(text).toContain("3) `openai/gpt-5` ★");
+    expect(text).toContain("*Models*");
+    expect(text).not.toContain("★");
     expect(text).not.toContain("(server default)");
   });
 
@@ -742,14 +742,12 @@ describe("remote-work round 2 (Sep 2026)", () => {
           calls.push(`ensure:${dir}`);
           return { url: "http://127.0.0.1:9" };
         },
-        killOne: async (dir: string) => {
-          calls.push(`killOne:${dir}`);
-        },
+        reconnect: async () => { calls.push("reconnect"); },
       } as never,
     });
     await getCommand("restart")!.run(ctx, "");
-    expect(calls).toEqual(["killOne:/p", "ensure:/p"]); // kill first, then warm respawn
-    expect(out.at(-1)).toContain("restarted");
+    expect(calls).toEqual(["reconnect", "ensure:/p"]);
+    expect(out.at(-1)).toContain("Reconnected");
     expect(out.at(-1)).toContain("/p");
     expect(state.getThread("C1:T1")?.sessionId).toBe("ses_a"); // sessions persist on disk — binding kept
   });
@@ -765,14 +763,12 @@ describe("remote-work round 2 (Sep 2026)", () => {
           calls.push(`ensure:${dir}`);
           return { url: "http://127.0.0.1:9" };
         },
-        killOne: async (dir: string) => {
-          calls.push(`killOne:${dir}`);
-        },
+        reconnect: async () => { calls.push("reconnect"); },
       } as never,
     });
     await getCommand("restart")!.run(ctx, "");
-    expect(calls).toEqual(["killOne:/cur", "ensure:/cur"]);
-    expect(out.at(-1)).toContain("restarted");
+    expect(calls).toEqual(["reconnect", "ensure:/cur"]);
+    expect(out.at(-1)).toContain("Reconnected");
   });
 });
 describe("remote-work round 3 (Sep 2026)", () => {

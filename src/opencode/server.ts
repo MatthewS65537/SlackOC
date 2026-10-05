@@ -1,23 +1,15 @@
-/** One generation-owned OpenCode child and event stream per canonical project. */
-import { spawn } from "node:child_process";
+/** Project handles over OpenCode V2's shared, authenticated background service. */
+import { Service } from "@opencode/client/service";
 import { canonicalDir } from "../paths.js";
-import { abortableFetch, abortableSleep, HEALTH_TIMEOUT_MS } from "../http.js";
-import { makeClient, sseEvents, type OCClient } from "./client.js";
-import { logErr } from "../log.js";
+import { abortableSleep } from "../http.js";
+import { isSupportedOpencodeVersion } from "../version.js";
+import { clientEvents, makeClient, type OCClient } from "./client.js";
 
 export type ConnectionState = "connecting" | "connected" | "reconnecting" | "disconnected";
-export interface PoolServerInfo {
-  dir: string;
-  url: string | null;
-  status: "starting" | "ready" | "dead";
-}
-
-export interface PoolEntry {
-  dir: string;
-  url: string | null;
+export interface PoolServerInfo { dir: string; url: string | null; status: "starting" | "ready" | "dead" }
+export interface PoolEntry extends PoolServerInfo {
   baseUrl: string | null;
   client: OCClient | null;
-  status: "starting" | "ready" | "dead";
   ready: Promise<void>;
   sseAbort: AbortController | null;
   proc: import("node:child_process").ChildProcess | null;
@@ -26,306 +18,181 @@ export interface PoolEntry {
   lastUsedAt?: number;
   connectionState?: ConnectionState;
 }
-
-interface ManagedEntry extends PoolEntry {
-  lifetime: AbortController;
-  cancelStart: (reason: Error) => void;
-  lastHealthAt: number;
-  requests: number;
-}
-
 export interface PoolHooks {
   isBusy?: (dir: string) => boolean;
   onConnectionState?: (dir: string, state: ConnectionState) => void;
 }
-
-export interface RequestLease {
-  entry: PoolEntry;
-  /** Idempotent; release in finally after session creation/submission. */
-  release: () => void;
-}
-
+export interface RequestLease { entry: PoolEntry; release: () => void }
 export const STALE_HEALTH_MS = 30_000;
-export function shouldNotifyDeath(wasReady: boolean, killedIntentionally: boolean): boolean {
-  return wasReady && !killedIntentionally;
-}
-export function isActivityEvent(type: string): boolean {
-  return type !== "server.heartbeat" && type !== "server.connected";
-}
-export function shouldReap(
-  e: { status: string; lastEventAt: number; lastUsedAt?: number },
-  now: number, maxIdleMs: number, busy: boolean,
-): boolean {
-  return e.status === "ready" && !busy && now - Math.max(e.lastEventAt, e.lastUsedAt ?? 0) > maxIdleMs;
+export function shouldNotifyDeath(wasReady: boolean, intentional: boolean): boolean { return wasReady && !intentional; }
+export function isActivityEvent(type: string): boolean { return type !== "server.heartbeat" && type !== "server.connected"; }
+export function shouldReap(e: { status: string; lastEventAt: number; lastUsedAt?: number }, now: number, ttl: number, busy: boolean): boolean {
+  return e.status === "ready" && !busy && now - Math.max(e.lastEventAt, e.lastUsedAt ?? 0) > ttl;
 }
 
 export class ServerPool {
-  private entries = new Map<string, ManagedEntry>();
-  private ensureLocks = new Map<string, { promise: Promise<PoolEntry>; abort: AbortController }>();
+  private entries = new Map<string, PoolEntry>();
   private leases = new Map<string, number>();
+  private lifetime = new AbortController();
+  private endpoint?: { url: string; headers?: Record<string, string> };
+  private discovering?: Promise<void>;
+  private streamAbort?: AbortController;
+  private stream?: Promise<void>;
+  private eventClient?: OCClient;
   private closed = false;
+  private connected = false;
+  private waiters = new Set<() => void>();
 
   constructor(
     private onEvent: (dir: string, eventType: string, properties: Record<string, unknown>) => void,
-    private log: (msg: string) => void = () => {},
+    private log: (message: string) => void = () => {},
     private onDeath?: (dir: string, code: number | null) => void,
     private onResume?: (dir: string, gapMs: number) => void,
     private onReady?: (dir: string, baseUrl: string) => void,
     private hooks: PoolHooks = {},
   ) {}
 
-  private current(entry: ManagedEntry): boolean {
-    return this.entries.get(entry.dir) === entry && !entry.lifetime.signal.aborted;
-  }
-
-  private connection(entry: ManagedEntry, state: ConnectionState): void {
-    if (entry.connectionState === state) return;
-    entry.connectionState = state;
-    try { this.hooks.onConnectionState?.(entry.dir, state); }
-    catch (err) { this.log(`connection callback failed: ${String(err)}`); }
-  }
-
-  /** Reservations start before ensure, closing the startup/session-create reaper gap. */
-  async acquire(dir: string): Promise<RequestLease> {
-    if (this.closed) throw new Error("server pool is closed");
-    const key = canonicalDir(dir);
-    this.leases.set(key, (this.leases.get(key) ?? 0) + 1);
-    let released = false;
-    let held: ManagedEntry | undefined;
-    const release = () => {
-      if (released) return;
-      released = true;
-      const n = (this.leases.get(key) ?? 1) - 1;
-      if (n) this.leases.set(key, n); else this.leases.delete(key);
-      if (held) { held.requests--; held.lastUsedAt = Date.now(); }
-    };
-    try {
-      held = await this.ensure(key) as ManagedEntry;
-      held.requests++;
-      return { entry: held, release };
+  private connection(state: ConnectionState): void {
+    for (const entry of this.entries.values()) {
+      if (entry.connectionState === state) continue;
+      entry.connectionState = state;
+      this.hooks.onConnectionState?.(entry.dir, state);
     }
-    catch (err) { release(); throw err; }
+  }
+
+  private discover(): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("server pool is closed"));
+    if (this.discovering) return this.discovering;
+    this.discovering = (async () => {
+      const endpoint = await Service.ensure({ version: isSupportedOpencodeVersion });
+      this.lifetime.signal.throwIfAborted();
+      this.endpoint = { url: endpoint.url, headers: Service.headers(endpoint) };
+      for (const entry of this.entries.values()) entry.url = entry.baseUrl = endpoint.url;
+      this.log(`OpenCode V2 service connected: ${endpoint.url}`);
+    })().finally(() => { this.discovering = undefined; });
+    return this.discovering;
+  }
+
+  private client(dir?: string): OCClient {
+    return makeClient(this.endpoint!.url, { directory: dir, signal: this.lifetime.signal,
+      endpoint: () => this.endpoint!, onFault: () => {
+        // Never retry a mutating request here. Refresh discovery/event observation only.
+        this.streamAbort?.abort(new Error("OpenCode request transport failed"));
+      } });
   }
 
   ensure(dir: string): Promise<PoolEntry> {
     if (this.closed) return Promise.reject(new Error("server pool is closed"));
     const key = canonicalDir(dir);
-    const pending = this.ensureLocks.get(key);
-    if (pending) return pending.promise;
-    const abort = new AbortController();
-    // Publish the lock before any user callback or spawn can re-enter the pool.
-    const lock = { abort, promise: null as unknown as Promise<PoolEntry> };
-    lock.promise = Promise.resolve().then(async () => {
-      abort.signal.throwIfAborted();
-      let entry = this.entries.get(key);
-      if (entry?.status === "ready" && Date.now() - entry.lastHealthAt >= STALE_HEALTH_MS) {
-        try {
-          await this.probe(entry.baseUrl!, AbortSignal.any([abort.signal, entry.lifetime.signal]));
-          if (!this.current(entry)) throw new Error("server generation replaced during health check");
-          entry.lastHealthAt = Date.now();
-        } catch (err) {
-          abort.signal.throwIfAborted();
-          if (!this.current(entry)) throw err;
-          this.connection(entry, "reconnecting");
-          // Leases reserve incoming work; existing requests/views protect work already accepted.
-          if (entry.requests || this.hooks.isBusy?.(key)) throw err;
-          this.retire(entry, new Error("idle server failed health check"));
-          entry = undefined;
-        }
+    const existing = this.entries.get(key);
+    if (existing) return existing.ready.then(() => existing);
+    const entry: PoolEntry = { dir: key, url: null, baseUrl: null, status: "starting", client: null,
+      ready: Promise.resolve(), sseAbort: null, proc: null, lastEventAt: Date.now(), lastUsedAt: Date.now(), connectionState: "connecting" };
+    this.entries.set(key, entry);
+    entry.ready = (async () => {
+      if (!this.endpoint) await this.discover();
+      if (this.closed || this.entries.get(key) !== entry) throw new Error("server handle canceled during startup");
+      entry.url = entry.baseUrl = this.endpoint!.url;
+      entry.client = this.client(key);
+      entry.status = "ready";
+      this.hooks.onConnectionState?.(key, "connecting");
+      if (!this.stream) {
+        this.eventClient = this.client();
+        this.stream = this.pipeEvents();
       }
-      abort.signal.throwIfAborted();
-      if (!entry || entry.status === "dead") entry = this.spawn(key);
-      await entry.ready;
-      abort.signal.throwIfAborted();
-      if (!this.current(entry)) throw new Error("server generation replaced during startup");
-      entry.lastUsedAt = Date.now();
-      return entry;
-    }).finally(() => {
-      if (this.ensureLocks.get(key) === lock) this.ensureLocks.delete(key);
+      if (!this.connected) await new Promise<void>((resolve, reject) => {
+        const ready = () => { clearTimeout(timer); this.waiters.delete(ready); resolve(); };
+        const timer = setTimeout(() => { this.waiters.delete(ready); reject(new Error("OpenCode event connection did not become ready within 10s")); }, 10_000);
+        this.waiters.add(ready);
+      });
+      if (this.closed || this.entries.get(key) !== entry) throw new Error("server handle canceled during startup");
+      entry.connectionState = "connected";
+      this.hooks.onConnectionState?.(key, "connected");
+      this.onReady?.(key, entry.url);
+    })().catch(err => {
+      if (this.entries.get(key) === entry) this.entries.delete(key);
+      entry.status = "dead"; throw err;
     });
-    this.ensureLocks.set(key, lock);
-    return lock.promise;
+    return entry.ready.then(() => entry);
   }
 
+  private lease(entry: PoolEntry): RequestLease {
+    this.leases.set(entry.dir, (this.leases.get(entry.dir) ?? 0) + 1);
+    let released = false;
+    return { entry, release: () => {
+      if (released) return; released = true;
+      this.leases.set(entry.dir, Math.max(0, (this.leases.get(entry.dir) ?? 1) - 1));
+      entry.lastUsedAt = Date.now();
+    } };
+  }
+  async acquire(dir: string): Promise<RequestLease> { return this.lease(await this.ensure(dir)); }
+  acquireExisting(dir: string): RequestLease | undefined {
+    const entry = this.get(dir);
+    return !this.closed && entry ? this.lease(entry) : undefined;
+  }
   get(dir: string): PoolEntry | null {
     const entry = this.entries.get(canonicalDir(dir));
     return entry?.status === "ready" ? entry : null;
   }
-
-  reapIdle(maxIdleMs: number, isBusy: (dir: string) => boolean, now = Date.now()): number {
-    let count = 0;
-    for (const entry of [...this.entries.values()]) {
-      const busy = !!(this.ensureLocks.has(entry.dir) || this.leases.get(entry.dir) || entry.requests ||
-        this.hooks.isBusy?.(entry.dir) || isBusy(entry.dir));
-      if (this.current(entry) && shouldReap(entry, now, maxIdleMs, busy)) {
-        count++;
-        this.log(`idle reaper: stopping opencode server for ${entry.dir}`);
-        // Retire this identity synchronously; never look up and kill a later replacement.
-        this.retire(entry, new Error("idle server reaped"));
-      }
-    }
-    return count;
+  list(): PoolServerInfo[] { return [...this.entries.values()].map(({ dir, url, status }) => ({ dir, url, status })); }
+  // The shared service owns idle resource management. Keeping handles warm costs no process.
+  reapIdle(_ttl: number, _isBusy: (dir: string) => boolean, _now = Date.now()): number { return 0; }
+  async killOne(dir: string): Promise<void> {
+    const key = canonicalDir(dir); const entry = this.entries.get(key);
+    if (!entry) return;
+    entry.status = "dead"; entry.killedIntentionally = true;
+    this.entries.delete(key);
+    this.hooks.onConnectionState?.(key, "disconnected");
   }
-
-  list(): PoolServerInfo[] {
-    return [...this.entries.values()].map((e) => ({ dir: e.dir, url: e.baseUrl, status: e.status }));
-  }
-
-  async killAll(): Promise<void> {
-    for (const key of new Set([...this.entries.keys(), ...this.ensureLocks.keys()])) await this.killOne(key);
-  }
-
-  /** Bridge shutdown is terminal; late handlers cannot spawn replacement children. */
+  async killAll(): Promise<void> { for (const key of this.entries.keys()) await this.killOne(key); }
   async close(): Promise<void> {
     this.closed = true;
+    this.lifetime.abort(new Error("bridge closed"));
+    this.streamAbort?.abort();
+    for (const ready of this.waiters) ready();
     await this.killAll();
+    await this.stream;
+    // Never stop a service owned by OpenCode or another interface.
+  }
+  async reconnect(): Promise<void> {
+    await this.discover();
+    this.streamAbort?.abort(new Error("reconnect requested"));
   }
 
-  async killOne(dir: string): Promise<void> {
-    const key = canonicalDir(dir);
-    this.ensureLocks.get(key)?.abort.abort(new Error("server startup/use canceled"));
-    this.ensureLocks.delete(key);
-    const entry = this.entries.get(key);
-    if (entry) this.retire(entry, new Error("server stopped"));
-  }
-
-  private retire(entry: ManagedEntry, reason: Error): void {
-    if (entry.killedIntentionally) return;
-    const current = this.entries.get(entry.dir) === entry;
-    if (current) this.entries.delete(entry.dir);
-    entry.killedIntentionally = true;
-    entry.status = "dead";
-    entry.cancelStart(reason);
-    entry.lifetime.abort(reason);
-    entry.sseAbort?.abort(reason);
-    if (current) this.connection(entry, "disconnected");
-    try {
-      if (entry.proc?.pid && process.platform !== "win32") process.kill(-entry.proc.pid, "SIGTERM");
-    } catch { /* already gone */ }
-    try { entry.proc?.kill("SIGTERM"); } catch { /* already gone */ }
-  }
-
-  private spawn(dir: string): ManagedEntry {
-    const child = spawn("opencode", ["serve", "--hostname=127.0.0.1", "--port=0"], {
-      cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: process.platform !== "win32",
-    });
-    const entry: ManagedEntry = {
-      dir, url: null, baseUrl: null, client: null, status: "starting", ready: null as unknown as Promise<void>,
-      sseAbort: null, proc: child, lastEventAt: Date.now(), lastUsedAt: Date.now(), lastHealthAt: 0,
-      lifetime: new AbortController(), cancelStart: () => {}, requests: 0,
-    };
-    this.entries.set(dir, entry);
-    let output = "";
-    entry.ready = new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let probing = false;
-      const finish = (error?: Error, url?: string) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        child.stdout?.removeListener("data", onData);
-        if (error || !this.current(entry)) {
-          reject(error ?? new Error("obsolete server startup"));
-          this.retire(entry, error ?? new Error("obsolete server startup"));
-          return;
-        }
-        entry.url = entry.baseUrl = url!;
-        entry.client = makeClient(url!, { signal: entry.lifetime.signal, onRequest: () => {
-          entry.requests++;
-          entry.lastUsedAt = Date.now();
-          return () => { entry.requests--; entry.lastUsedAt = Date.now(); };
-        } });
-        entry.status = "ready";
-        entry.lastHealthAt = Date.now();
-        this.log(`opencode server for ${dir} listening on ${url}`);
-        resolve();
-        void this.pipeEvents(entry);
-        try { this.onReady?.(dir, url!); } catch (err) { this.log(`onReady failed: ${String(err)}`); }
-      };
-      entry.cancelStart = (err) => finish(err);
-      const timer = setTimeout(() => finish(new Error(`opencode serve in ${dir} did not start within 45s`)), 45_000);
-      const onData = (chunk: Buffer) => {
-        output = (output + chunk.toString()).slice(-16_384);
-        const match = output.match(/https?:\/\/127\.0\.0\.1:\d+/);
-        if (!probing && !settled && match) {
-          probing = true;
-          void this.waitHealthy(match[0], entry.lifetime.signal).then(
-            () => finish(undefined, match[0]), (err: Error) => finish(err),
-          );
-        }
-      };
-      child.stdout?.on("data", onData);
-      child.stderr?.on("data", (chunk: Buffer) => {
-        if (!settled) onData(chunk);
-        this.log(`opencode[${dir}] stderr: ${chunk.toString().trim()}`);
-      });
-      child.on("error", (err) => finish(new Error(`failed to spawn opencode: ${err.message}`)));
-      child.on("exit", (code) => {
-        const current = this.entries.get(dir) === entry;
-        const notify = current && shouldNotifyDeath(entry.status === "ready", !!entry.killedIntentionally);
-        this.log(`opencode server for ${dir} exited with code ${code}`);
-        if (current) this.entries.delete(dir);
-        entry.status = "dead";
-        entry.lifetime.abort(new Error("server exited"));
-        entry.sseAbort?.abort();
-        finish(new Error(`opencode serve exited early (code ${code}):\n${output.slice(-2000)}`));
-        if (current) this.connection(entry, "disconnected");
-        if (notify) {
-          try { this.onDeath?.(dir, code); } catch (err) { this.log(`onDeath failed: ${String(err)}`); }
-        }
-      });
-    });
-    this.connection(entry, "connecting");
-    return entry;
-  }
-
-  private async probe(url: string, signal: AbortSignal, timeoutMs = HEALTH_TIMEOUT_MS): Promise<void> {
-    const res = await abortableFetch(`${url}/api/health`, {}, { signal, timeoutMs });
-    if (!res.ok) throw new Error(`server health failed: HTTP ${res.status}`);
-  }
-
-  private async waitHealthy(url: string, signal: AbortSignal): Promise<void> {
-    const deadline = Date.now() + 15_000;
-    for (;;) {
-      signal.throwIfAborted();
-      try { await this.probe(url, signal, Math.min(HEALTH_TIMEOUT_MS, Math.max(1, deadline - Date.now()))); return; }
-      catch (err) { signal.throwIfAborted(); if (Date.now() >= deadline) throw err; }
-      await abortableSleep(Math.min(250, deadline - Date.now()), signal);
-    }
-  }
-
-  private async pipeEvents(entry: ManagedEntry): Promise<void> {
-    const abort = new AbortController();
-    entry.sseAbort = abort;
-    const signal = AbortSignal.any([abort.signal, entry.lifetime.signal]);
-    let backoffMs = 1000;
-    let downSince: number | null = null;
-    while (!signal.aborted && this.current(entry) && entry.status === "ready") {
+  private async pipeEvents(): Promise<void> {
+    let delay = 100; let downSince = Date.now(); let connected = false;
+    while (!this.closed) {
+      this.streamAbort = new AbortController();
+      const signal = AbortSignal.any([this.lifetime.signal, this.streamAbort.signal]);
       try {
-        this.log(`SSE subscribing to ${entry.baseUrl}/event`);
-        for await (const event of sseEvents(entry.baseUrl!, signal)) {
-          if (!this.current(entry) || signal.aborted) break;
-          backoffMs = 1000;
-          this.connection(entry, "connected");
-          if (downSince !== null) {
-            const gap = Date.now() - downSince;
-            downSince = null;
-            try { this.onResume?.(entry.dir, gap); } catch (err) { this.log(`onResume failed: ${String(err)}`); }
-            if (gap > 5 * 60_000) logErr(`SSE for ${entry.dir} was disconnected for ${Math.round(gap / 60_000)}m — reconciling missed events`);
+        for await (const event of clientEvents(this.eventClient!, signal)) {
+          if (this.closed) return;
+          if (!connected) {
+            connected = true; delay = 100;
+            this.connected = true;
+            for (const ready of this.waiters) ready();
+            this.connection("connected");
+            for (const entry of this.entries.values()) this.onResume?.(entry.dir, Date.now() - downSince);
           }
-          if (isActivityEvent(event.type)) entry.lastEventAt = Date.now();
-          try { this.onEvent(entry.dir, event.type, (event.properties ?? {}) as Record<string, unknown>); }
-          catch (err) { this.log(`event handler error: ${String(err)}`); }
+          const props = (event.properties ?? {}) as Record<string, unknown>;
+          // Native events carry location; a session-bound event lacking one is resolved by start.ts.
+          const dir = event.directory ? canonicalDir(event.directory) : this.entries.keys().next().value;
+          if (!dir || (event.directory && !this.entries.has(dir))) continue;
+          const entry = this.entries.get(dir);
+          if (entry && isActivityEvent(event.type)) entry.lastEventAt = Date.now();
+          this.onEvent(dir, event.type, props);
         }
-      } catch (err) {
-        if (signal.aborted) break;
-        this.log(`SSE error for ${entry.dir}: ${String(err)}`);
-      }
-      if (signal.aborted || !this.current(entry)) break;
-      downSince ??= Date.now();
-      this.connection(entry, "reconnecting");
-      try { await abortableSleep(backoffMs, signal); } catch { break; }
-      backoffMs = Math.min(backoffMs * 2, 15_000);
+      } catch (err) { if (!this.closed) this.log(`OpenCode event connection: ${String(err)}`); }
+      if (this.closed) return;
+      if (connected) downSince = Date.now();
+      connected = false;
+      this.connected = false;
+      this.connection("reconnecting");
+      try {
+        await abortableSleep(delay, this.lifetime.signal);
+        await this.discover();
+      } catch (err) { if (this.closed) return; this.log(`OpenCode discovery: ${String(err)}`); }
+      delay = Math.min(delay * 2, 5_000);
     }
   }
 }

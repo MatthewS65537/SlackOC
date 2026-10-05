@@ -83,7 +83,7 @@ echo
 echo "✓ slackoc installed ($(slackoc --version))"
 echo
 echo "Next steps:"
-echo "  1. Make sure opencode >= 1.18 is installed and authenticated"
+echo "  1. Make sure OpenCode V2 >= 2.0.12 is installed and authenticated"
 echo "  2. slackoc init    # one-time: create the Slack app from the bundled manifest, paste tokens"
 echo "  3. slackoc start   # bridge online"
 echo

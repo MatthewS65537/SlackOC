@@ -1,224 +1,133 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import {
-  detectDefaultModel, pendingPermissions, pendingQuestions, questionReply, questionReject,
-  sessionIdle, sessionMessages, sessionStatus,
-} from "../src/opencode/client.js";
+import { makeClient, detectDefaultModel, pendingPermissions, pendingQuestions, questionReply, questionReject,
+  sessionIdle, sessionMessages, sessionStatus, promptAsync, permRespond } from "../src/opencode/client.js";
+import { formAnswer, visibleQuestions, normalizeForm, V2Events } from "../src/opencode/v2.js";
+import type { FormInfo, V2Event } from "@opencode/client";
 
-/**
- * Fake OCClient whose session methods record calls. `assistant` is the model
- * the server stamps on the assistant message (what a real prompt would use).
- */
-function fakeClient(opts: { assistant?: { providerID: string; modelID: string }; throwOnCreate?: boolean }) {
-  const calls: string[] = [];
-  const client = {
-    session: {
-      create: async () => {
-        calls.push("create");
-        if (opts.throwOnCreate) throw new Error("boom");
-        return { data: { id: "ses_probe" } };
-      },
-      promptAsync: async () => {
-        calls.push("promptAsync");
-        return { data: {} };
-      },
-      messages: async () => {
-        calls.push("messages");
-        const arr: Array<{ info: { role: string; providerID?: string; modelID?: string }; parts: unknown[] }> = [
-          { info: { role: "user" }, parts: [] },
-        ];
-        if (opts.assistant) arr.push({ info: { role: "assistant", ...opts.assistant }, parts: [] });
-        return arr;
-      },
-      abort: async () => {
-        calls.push("abort");
-        return { data: {} };
-      },
-      delete: async () => {
-        calls.push("delete");
-        return { data: {} };
-      },
-    },
-  } as never;
-  return { client, calls };
+afterEach(() => vi.unstubAllGlobals());
+const form: FormInfo = { id: "frm_test", sessionID: "ses_test", title: "Choose", fields: [
+  { key: "framework", type: "string", options: [{ label: "React (recommended)", value: "react" }] },
+  { key: "features", type: "multiselect", options: [{ label: "TypeScript", value: "ts" }] },
+] };
+function wire(handler: (request: Request) => Response | Promise<Response>) {
+  const mock = vi.fn((input: Request) => handler(input)); vi.stubGlobal("fetch", mock); return mock;
 }
 
-describe("detectDefaultModel", () => {
-  // Unique project dir per test: the cache is module-level and keyed by dir.
-  it("reads the model the server assigns, then tears down the probe session", async () => {
-    const { client, calls } = fakeClient({ assistant: { providerID: "airouter", modelID: "Qwen3.8" } });
-    const m = await detectDefaultModel(client, "/proj/read-model");
-    expect(m).toBe("airouter/Qwen3.8");
-    expect(calls).toContain("abort");
-    expect(calls).toContain("delete");
+describe("V2 HTTP contracts", () => {
+  it("gets the configured default without creating a session or sending a ping", async () => {
+    const calls = wire(request => {
+      expect(new URL(request.url).pathname).toBe("/api/model/default");
+      return Response.json({ location: { directory: "/project" }, data: { id: "model", providerID: "provider" } });
+    });
+    expect(await detectDefaultModel(makeClient("http://fixture", { directory: "/project" }), "/project")).toBe("provider/model");
+    expect(calls).toHaveBeenCalledOnce();
   });
-
-  it("caches per project dir — a repeat call creates no new session", async () => {
-    const { client, calls } = fakeClient({ assistant: { providerID: "airouter", modelID: "Qwen3.8" } });
-    await detectDefaultModel(client, "/proj/cache-hit");
-    const afterFirst = calls.filter((c) => c === "create").length;
-    await detectDefaultModel(client, "/proj/cache-hit");
-    const afterSecond = calls.filter((c) => c === "create").length;
-    expect(afterFirst).toBe(1);
-    expect(afterSecond).toBe(1);
+  it("submits durable input with the correlation ID, queue policy, and V2 file URI", async () => {
+    wire(async r => {
+      expect(new URL(r.url).pathname).toBe("/api/session/ses_test/prompt");
+      expect(await r.json()).toEqual({ id: "msg_test", text: "hello", delivery: "queue", files: [{ uri: "data:image/png;base64,YQ==", name: "a.png" }] });
+      return Response.json({ data: { id: "msg_test", sessionID: "ses_test" } });
+    });
+    await promptAsync(makeClient("http://fixture"), "ses_test", "hello", { messageID: "msg_test", files: [{ mime: "image/png", filename: "a.png", dataUrl: "data:image/png;base64,YQ==" }] });
   });
-
-  it("probes different project dirs independently", async () => {
-    const { client, calls } = fakeClient({ assistant: { providerID: "airouter", modelID: "Qwen3.8" } });
-    await detectDefaultModel(client, "/proj/indep-a");
-    await detectDefaultModel(client, "/proj/indep-b");
-    expect(calls.filter((c) => c === "create").length).toBe(2);
+  it("reads pending forms using authenticated, location-scoped V2 requests", async () => {
+    wire(r => {
+      const url = new URL(r.url);
+      expect(url.pathname).toBe("/api/form");
+      expect(r.headers.get("authorization")).toBe("Basic fixture");
+      expect(url.search).toContain("project");
+      return Response.json({ location: { directory: "/project" }, data: [form] });
+    });
+    const qs = await pendingQuestions(makeClient("http://fixture", { headers: { authorization: "Basic fixture" }, directory: "/project" }));
+    expect(qs[0]?.questions[0]?.options[0]).toMatchObject({ label: "React (recommended)", value: "react" });
   });
-
-  it("returns undefined (never a guess) when the probe fails", async () => {
-    const { client } = fakeClient({ throwOnCreate: true });
-    expect(await detectDefaultModel(client, "/proj/boom")).toBeUndefined();
+  it("replies using field keys and values, and accepts an empty 204", async () => {
+    wire(async r => {
+      expect(new URL(r.url).pathname).toBe("/api/session/ses_test/form/frm_test/reply");
+      expect(await r.json()).toEqual({ answer: { framework: "react", features: ["ts"] } });
+      return new Response(null, { status: 204 });
+    });
+    await questionReply(makeClient("http://fixture"), form.id, [["react"], ["ts"]], { request: normalizeForm(form) });
   });
-});
-
-describe("validated idle inference from the complete status map", () => {
-  function client(statuses: unknown = {}) {
-    const get = vi.fn(async () => ({ data: { id: "ses_probe", directory: "/project" } }));
-    const status = vi.fn(async () => ({ data: statuses }));
-    return { get, status, c: { session: { get, status } } as never };
-  }
-
-  it("proves an existing session idle when the successful full map omits it", async () => {
-    const { c, get, status } = client({ ses_other: { type: "busy" } });
-    expect(await sessionIdle(c, "ses_probe")).toBe(true);
-    expect(get.mock.invocationCallOrder[0]).toBeLessThan(status.mock.invocationCallOrder[0]!);
-    expect(await sessionStatus(c)).toEqual({ ses_other: { type: "busy" } });
+  it("cancels a form using DELETE and no synthetic prompt", async () => {
+    wire(r => { expect(r.method).toBe("DELETE"); expect(r.url).toBe("http://fixture/api/session/ses_test/form/frm_test"); return new Response(null, { status: 204 }); });
+    await questionReject(makeClient("http://fixture"), form.id, { sessionId: form.sessionID });
   });
-
-  it.each([
-    [{ type: "idle" }, true],
-    [{ type: "busy" }, false],
-    [{ type: "retry", attempt: 1, message: "waiting", next: 123 }, false],
-  ])("handles explicit status %j", async (status, expected) => {
-    expect(await sessionIdle(client({ ses_probe: status }).c, "ses_probe")).toBe(expected);
+  it("maps V2 permission action/resources/source and replies with decision", async () => {
+    const client = makeClient("http://fixture");
+    wire(async r => {
+      if (r.method === "POST") {
+        expect(r.url).toBe("http://fixture/api/session/ses_test/permission/per_test/reply");
+        expect(await r.json()).toEqual({ decision: "once" }); return new Response(null, { status: 204 });
+      }
+      return Response.json({ data: [{ id: "per_test", sessionID: "ses_test", action: "shell", resources: ["npm test"], source: { type: "tool", messageID: "msg_a", id: "call_a" } }] });
+    });
+    expect((await pendingPermissions(client))[0]).toMatchObject({ type: "shell", pattern: ["npm test"], messageID: "msg_a", callID: "call_a" });
+    await permRespond(client, "ses_test", "per_test", "once");
   });
-
-  it("does not infer idle for a deleted or mismatched session", async () => {
-    const missing = client();
-    missing.get.mockRejectedValueOnce(new Error("HTTP 404"));
-    await expect(sessionIdle(missing.c, "ses_probe")).rejects.toThrow("404");
-    expect(missing.status).not.toHaveBeenCalled();
-    await expect(sessionIdle(client().c, "ses_another")).rejects.toThrow("identity");
+  it("paginates messages and correlates assistants without treating tool completion as final", async () => {
+    wire(r => {
+      const u = new URL(r.url);
+      if (u.pathname.endsWith("/inbox")) return Response.json({ data: [{ type: "user", id: "msg_queued", time: { created: 4 } }] });
+      if (!u.searchParams.has("cursor")) return Response.json({ data: [{ id: "msg_user", type: "user", time: { created: 1 }, text: "hello" }], cursor: { next: "page2" } });
+      expect(u.searchParams.has("order")).toBe(false);
+      return Response.json({ data: [{ id: "msg_assistant", type: "assistant", agent: "build", time: { created: 2, completed: 3 }, model: { id: "m", providerID: "p" }, content: [], finish: "tool-calls" }], cursor: {} });
+    });
+    const rows = await sessionMessages(makeClient("http://fixture"), "ses_test");
+    expect(rows[1]?.info).toMatchObject({ parentID: "msg_user", finish: "tool-calls" });
+    expect(rows[2]?.info.id).toBe("msg_queued");
   });
-
-  it("does not turn a status request failure into an empty map", async () => {
-    const { c, status } = client();
-    status.mockRejectedValueOnce(new Error("connection lost"));
-    await expect(sessionIdle(c, "ses_probe")).rejects.toThrow("connection lost");
+  it.each([null, {}, { data: [{ id: "broken" }] }])("refuses malformed pending interaction responses %j", async body => {
+    wire(() => Response.json(body));
+    await expect(pendingQuestions("http://fixture")).rejects.toThrow("invalid pending questions");
+    await expect(pendingPermissions("http://fixture")).rejects.toThrow("invalid pending permissions");
   });
-
-  it.each([null, undefined, [], "", { error: "offline" }, { ses_probe: null },
-    { ses_probe: { type: "new-unknown-state" } }, { ses_other: { type: "retry" } }])(
-    "does not infer idle from malformed/unsupported status data %j", async (payload) => {
-      const { c, status } = client();
-      status.mockResolvedValueOnce({ data: payload });
-      await expect(sessionIdle(c, "ses_probe")).rejects.toThrow("invalid session status");
-    },
-  );
-
-  it("forwards caller cancellation to both requests", async () => {
-    const { c, get, status } = client();
-    const signal = new AbortController().signal;
-    await sessionIdle(c, "ses_probe", { signal });
-    expect(get).toHaveBeenCalledWith({ path: { id: "ses_probe" }, signal });
-    expect(status).toHaveBeenCalledWith({ signal });
+  it("propagates an unavailable service rather than reporting no pending interactions", async () => {
+    wire(() => new Response(null, { status: 503 }));
+    await expect(pendingPermissions("http://fixture")).rejects.toThrow("503");
   });
 });
 
-describe("reconciliation response contracts", () => {
-  afterEach(() => vi.unstubAllGlobals());
-
-  it("preserves assistant correlation/finish fields in SDK-wrapped and raw transcripts", async () => {
-    const row = { info: { id: "msg_assistant", sessionID: "ses_probe", role: "assistant", parentID: "msg_user",
-      finish: "tool-calls", time: { created: 1, completed: 2 } }, parts: [] };
-    const messages = vi.fn().mockResolvedValueOnce({ data: [row] }).mockResolvedValueOnce([row]);
-    const c = { session: { messages } } as never;
-    expect(await sessionMessages(c, "ses_probe")).toEqual([row]);
-    expect(await sessionMessages(c, "ses_probe")).toEqual([row]);
+describe("idle evidence", () => {
+  const client = (statuses: unknown = {}) => ({ session: { get: vi.fn(async () => ({ id: "ses_test" })), status: vi.fn(async () => statuses) } });
+  it("requires an existing exact session and a successful complete active map", async () => {
+    const c = client({ ses_other: { type: "busy" } });
+    expect(await sessionIdle(c as never, "ses_test")).toBe(true);
+    await expect(sessionIdle(c as never, "wrong")).rejects.toThrow("identity");
+    c.session.status.mockRejectedValueOnce(new Error("offline"));
+    await expect(sessionIdle(c as never, "ses_test")).rejects.toThrow("offline");
   });
-
-  it.each([undefined, {}, null, [{ parts: [] }], [{ info: { role: "assistant" } }]])(
-    "rejects malformed transcripts rather than reporting no messages: %j", async (payload) => {
-      const c = { session: { messages: async () => ({ data: payload }) } } as never;
-      await expect(sessionMessages(c, "ses_probe")).rejects.toThrow("invalid session messages");
-    },
-  );
-
-  it("normalizes real modern pending permission fields and preserves legacy fields", async () => {
-    const legacy = { id: "per_old", sessionID: "ses_probe", type: "read", title: "Read file" };
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json([
-      { id: "per_new", sessionID: "ses_probe", permission: "bash", patterns: ["npm test"],
-        always: [], metadata: { title: "Run tests" }, tool: { messageID: "msg1", callID: "call1" } },
-      legacy,
-    ])));
-    expect(await pendingPermissions("http://localhost:4096")).toEqual([
-      { id: "per_new", sessionID: "ses_probe", type: "bash", pattern: ["npm test"], title: "Run tests",
-        metadata: { title: "Run tests" }, messageID: "msg1", callID: "call1" }, legacy,
-    ]);
-  });
-
-  it.each([{}, null, [{ id: "broken" }]])("rejects malformed pending-interaction lists %j", async (payload) => {
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json(payload)));
-    await expect(pendingQuestions("http://localhost:4096")).rejects.toThrow("invalid pending questions");
-    await expect(pendingPermissions("http://localhost:4096")).rejects.toThrow("invalid pending permissions");
-  });
-
-  it("propagates failed permission-list requests rather than treating them as no waits", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })));
-    await expect(pendingPermissions("http://localhost:4096")).rejects.toThrow("HTTP 503");
+  it.each([null, undefined, [], "", { error: "offline" }, { ses_test: null }, { ses_test: { type: "unknown" } }, { ses_test: { type: "retry" } }])("rejects malformed statuses %j", async s => {
+    await expect(sessionStatus({ session: { status: async () => s } } as never)).rejects.toThrow("invalid session status");
   });
 });
 
-// ─── question API client fns (#2) ───────────────────────────────────────────
-
-describe("pendingQuestions / questionReply / questionReject", () => {
-  afterEach(() => vi.unstubAllGlobals());
-
-  it("pendingQuestions GETs /question and parses the array", async () => {
-    const payload = [{ id: "q1", sessionID: "s1", questions: [] }];
-    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-      expect(url).toBe("http://localhost:4096/question");
-      return Response.json(payload);
-    }));
-    const out = await pendingQuestions("http://localhost:4096");
-    expect(out).toEqual(payload);
+describe("native V2 event translation", () => {
+  it("does not offer custom input for fixed options and preserves conditional defaults", () => {
+    expect(normalizeForm(form).questions[0]?.custom).toBe(false);
+    const req = normalizeForm({ ...form, fields: [
+      { key: "enabled", type: "boolean", default: false },
+      { key: "amount", type: "integer", when: [{ key: "enabled", op: "eq", value: true }] },
+      { key: "notes", type: "string" },
+    ] });
+    expect(visibleQuestions(req, [[], [], []])).toEqual([true, false, true]);
+    expect(formAnswer(req, [["false"], ["42"], ["hello"]])).toEqual({ enabled: false, notes: "hello" });
+    expect(() => formAnswer(req, [["true"], ["1.5"], []])).toThrow("number");
   });
-
-  it("pendingQuestions throws on non-OK", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 500 })));
-    await expect(pendingQuestions("http://localhost:4096")).rejects.toThrow("HTTP 500");
+  it("emits only one idle for the V2 completion signals", () => {
+    const events = new V2Events();
+    const e = (type: string, data: object) => events.translate({ type, data } as V2Event);
+    e("session.execution.started", { sessionID: "s" });
+    expect(e("session.execution.succeeded", { sessionID: "s" })).toHaveLength(1);
+    expect(e("session.status", { sessionID: "s", status: { type: "idle" } })).toEqual([]);
+    expect(e("session.idle", { sessionID: "s" })).toEqual([]);
+    e("session.execution.started", { sessionID: "s" });
+    expect(e("session.execution.succeeded", { sessionID: "s" })).toHaveLength(1);
   });
-
-  it("questionReply POSTs the answers matrix to /question/{id}/reply", async () => {
-    let captured: { url: string; init: RequestInit } | null = null;
-    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
-      captured = { url, init };
-      return Response.json({ ok: true });
-    }));
-    await questionReply("http://localhost:4096", "req-1", [["React"], ["TypeScript"]]);
-    expect(captured!.url).toBe("http://localhost:4096/question/req-1/reply");
-    expect(captured!.init.method).toBe("POST");
-    expect(JSON.parse(captured!.init.body as string)).toEqual({ answers: [["React"], ["TypeScript"]] });
-  });
-
-  it("questionReply throws on non-OK", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404 })));
-    await expect(questionReply("http://localhost:4096", "bad", [["x"]])).rejects.toThrow("HTTP 404");
-  });
-
-  it("questionReject POSTs to /question/{id}/reject with no body", async () => {
-    let captured: { url: string; init: RequestInit } | null = null;
-    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
-      captured = { url, init };
-      return Response.json({ ok: true });
-    }));
-    await questionReject("http://localhost:4096", "req-2");
-    expect(captured!.url).toBe("http://localhost:4096/question/req-2/reject");
-    expect(captured!.init.method).toBe("POST");
-    expect(captured!.init.body).toBeUndefined();
+  it("routes forms and complete text with stable transcript part identities", () => {
+    const events = new V2Events();
+    expect(events.translate({ type: "form.created", data: { form } } as V2Event)[0]).toMatchObject({ type: "question.asked", properties: { id: form.id } });
+    expect(events.translate({ type: "session.text.ended", created: 100, data: { sessionID: "ses_test", assistantMessageID: "msg_a", ordinal: 1, text: "hello" } } as V2Event)[0])
+      .toMatchObject({ type: "message.part.updated", properties: { part: { id: "msg_a:1", text: "hello", time: { end: 100 } } } });
   });
 });

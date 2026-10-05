@@ -471,7 +471,7 @@ describe("SessionView section dividers", () => {
     expect(log.posted).toEqual([]);
     expect(log.uploads.length).toBe(1);
     expect(log.uploads[0]?.filename).toBe("chart.png");
-    expect(log.uploads[0]?.comment).toBe(":framed_picture: chart.png received.");
+    expect(log.uploads[0]?.comment).toBe("🖼️ chart.png received.");
     expect(Buffer.from(log.uploads[0]?.file ?? Buffer.alloc(0)).toString()).toBe("ipho");
     // Duplicate delivery is deduped.
     await v.handle({
@@ -908,7 +908,7 @@ describe("SessionView pendingRun tombstone (interrupt sweep)", () => {
     deleteView("sess-pr-b");
   });
 
-  it("a status sink keeps the tombstone pointed at the LIVE bar (C1: #6 bookkeeping)", async () => {
+  it("content re-homing updates the recovery tombstone to the new status identity", async () => {
     vi.useFakeTimers();
     _resetQueueForTests();
     try {
@@ -924,7 +924,7 @@ describe("SessionView pendingRun tombstone (interrupt sweep)", () => {
       } as never);
       await vi.advanceTimersByTimeAsync(0); // sink round: post → adopt → sync tombstone → delete old
       expect(state.getThread("C1:T1")?.pendingRun?.statusTs).toBe("status-3");
-      expect(log.deleted).toContain("status-1");
+      expect(log.deleted).toEqual(["status-1"]);
       deleteView("sess-pr-sink");
     } finally {
       _resetQueueForTests();
@@ -1375,8 +1375,8 @@ function gateableStatusPosts(log: CallLog): { deps: RenderDeps; release: () => P
   };
 }
 
-describe("SessionView strict-bottom sink (#6)", () => {
-  it("a content post re-homes the status bar to the bottom immediately — no tick, no idle-queue gate", async () => {
+describe("SessionView strict-bottom progress message (#6)", () => {
+  it("re-homes below content immediately without waiting for a quiet tick", async () => {
     vi.useFakeTimers();
     _resetQueueForTests();
     try {
@@ -1388,9 +1388,9 @@ describe("SessionView strict-bottom sink (#6)", () => {
       // Flush the sink chain (post → adopt → delete). NO clock advance: this
       // is the #4/#3 regression — the sink must not wait for a quiet tick.
       await vi.advanceTimersByTimeAsync(0);
-      expect(log.posted).toHaveLength(3); // ack + content + re-homed bar
+      expect(log.posted).toHaveLength(3); // ack + content + replacement status
       expect(log.posted[1]).toContain("some answer");
-      expect(log.posted.at(-1)).toMatch(/[⏳⌛]/); // bar is bottom-most
+      expect(log.posted.at(-1)).toMatch(/[⏳⌛]/);
       expect(log.deleted).toEqual(["status-1"]);
       deleteView("sess-sink-b");
     } finally {
@@ -1399,7 +1399,7 @@ describe("SessionView strict-bottom sink (#6)", () => {
     }
   });
 
-  it("back-to-back content coalesces to one sink round at a time, and the bar catches the last post", async () => {
+  it("coalesces in-flight sinks and follows content posted during adoption", async () => {
     vi.useFakeTimers();
     _resetQueueForTests();
     try {
@@ -1409,12 +1409,12 @@ describe("SessionView strict-bottom sink (#6)", () => {
       await v.beginPrompt("111.sink3");
       await v.handle(textPart("t1", "answer one")); // sink round 1 starts, gated mid-flight
       await v.handle(textPart("t2", "answer two")); // its maybeSink() no-ops behind the in-flight round
-      expect(gated.maxActive()).toBe(1); // never two overlapping status posts
+      expect(gated.maxActive()).toBe(1);
       await gated.release(); // round 1 adopts; contentBelow re-armed → round 2 follows
       await vi.advanceTimersByTimeAsync(0);
       const bars = log.posted.filter((p) => /[⏳⌛]/.test(p));
-      expect(bars).toHaveLength(3); // ack + 2 chase rounds (one after each content)
-      expect(log.posted.at(-1)).toMatch(/[⏳⌛]/); // ends strictly at the bottom
+      expect(bars).toHaveLength(3);
+      expect(log.posted.at(-1)).toMatch(/[⏳⌛]/);
       expect(gated.maxActive()).toBe(1);
       deleteView("sess-sink-c");
     } finally {
@@ -1423,7 +1423,7 @@ describe("SessionView strict-bottom sink (#6)", () => {
     }
   });
 
-  it("the lane-depth circuit breaker defers the sink while the lane is deep in queued work", async () => {
+  it("retries on the next tick after a busy lane drains, without new content", async () => {
     vi.useFakeTimers();
     _resetQueueForTests();
     const queueMod = await import("../src/slack/queue.js");
@@ -1435,10 +1435,9 @@ describe("SessionView strict-bottom sink (#6)", () => {
       await v.handle(textPart("t1", "answer one"));
       await vi.advanceTimersByTimeAsync(2_000); // ticks fire; every sink attempt hits the breaker
       expect(log.posted.filter((p) => /[⏳⌛]/.test(p))).toHaveLength(1); // ack only — no sink
-      // The lane drains — the NEXT content post re-homes the bar.
+      // The lane drains — retry even if no new content arrives.
       spy.mockReturnValue(0);
-      await v.handle(textPart("t2", "answer two"));
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(1_000);
       expect(log.posted.filter((p) => /[⏳⌛]/.test(p))).toHaveLength(2);
       expect(log.posted.at(-1)).toMatch(/[⏳⌛]/);
       deleteView("sess-sink-brk");
@@ -1449,7 +1448,7 @@ describe("SessionView strict-bottom sink (#6)", () => {
     }
   });
 
-  it("a sink post landing after finalize deletes itself (orphan guard)", async () => {
+  it("finalization removes the old bar and cleans up a late sink", async () => {
     vi.useFakeTimers();
     _resetQueueForTests();
     try {
@@ -1460,7 +1459,7 @@ describe("SessionView strict-bottom sink (#6)", () => {
       await v.handle(textPart("t1", "answer")); // sink starts, gated mid-flight
       await v.finalize(); // deletes the old bar, posts the summary (status-3, not gated)
       await gated.release(); // the mid-flight post lands NOW (status-4) — stale
-      expect(log.deleted).toEqual(["status-1", "status-4"]); // old bar (finalize) + orphan (guard)
+      expect(log.deleted).toEqual(["status-1", "status-4"]);
       deleteView("sess-sink-orph");
     } finally {
       _resetQueueForTests();
@@ -1478,7 +1477,7 @@ describe("SessionView strict-bottom sink (#6)", () => {
       await v.handle(textPart("t3", "content"));
       await vi.advanceTimersByTimeAsync(0); // the sink round completes BEFORE finalize
       const barsBefore = log.posted.filter((p) => /[⏳⌛]/.test(p)).length;
-      expect(barsBefore).toBe(2); // ack + re-homed bar (strict bottom at work)
+      expect(barsBefore).toBe(2);
       await v.finalize();
       await vi.advanceTimersByTimeAsync(3_000);
       expect(log.posted.filter((p) => /[⏳⌛]/.test(p))).toHaveLength(barsBefore);
@@ -1568,9 +1567,9 @@ describe("SessionView.attach (watch a computer-driven session)", () => {
       expect(state.getThread("C1:T1")?.pendingRun).toBeUndefined(); // no tombstone — ever
       await vi.advanceTimersByTimeAsync(3_000); // second poll — new content streams
       expect(log.posted.join("\n")).toContain("live answer");
-      expect(log.posted.join("\n")).toContain("read");
       // The watcher's status line ticks with a 👀 prefix, never "working…"
       await vi.advanceTimersByTimeAsync(1_000);
+      expect([...log.posted, ...log.updates].join("\n")).toContain("read");
       expect(log.updates.join("\n")).toMatch(/👀/);
       await v.stopWatching();
       deleteView("ses-watch-a");

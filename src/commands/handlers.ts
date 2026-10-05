@@ -8,7 +8,6 @@ import {
   agentsList,
   configGet,
   configProviders,
-  detectDefaultModel,
   promptAsync,
   sessionAbort,
   sessionCommand,
@@ -28,6 +27,8 @@ import { deleteView, getView, SessionView, describeActiveRuns, finalizeViewsForP
 import { droppedOpCount, oldestPendingAgeMs, queueDepth } from "../slack/queue.js";
 import { fileLogPath, logCount, newLogsSince, recentLogs } from "../log.js";
 import { createTwoFilesPatch } from "diff";
+import { parsePermissionCommand } from "../slack/permissions.js";
+import "./schedules.js";
 
 function requireThread(ctx: CmdCtx): NonNullable<CmdCtx["thread"]> {
   if (!ctx.thread) throw new Error("no session bound to this thread yet — send a prompt first");
@@ -76,6 +77,7 @@ async function rebindThread(
 ): Promise<void> {
   dir = canonicalDir(dir);
   const old = ctx.thread;
+  ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs, true);
   if (old) {
     if (opts.teardown !== false) {
       try {
@@ -111,7 +113,8 @@ export const HELP_SECTIONS: Array<{ title: string; names: string[] }> = [
   { title: "Monitoring", names: ["watch", "unwatch", "history", "summary"] },
   { title: "Model & agent", names: ["model", "agent"] },
   { title: "Projects", names: ["project", "projects", "cd"] },
-  { title: "Notifications", names: ["notify"] },
+  { title: "Notifications", names: ["notify", "schedule"] },
+  { title: "Approvals & questions", names: ["permissions", "permission", "questions"] },
   { title: "Raw OpenCode", names: ["cmd"] },
   { title: "Bridge", names: ["status", "logs", "restart", "help"] },
 ];
@@ -197,7 +200,42 @@ registerCommand({
     if (qd || dropped) lines.push(`*Slack queue:* ${qd} pending${oldest ? ` (oldest ${dur(oldest)})` : ""} · ${dropped} dropped`);
     const recovery = ctx.state.recoveryStatus();
     if (recovery.paused || recovery.uncertain) lines.push(`*Recovery:* ${recovery.paused ? "paused (receipt capacity) · " : ""}${recovery.uncertain} uncertain · ${recovery.receipts} receipts retained; uncertain work is not automatically replayed.`);
+    lines.push(`*Replay (72h maximum):* ${recovery.recovered} recovered · ${recovery.held} held · ${recovery.expired} expired · ${recovery.canceled} canceled`);
+    for (const r of recovery.threads.filter(r => r.recent && r.decision === "held").slice(0, 5)) {
+      const url = ctx.threadUrl?.(r.key);
+      lines.push(`• ${url ? `<${url}|Held thread>` : `Held ${r.key}`} — ${r.reason.replaceAll("_", " ")}; send a fresh instruction after checking the session.`);
+    }
+    if (ctx.permissions) lines.push(await ctx.permissions.list(ctx.ownerDm ? { dm: true } : { threadKey: ctx.threadKey }));
     await ctx.postToThread(lines.join("\n"));
+  },
+});
+
+registerCommand({
+  name: "permissions", usage: "\\permissions", summary: "Pending approvals and delivery status",
+  async run(ctx) {
+    if (!ctx.permissions) throw new Error("permission service unavailable");
+    for (const text of chunkText(await ctx.permissions.list(ctx.ownerDm ? { dm: true } : { threadKey: ctx.threadKey }, true))) await ctx.postToThread(text);
+  },
+});
+
+registerCommand({
+  name: "permission", usage: "\\permission <request-id> once|deny|always", summary: "Answer an approval by text",
+  async run(ctx, args) {
+    const parsed = parsePermissionCommand(args);
+    if (!parsed) throw new Error("use \\permission <request-id> once|deny|always; \\permissions lists requests");
+    if (!ctx.permissions) throw new Error("permission service unavailable");
+    const result = await ctx.permissions.respond({ ...parsed, actor: ctx.config.ownerSlackUserId,
+      context: ctx.ownerDm ? { dm: true } : { threadKey: ctx.threadKey }, source: ctx.source ?? "live" });
+    await ctx.postToThread(result.text);
+  },
+});
+
+registerCommand({
+  name: "questions", usage: "\\questions", summary: "Recover pending question cards and show delivery status",
+  async run(ctx) {
+    if (!ctx.questions) throw new Error("question service unavailable");
+    const status = await ctx.questions(ctx.ownerDm ? { dm: true } : { threadKey: ctx.threadKey }, text => ctx.postToThread(text));
+    if (status) await ctx.postToThread(status);
   },
 });
 
@@ -209,6 +247,7 @@ registerCommand({
   async run(ctx) {
     const th = requireThread(ctx);
     const next = !th.hushed;
+    if (next) ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs);
     ctx.state.setThread(ctx.threadKey, { ...th, hushed: next });
     await ctx.postToThread(
       next
@@ -260,16 +299,13 @@ registerCommand({
 registerCommand({
   name: "restart",
   usage: "\\restart",
-  summary: "Restart this project's opencode server (wedged-server rescue from Slack)",
-  detail: "In-flight work on it is interrupted; threads keep their sessions — resend the last prompt if one was running.",
+  summary: "Reconnect to the OpenCode V2 service",
+  detail: "Re-discovers the service and resumes observation. Existing sessions and running tasks are retained.",
   async run(ctx) {
     const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
-    // Friendly immediate finalize for anything in flight there; the pool's
-    // death hook stays silent because killOne marks the stop intentional.
-    await finalizeViewsForProject(dir, ":arrows_counterclockwise: server restarting at owner's request — resend your prompt.");
-    await ctx.pool.killOne(dir).catch(() => {});
+    await ctx.pool.reconnect();
     const entry = await ctx.pool.ensure(dir);
-    await ctx.postToThread(`🔄 Server for \`${dir}\` restarted (${entry.url ?? "starting"}). Threads keep their sessions — resend the interrupted prompt if any.`);
+    await ctx.postToThread(`🔄 Reconnected to OpenCode for \`${dir}\` (${entry.url ?? "connecting"}). Existing work is retained; observation is being reconciled.`);
   },
 });
 
@@ -329,20 +365,10 @@ registerCommand({
     const info = await configProviders(entry.client!);
     const ids = () =>
       info.providers.flatMap((p) => Object.keys(p.models).map((mid) => `${p.id}/${mid}`));
-    // Effective current model: the thread override wins; otherwise the config
-    // "model"; otherwise the server's real default, resolved by live probe
-    // (cached per project dir) — so \model stars what a prompt would ACTUALLY
-    // use. A bare "(server default)" placeholder is useless and never shown.
+    // A thread override wins; V2 exposes the location default directly.
     const effectiveModel = async (): Promise<string | undefined> => {
       if (ctx.thread?.model) return ctx.thread.model;
-      let m: string | undefined;
-      try {
-        m = (await configGet(entry.client!)).model;
-      } catch {
-        /* older server without GET /config — fall through to the live probe */
-      }
-      if (!m) m = await withServerLease(ctx, dir, (leased) => detectDefaultModel(leased.client!, canonicalDir(dir)));
-      return m;
+      return (await configGet(entry.client!)).model;
     };
     // ★ trails the line (user-mandated): start-of-line markers crowded the code
     // span; the trailing star also can't disturb the span's leading whitespace.
@@ -544,6 +570,7 @@ registerCommand({
   detail: "Machine-wide: any session on this computer, including TUI-started ones; the thread follows the session's project.",
   async run(ctx, args) {
     if (!args) throw new Error("usage: \\resume <# or session id>");
+    ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs, true);
     const pick = await pickerResolve(ctx, args);
     if (pick.kind === "stale") {
       // The list the user picked from has expired — showing a fresh one beats
@@ -573,8 +600,14 @@ registerCommand({
       sessionId: target,
       projectDir: dir,
       watchOnly: false, // \resume is the takeover path — the read-only gate lifts
+      pendingRun: old?.sessionId === target ? old.pendingRun : undefined,
     });
-    await ctx.postToThread(`↩️ Thread bound to session \`${shortId(target)}\` in \`${dir}\`. Reply here to continue it.`);
+    const generation = ctx.state.bindingGeneration(ctx.threadKey);
+    await Promise.all([
+      ctx.postToThread(`↩️ Thread bound to session \`${shortId(target)}\` in \`${dir}\`. Reply here to continue it.`),
+      ctx.source === "live" && ctx.messageTs ? ctx.resumeQuestions?.({ threadKey: ctx.threadKey,
+        sessionId: target, generation, ownerTs: ctx.messageTs }) : undefined,
+    ]);
   },
 });
 
@@ -608,6 +641,7 @@ registerCommand({
   detail: "Streams a TUI/IDE session's run into this thread (3s transcript poll). Replies stay read-only; `\\resume` takes the session over, `\\unwatch` stops.",
   async run(ctx, args) {
     if (!args) throw new Error("usage: \\watch <# or session id>");
+    ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs, true);
     const pick = await pickerResolve(ctx, args);
     if (pick.kind === "stale") {
       await ctx.postToThread(staleListReply(pick, "watch"));
@@ -877,6 +911,7 @@ registerCommand({
   summary: "Abort the running task in this thread",
   async run(ctx) {
     const th = requireThread(ctx);
+    ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs);
     // Finalized views leave the registry, so an absent view = nothing in flight.
     if (!getView(th.sessionId)) {
       await ctx.postToThread("Nothing running in this thread.");
@@ -917,8 +952,8 @@ export function formatDiffSummary(diffs: OcFileDiff[]): string {
 /** Unified diff across files with real changes — shared by `\diff full` and the RF1 button. Empty when nothing changed. */
 export function buildUnifiedDiff(diffs: OcFileDiff[]): string {
   return diffs
-    .filter((d) => d.before !== d.after)
-    .map((d) => createTwoFilesPatch(`a/${d.file}`, `b/${d.file}`, d.before, d.after, undefined, undefined, { context: 3 }))
+    .filter((d) => d.patch || d.before !== d.after)
+    .map((d) => d.patch ?? createTwoFilesPatch(`a/${d.file}`, `b/${d.file}`, d.before, d.after, undefined, undefined, { context: 3 }))
     .join("\n")
     .trim();
 }

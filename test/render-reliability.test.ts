@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { rmSync } from "node:fs";
 import { SessionView, deleteView, getView, setProjectConnectionState, type RenderDeps } from "../src/slack/render.js";
 import { formatTool } from "../src/slack/tool-format.js";
 import { StateStore } from "../src/state.js";
 import type { OCClient, OcEvent, OcMessageInfo, OcPart } from "../src/opencode/api.js";
 import * as logModule from "../src/log.js";
+import { timestampFromMs } from "../src/slack/recovery-policy.js";
 
 type Message = { info: OcMessageInfo & { finish?: string }; parts: OcPart[] };
 function deferred<T>() {
@@ -41,7 +43,9 @@ function fixture(verbose: "on" | "off" | "full" = "on") {
       ? { type: "retry", attempt: 1, message: "retrying", next: Date.now() + 1_000 }
       : { type: status } } : {} })),
   } };
-  const state = new StateStore(`${import.meta.dirname}/.fixtures/render-reliability/${id}/state.json`);
+  const directory = `${import.meta.dirname}/.fixtures/render-reliability/${id}`;
+  rmSync(directory, { recursive: true, force: true });
+  const state = new StateStore(`${directory}/state.json`);
   const v = new SessionView({ sessionId: id, projectDir: "/renderer-reliability", channel: "C", threadTs: "T", threadKey: "C:T", client: client as unknown as OCClient, deps, state,
     threadState: { sessionId: id, projectDir: "/renderer-reliability", verbose, createdAt: 1, lastUsedAt: 1 } });
   views.push(v);
@@ -61,6 +65,42 @@ afterEach(() => {
   for (const v of views.splice(0)) deleteView(v.sessionId);
   vi.restoreAllMocks();
   vi.useRealTimers();
+});
+afterAll(() => rmSync(`${import.meta.dirname}/.fixtures/render-reliability`, { recursive: true, force: true }));
+
+describe("durable run lifecycle", () => {
+  it("records correlated terminal evidence before clearing pendingRun, independent of Slack final-line delivery", async () => {
+    const f = fixture();
+    const ts = timestampFromMs(Date.now() - 1000);
+    f.state.setThread("C:T", { sessionId: f.v.sessionId, projectDir: "/renderer-reliability", verbose: "on",
+      createdAt: Date.now(), lastUsedAt: Date.now(), historyCursorTs: timestampFromMs(Date.now() - 2000), lastSeenTs: ts });
+    f.state.claimMessage("C:T", ts);
+    f.state.associatePrompt("C:T", ts, { projectDir: "/renderer-reliability", sessionId: f.v.sessionId, messageId: "msg_lifecycle" });
+    f.state.settleMessage("C:T", ts, "accepted");
+    await f.v.beginPrompt(ts);
+    const activity = f.state.getThread("C:T")!.lastUsedAt;
+    await f.v.finalize();
+    expect(f.state.getThread("C:T")?.pendingRun).toBeUndefined();
+    expect(f.state.getThread("C:T")?.recovery?.lastRun).toMatchObject({ outcome: "completed", userMsgTs: [ts], messageIds: ["msg_lifecycle"] });
+    expect(f.state.getThread("C:T")?.lastUsedAt).toBe(activity);
+  });
+
+  it("restores observation of a proven accepted active run without submitting work or using restart time", async () => {
+    const f = fixture();
+    const ts = timestampFromMs(Date.now() - 10_000);
+    f.state.setThread("C:T", { sessionId: f.v.sessionId, projectDir: "/renderer-reliability", verbose: "on",
+      createdAt: Date.now(), lastUsedAt: Date.now(), lastSeenTs: ts, historyCursorTs: timestampFromMs(Date.now() - 20_000),
+      pendingRun: { userMsgTs: [ts] } });
+    f.state.claimMessage("C:T", ts);
+    f.state.associatePrompt("C:T", ts, { projectDir: "/renderer-reliability", sessionId: f.v.sessionId, messageId: "msg_restore" });
+    expect(await f.v.restoreAcceptedRun([ts], Date.now() - 9000)).toBe(false); // receipt isn't accepted yet
+    f.state.settleMessage("C:T", ts, "accepted");
+    expect(await f.v.restoreAcceptedRun([ts], Date.now() - 9000)).toBe(true);
+    expect(f.state.getThread("C:T")?.recovery?.lastRun).toMatchObject({ outcome: "active", messageIds: ["msg_restore"] });
+    expect(f.client.session.messages).not.toHaveBeenCalled();
+    expect(f.client.session.get).not.toHaveBeenCalled();
+    expect(f.posted.join(" ")).not.toContain("Queued");
+  });
 });
 
 describe("timed tool delivery", () => {
@@ -182,9 +222,31 @@ describe("timed tool delivery", () => {
 });
 
 describe("status reliability and lifetime", () => {
-  it("backs off failed sinks 2/4/8/16/30 seconds and resets after success", async () => {
+  it("re-homes only after a delayed queued-prompt acknowledgement lands", async () => {
+    const f = fixture();
+    await f.v.beginPrompt("first");
+    await f.v.start();
+    const gate = deferred<void>();
+    const base = f.deps.post;
+    f.deps.post = vi.fn(async (...args: Parameters<RenderDeps["post"]>) => {
+      if (args[2].includes("Queued")) await gate.promise;
+      return base(...args);
+    });
+    await f.v.beginPrompt("second");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.posted).toHaveLength(1); // do not move ahead of the queued ack
+    gate.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.posted).toHaveLength(3);
+    expect(f.posted[1]).toContain("Queued");
+    expect(f.posted[2]).toMatch(/[⏳⌛]/);
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+  });
+
+  it("backs off status re-homing 2/4/8/16/30 seconds while retaining the old bar", async () => {
     const f = fixture();
     await f.v.beginPrompt("user");
+    await f.v.start();
     const attempts: number[] = [];
     const base = f.deps.post;
     let failing = true;
@@ -244,16 +306,18 @@ describe("status reliability and lifetime", () => {
     expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
   });
 
-  it("logs cleanup failures, and still adopts the new bar without retrying posts", async () => {
+  it("re-homes through content and logs old-bar and final cleanup failures", async () => {
     const f = fixture();
     await f.v.beginPrompt("user");
     vi.mocked(f.deps.delete).mockRejectedValue(new Error("cannot delete"));
     f.v.contentPosted();
     await vi.advanceTimersByTimeAsync(2_000);
     expect(f.posted).toHaveLength(2);
-    expect(logModule.logErr).toHaveBeenCalledWith(expect.stringContaining("status cleanup failed"));
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
     expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
+    expect(logModule.logErr).toHaveBeenCalledWith(expect.stringContaining("status cleanup failed"));
     await f.v.finalize();
+    expect(logModule.logErr).toHaveBeenCalledWith(expect.stringContaining("status cleanup failed"));
     expect(getView(f.v.sessionId)).toBeUndefined();
   });
 
@@ -334,6 +398,177 @@ describe("status reliability and lifetime", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("starting"));
     expect(f.posted.join("\n")).not.toContain(":hourglass");
+  });
+});
+
+describe("pending question placement precedence", () => {
+  it("keeps updating the existing bar through content and resumes strict-bottom placement on release", async () => {
+    const f = fixture();
+    await f.v.beginPrompt("user");
+    await f.v.start();
+    f.v.setWaiting("q", "question", true);
+    f.v.contentPosted(); // question card
+    await f.v.handle(text("later", "later thread content"));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(f.deps.post).toHaveBeenCalledTimes(2); // initial status and content, no replacement status
+    expect(f.deps.delete).not.toHaveBeenCalled();
+    expect(f.deps.update).toHaveBeenCalledTimes(3);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"));
+
+    f.v.setWaiting("q", "question", false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(3);
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(f.deps.post).toHaveBeenCalledTimes(3); // no card/bar repositioning loop
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-3", expect.not.stringContaining("Waiting"));
+    f.v.contentPosted();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(4);
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-3");
+  });
+
+  it("defers dirty content until the LAST question clears, independently of permission waits", async () => {
+    const f = fixture();
+    await f.v.beginPrompt("user");
+    await f.v.start();
+    f.v.setWaiting("same", "question", true);
+    f.v.setWaiting("second", "question", true);
+    f.v.setWaiting("same", "permission", true);
+    f.v.contentPosted();
+    f.v.setWaiting("same", "question", false);
+    f.v.setWaiting("same", "question", false); // duplicate resolution must not release the other question
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(f.deps.post).toHaveBeenCalledTimes(1);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("your answer and permission"));
+
+    f.v.setWaiting("second", "question", false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(2);
+    expect(f.posted[1]).toContain("Waiting for permission");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+  });
+
+  it("keeps ordinary strict-bottom sinking for permission-only waiting", async () => {
+    const f = fixture();
+    await f.v.beginPrompt("user");
+    await f.v.start();
+    f.v.setWaiting("p", "permission", true);
+    f.v.contentPosted();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(2);
+    expect(f.posted[1]).toContain("Waiting for permission");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.stringContaining("Waiting for permission"));
+  });
+
+  it("retires an in-flight sink beneath a new question without replacing or deleting the known bar", async () => {
+    const f = fixture();
+    f.state.setThread("C:T", { sessionId: f.v.sessionId, projectDir: "/renderer-reliability", verbose: "on", createdAt: Date.now(), lastUsedAt: Date.now() });
+    await f.v.beginPrompt("user");
+    await f.v.start();
+    const gate = deferred<{ ts: string }>();
+    vi.mocked(f.deps.post).mockReturnValueOnce(gate.promise);
+    f.v.contentPosted();
+    f.v.setWaiting("q", "question", true);
+    f.v.contentPosted();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"));
+    gate.resolve({ ts: "late-sink" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.delete).toHaveBeenCalledExactlyOnceWith("C", "late-sink");
+    expect(f.state.getThread("C:T")?.pendingRun?.statusTs).toBe("ts-1");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(f.deps.post).toHaveBeenCalledTimes(2);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"));
+
+    f.v.setWaiting("q", "question", false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(3);
+    expect(f.state.getThread("C:T")?.pendingRun?.statusTs).toBe("ts-2");
+    expect(f.deps.delete).toHaveBeenLastCalledWith("C", "ts-1");
+  });
+
+  it("invalidates an interrupted sink even if the question clears before that post returns", async () => {
+    const f = fixture();
+    await f.v.beginPrompt("user");
+    await f.v.start();
+    const gate = deferred<{ ts: string }>();
+    vi.mocked(f.deps.post).mockReturnValueOnce(gate.promise);
+    const baseDelete = f.deps.delete;
+    const retired: string[] = [];
+    f.deps.delete = vi.fn(async (...args: Parameters<RenderDeps["delete"]>) => {
+      retired.push(args[1]);
+      if (args[1] === "late-sink") {
+        expect((f.v as unknown as { statusTs: string }).statusTs).toBe("ts-1");
+      }
+      return baseDelete(...args);
+    });
+    f.v.contentPosted();
+    f.v.setWaiting("q", "question", true);
+    f.v.setWaiting("q", "question", false);
+    gate.resolve({ ts: "late-sink" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(retired).toEqual(["late-sink", "ts-1"]); // late sink discarded, then a fresh normal sink replaces old bar
+    expect(f.deps.post).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
+  });
+
+  it("defers an initial status while a question is already pending without spinning", async () => {
+    const f = fixture();
+    f.v.setWaiting("q", "question", true);
+    await f.v.beginPrompt("user");
+    await Promise.all([f.v.start(), f.v.start()]);
+    f.v.contentPosted();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.deps.post).not.toHaveBeenCalled();
+    expect(f.deps.update).not.toHaveBeenCalled();
+    expect(f.deps.delete).not.toHaveBeenCalled();
+    f.v.setWaiting("q", "question", false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.any(String));
+  });
+
+  it("retires a delayed initial status interrupted by a question and restores status only after release", async () => {
+    const f = fixture();
+    const gate = deferred<{ ts: string }>();
+    vi.mocked(f.deps.post).mockReturnValueOnce(gate.promise);
+    await f.v.beginPrompt("user");
+    const start = f.v.start();
+    f.v.setWaiting("q", "question", true);
+    f.v.contentPosted();
+    gate.resolve({ ts: "late-initial" });
+    await start;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.deps.delete).toHaveBeenCalledExactlyOnceWith("C", "late-initial");
+    expect(f.deps.post).toHaveBeenCalledTimes(1);
+    expect(f.deps.update).not.toHaveBeenCalled();
+    f.v.setWaiting("q", "question", false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.any(String));
+  });
+
+  it("defers deleted-bar recovery while the question owns bottom placement", async () => {
+    const f = fixture();
+    await f.v.beginPrompt("user");
+    await f.v.start();
+    f.v.setWaiting("q", "question", true);
+    vi.mocked(f.deps.update).mockRejectedValueOnce({ data: { error: "message_not_found" } });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(f.deps.update).toHaveBeenCalledTimes(1);
+    expect(f.deps.post).toHaveBeenCalledTimes(1);
+    f.v.setWaiting("q", "question", false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.deps.post).toHaveBeenCalledTimes(2);
+    expect(f.deps.delete).not.toHaveBeenCalled(); // the old bar was already missing
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
   });
 });
 

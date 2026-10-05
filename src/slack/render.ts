@@ -1,4 +1,5 @@
 import type { OCClient, OcEvent, OcPart } from "../opencode/api.js";
+import { readFile } from "node:fs/promises";
 import { sessionGet, sessionIdle, sessionMessages } from "../opencode/client.js";
 import type { ConnectionState } from "../opencode/server.js";
 import { canonicalDir } from "../paths.js";
@@ -9,6 +10,7 @@ import { logErr } from "../log.js";
 import { chunkText, dur, mdToMrkdwn, money, shortId, shortPath, tok, truncate } from "../util.js";
 import { laneDepth } from "./queue.js";
 import type { SlackLane } from "./queue.js";
+import { classifyPendingRun, replayAge } from "./recovery-policy.js";
 
 export interface RenderDeps {
   post(
@@ -243,6 +245,9 @@ export class SessionView {
   private readonly terminalTools = new Set<string>();
   private toolTimer: NodeJS.Timeout | null = null;
   private readonly waiting = new Map<string, "question" | "permission">();
+  /** Invalidates a status post interrupted by a question, even if it clears before delivery. */
+  private questionWaitVersion = 0;
+  private readonly failedPermissionDeliveries = new Set<string>();
   private connectionState: ConnectionState;
   private generation = 0;
   private reconcileInFlight: Promise<boolean> | null = null;
@@ -277,8 +282,9 @@ export class SessionView {
   /**
    * Set by any thread-content post while a run is active. Slack can't reorder
    * messages, so once content lands BELOW the live-status line the bar is
-   * re-posted at the bottom (delete + post) — STRICT bottom (issue #6): every
-   * content post schedules a sink via maybeSink(), coalesced by sinkInFlight.
+    * re-posted at the bottom (post → adopt → delete) — STRICT bottom (issue #6): every
+    * content post schedules a sink via maybeSink(), coalesced by sinkInFlight.
+    * Pending question cards take precedence; retain the dirty flag until they clear.
    * Cleared on a successful sink and reset per run in beginPrompt.
    */
   private contentBelow = false;
@@ -288,8 +294,8 @@ export class SessionView {
   private sinkFailures = 0;
   /**
    * Circuit breaker for the strict sink: when this channel's lane is deep in
-   * queued work (a torrent run), skip the sink attempt — the bar trails until
-   * the next content post instead of burying the lane (and the run's final
+    * queued work (a torrent run), skip the sink attempt — the next tick or
+    * content post retries instead of burying the lane (and the run's final
    * summary) behind dozens of stale sink pairs.
    */
   private static readonly SINK_MAX_LANE_DEPTH = 8;
@@ -368,14 +374,27 @@ export class SessionView {
   /** IDs are scoped by kind, so independent asks cannot clear each other. */
   setWaiting(id: string, kind: "question" | "permission", waiting: boolean): void {
     if (this.finalized || this.disposed) return;
+    const hadQuestion = this.hasPendingQuestion();
     const key = `${kind}:${id}`;
     if (waiting) this.waiting.set(key, kind);
-    else this.waiting.delete(key);
+    else { this.waiting.delete(key); if (kind === "permission") this.failedPermissionDeliveries.delete(id); }
+    const hasQuestion = this.hasPendingQuestion();
+    if (!hadQuestion && hasQuestion) this.questionWaitVersion++;
     this.generation++;
     this.stalled = false;
     this.lastEventAt = Date.now();
     this.cancelIdleGrace();
     if (this.active && !this.attached) this.armWatchdog();
+    if (hadQuestion && !hasQuestion) this.maybeSink();
+  }
+
+  private hasPendingQuestion(): boolean {
+    for (const kind of this.waiting.values()) if (kind === "question") return true;
+    return false;
+  }
+
+  setPermissionDeliveryFailed(id: string, failed: boolean): void {
+    if (failed) this.failedPermissionDeliveries.add(id); else this.failedPermissionDeliveries.delete(id);
   }
 
   /** Call after an external question/permission thread post succeeds. */
@@ -487,10 +506,20 @@ export class SessionView {
     registry.set(newSessionId, this);
   }
 
-  /** Idempotent: posts the live-status placeholder once per run. */
+  private startFlight?: Promise<void>;
+  /** Idempotent even while a slow Slack post is still in flight. */
   async start(): Promise<void> {
+    if (this.startFlight) return this.startFlight;
+    this.startFlight = this.postInitialStatus();
+    try { await this.startFlight; }
+    finally { this.startFlight = undefined; this.maybeSink(); }
+  }
+
+  private async postInitialStatus(): Promise<void> {
     if (this.statusTs || this.finalized || this.disposed) return;
+    if (this.hasPendingQuestion()) { this.contentBelow = true; return; }
     this.lastSection = null;
+    const questionWaitVersion = this.questionWaitVersion;
     // Interactive: the run's ack message — the user is staring at the thread
     // waiting for it; it must not queue behind background stream traffic.
     const { ts } = await this.deps.post(this.channel, this.threadTs, "⏳ OpenCode is on it…", undefined, {
@@ -498,7 +527,13 @@ export class SessionView {
       lane: "interactive",
     });
     if (this.finalized || this.disposed) { await this.deleteStatus(ts); return; }
+    if (this.hasPendingQuestion() || questionWaitVersion !== this.questionWaitVersion) {
+      this.contentBelow = true;
+      await this.deleteStatus(ts);
+      return;
+    }
     this.statusTs = ts;
+    this.syncTombstoneStatusTs();
   }
 
   /** No-activity watchdog: nudge the status line if nothing lands for 3 minutes. */
@@ -550,13 +585,12 @@ export class SessionView {
     this.cancelIdleGrace(); // a new prompt cancels any pending "queue drained" finalize
     this.nudges = 0;
     this.stalled = false;
-    this.contentBelow = false; // fresh run: the status line is at the top again
+    if (!this.hasPendingQuestion()) this.contentBelow = false; // keep deferred content dirty while answering
     if (!this.pendingUserMsgs.includes(userMsgTs)) this.pendingUserMsgs.push(userMsgTs);
     this.runStartedAt = Date.now();
     this.lastEventAt = Date.now();
     this.armWatchdog();
-    await this.start();
-    if (this.finalized || this.disposed) return;
+    void this.start().catch(err => logErr(`status post failed: ${errorMessage(err)}`));
     this.startTicker();
     // Tombstone for the interrupt sweep: if the bridge dies before finalize,
     // the next boot can resolve this thread's ⏳ instead of leaving it frozen.
@@ -564,17 +598,68 @@ export class SessionView {
     if (cur) {
       const tombstones = [...new Set([...(cur.pendingRun?.userMsgTs ?? []), userMsgTs])];
       this.state.setThread(this.threadKey, { ...cur, pendingRun: { userMsgTs: tombstones, statusTs: this.statusTs ?? undefined } });
+      this.state.recordRunOutcome(this.threadKey, this.sessionId, "active", tombstones);
     }
     if (wasActive) {
       // Interactive: this ack directly answers the user's just-sent message.
-      await this.deps
+      void this.deps
         .post(this.channel, this.threadTs, "⏳ Queued — runs after the current task.", undefined, {
           unfurl: false,
           lane: "interactive",
         })
+        .then(() => this.contentPosted())
         .catch(() => {});
-      this.contentBelow = true; // the ack landed below the status line
-      this.maybeSink();
+    }
+  }
+
+  /** Boot only, after authoritative server evidence proves this exact accepted run is still active.
+   * startedAt is the correlated OpenCode user message's creation time, never restart time.
+   * This restores observation/timers only; it does not submit a prompt or a synthetic continuation.
+   */
+  async restoreAcceptedRun(userMsgTs: string[], startedAt: number): Promise<boolean> {
+    const cur = this.state.getThread(this.threadKey);
+    if (this.active || this.disposed || this.finalized || cur?.sessionId !== this.sessionId || !userMsgTs.length
+      || !Number.isFinite(startedAt) || startedAt > this.state.now()
+      || userMsgTs.some((ts) => replayAge(ts, this.state.now()).decision !== "recover")) return false;
+    if (classifyPendingRun({ ...cur, pendingRun: { userMsgTs } }, this.state.messageReceipts(this.threadKey), this.state.now()).decision !== "recover") return false;
+    const generation = this.state.bindingGeneration(this.threadKey);
+    this.active = true;
+    this.generation++;
+    this.pendingUserMsgs.push(...new Set(userMsgTs));
+    this.outstandingPrompts = this.pendingUserMsgs.length;
+    this.runStartedAt = startedAt;
+    this.lastEventAt = Date.now();
+    this.activity = "reconnected to running task…";
+    this.state.recordRunOutcome(this.threadKey, this.sessionId, "active", this.pendingUserMsgs);
+    await this.start();
+    const latest = this.state.getThread(this.threadKey);
+    if (!latest || generation !== this.state.bindingGeneration(this.threadKey)
+      || classifyPendingRun({ ...latest, pendingRun: { userMsgTs } }, this.state.messageReceipts(this.threadKey), this.state.now()).decision !== "recover") {
+      if (this.statusTs) await this.deleteStatus(this.statusTs);
+      deleteView(this.sessionId);
+      return false;
+    }
+    this.syncTombstoneStatusTs();
+    this.armWatchdog();
+    this.startTicker();
+    return true;
+  }
+
+  /** Eligibility can change while the initial Slack status is awaiting delivery. */
+  async forgetUnsubmittedPrompt(ts: string): Promise<void> {
+    const index = this.pendingUserMsgs.indexOf(ts);
+    if (index === -1) return;
+    this.pendingUserMsgs.splice(index, 1);
+    this.outstandingPrompts = Math.max(0, this.outstandingPrompts - 1);
+    const cur = this.state.getThread(this.threadKey);
+    if (cur?.sessionId === this.sessionId && cur.pendingRun) {
+      const userMsgTs = cur.pendingRun.userMsgTs.filter((item) => item !== ts);
+      this.state.recordRunOutcome(this.threadKey, this.sessionId, userMsgTs.length ? "active" : "interrupted", userMsgTs.length ? userMsgTs : [ts]);
+      this.state.setThread(this.threadKey, { ...cur, pendingRun: userMsgTs.length ? { ...cur.pendingRun, userMsgTs } : undefined });
+    }
+    if (!this.pendingUserMsgs.length) {
+      if (this.statusTs) await this.deleteStatus(this.statusTs);
+      deleteView(this.sessionId);
     }
   }
 
@@ -913,12 +998,13 @@ export class SessionView {
 
   private tick(): void {
     if (this.finalized || this.disposed || this.tickInFlight) return;
-    // The sink owns the beat whenever the bar isn't at the bottom (issue #6):
+    // A pending question owns bottom placement; its bar still updates in place.
+    // Otherwise the sink owns the beat whenever the bar isn't at the bottom (issue #6):
     // re-homing it IS this second's refresh — a same-second re-render on top
     // would double-post. Sinks are never gated on queue depth; the round-1 #4
     // design gated them inside the ticker, so any sustained queue traffic
     // pinned the bar to the top for the whole run.
-    if (this.contentBelow || this.sinkInFlight || this.statusTs == null) {
+    if (this.statusTs == null || (!this.hasPendingQuestion() && (this.contentBelow || this.sinkInFlight))) {
       this.maybeSink();
       return;
     }
@@ -958,6 +1044,7 @@ export class SessionView {
    * later ticks/content retry after the 2/4/8/16/30s backoff deadline.
    */
   private maybeSink(): void {
+    if (this.startFlight || this.hasPendingQuestion()) return;
     if (this.finalized || this.disposed || this.sinkInFlight || !this.contentBelow || Date.now() < this.sinkRetryAt) return;
     if (this.statusTs == null && !this.active) return;
     if (laneDepth(this.channel) > SessionView.SINK_MAX_LANE_DEPTH) return;
@@ -969,6 +1056,7 @@ export class SessionView {
     this.tickSeen += 1; // a sink is a visible refresh — keep the glass alternating
     const text = this.statusText();
     const oldTs = this.statusTs;
+    const questionWaitVersion = this.questionWaitVersion;
     void this.deps
       .post(this.channel, this.threadTs, text, undefined, { unfurl: false })
       .then(({ ts }) => {
@@ -976,6 +1064,10 @@ export class SessionView {
         // then-current statusTs). If so, the message we just posted is an
         // orphan — delete it rather than re-adopting it.
         if (this.finalized || this.disposed) return this.deleteStatus(ts);
+        if (this.hasPendingQuestion() || questionWaitVersion !== this.questionWaitVersion) {
+          this.contentBelow = true;
+          return this.deleteStatus(ts); // retain the old bar and its tombstone above the question
+        }
         this.sinkFailures = 0;
         this.sinkRetryAt = 0;
         this.statusTs = ts;
@@ -1010,7 +1102,7 @@ export class SessionView {
     if (this.waiting.size) {
       const kinds = new Set(this.waiting.values());
       const what = kinds.size === 2 ? "your answer and permission" : kinds.has("question") ? "your answer" : "permission";
-      return `${glass} Waiting for ${what} (${elapsed})`;
+      return `${glass} Waiting for ${what} (${elapsed})${kinds.has("permission") ? ` — ${this.failedPermissionDeliveries.size ? "approval delivery failed; " : ""}use the card or \`\\permissions\`` : ""}`;
     }
     if (this.connectionState !== "connected") {
       const label = this.connectionState === "connecting" ? "Connecting to OpenCode" : this.connectionState === "reconnecting" ? "Reconnecting to OpenCode" : "Disconnected from OpenCode";
@@ -1197,6 +1289,8 @@ export class SessionView {
     try {
       if (url.startsWith("data:")) {
         data = Buffer.from(url.slice(url.indexOf(",") + 1), "base64");
+      } else if (url.startsWith("file:")) {
+        data = await readFile(new URL(url));
       } else {
         const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1235,7 +1329,7 @@ export class SessionView {
       threadTs: this.threadTs,
       filename,
       file: data,
-      comment: `:framed_picture: ${safePayload(filename)} received.`,
+      comment: `🖼️ ${safePayload(filename)} received.`,
     });
     this.contentBelow = true; // the upload landed below the live-status line
     this.maybeSink(); // last message of this emit step — re-home the bar now
@@ -1291,7 +1385,8 @@ export class SessionView {
     // watched run (watchOnly must never outlive its view). A second spread of
     // `cur` here would resurrect a just-cleared tombstone — hence single write.
     const cur = this.state.getThread(this.threadKey);
-    if (cur && (cur.pendingRun || wasWatch)) {
+    this.state.recordRunOutcome(this.threadKey, this.sessionId, err ? "failed" : "completed", this.pendingUserMsgs);
+    if (cur?.sessionId === this.sessionId && (cur.pendingRun || wasWatch)) {
       this.state.setThread(this.threadKey, { ...cur, pendingRun: undefined, watchOnly: wasWatch ? false : cur.watchOnly });
     }
     this.outstandingPrompts = 0;

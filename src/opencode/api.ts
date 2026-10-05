@@ -18,6 +18,7 @@ export interface OcFileDiff {
   after: string;
   additions: number;
   deletions: number;
+  patch?: string;
 }
 
 export interface OcToolState {
@@ -85,6 +86,13 @@ export interface OcPermission {
  * already consumes; legacy payloads pass through untouched.
  */
 export function normalizePermission(props: Record<string, unknown>): OcPermission {
+  if (typeof props.action === "string") {
+    const source = props.source as { messageID?: string; id?: string } | undefined;
+    return { id: String(props.id), sessionID: String(props.sessionID), type: props.action,
+      title: String(props.message ?? props.action), pattern: props.resources as string[],
+      metadata: props.metadata as Record<string, unknown> | undefined,
+      messageID: source?.messageID, callID: source?.id };
+  }
   // New shape discriminator: a string `permission` field (legacy uses `type`).
   if (typeof props.permission === "string") {
     const permission = props.permission;
@@ -108,6 +116,7 @@ export function normalizePermission(props: Record<string, unknown>): OcPermissio
 export interface OcQuestionOption {
   label: string;
   description: string;
+  value?: string;
 }
 
 /** A single question in a QuestionRequest. */
@@ -119,6 +128,7 @@ export interface OcQuestionInfo {
   multiple?: boolean;
   /** Free-text answer — deferred this round. */
   custom?: boolean;
+  field?: import("@opencode/client").FormField;
 }
 
 /**
@@ -131,6 +141,7 @@ export interface OcQuestionRequest {
   sessionID: string;
   questions: OcQuestionInfo[];
   tool?: { messageID: string; callID: string };
+  form?: import("@opencode/client").FormInfo;
 }
 
 export type OcSessionStatus =
@@ -145,6 +156,7 @@ export interface OcSessionStatusPayload {
 
 export interface OcEvent {
   type: string;
+  directory?: string;
   properties?: OcSessionStatusPayload & {
     part?: OcPart;
     info?: OcMessageInfo;
@@ -153,7 +165,14 @@ export interface OcEvent {
   };
 }
 
-/** The v1 SDK client instance (createOpencodeClient), typed loosely. */
-export type OCClient = ReturnType<
-  typeof import("@opencode-ai/sdk").createOpencodeClient
->;
+/** Stable bridge-facing port. Wire contracts are implemented by the V2 adapter. */
+type Call = (input?: any) => Promise<any>;
+export interface OCClient {
+  v2?: import("@opencode/client").OpenCodeClient;
+  directory?: string;
+  session: { status: Call; create: Call; get: Call; messages: Call; list: Call; diff: Call;
+    abort: Call; delete: Call; promptAsync: Call; command: Call };
+  config: { providers: Call; get: Call };
+  app: { agents: Call };
+  postSessionIdPermissionsPermissionId: Call;
+}

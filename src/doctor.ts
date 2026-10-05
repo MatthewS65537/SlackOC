@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { loadConfig } from "./config.js";
-import { MIN_OPENCODE, VERSION } from "./version.js";
+import { isSupportedOpencodeVersion, MIN_OPENCODE, VERSION } from "./version.js";
 
 const execFileP = promisify(execFile);
 
@@ -13,14 +13,17 @@ export interface Check {
 
 /**
  * Verdict for a live scope probe. The probe calls a scoped API with bogus
- * arguments: any non-scope error means the scope check PASSED before param
- * validation (granted); "missing_scope" means the installed app's manifest
- * drifted behind ours and needs a reinstall.
+ * arguments. Known resource-validation errors prove access; auth, rate-limit,
+ * server and unknown failures do not. Missing scopes require a reinstall.
  */
 export function scopeCheck(name: string, body: { ok: boolean; error?: string }): Check {
-  return body.error === "missing_scope"
-    ? { name, ok: false, detail: "missing — the installed app is behind the manifest; reinstall it (OAuth & Permissions → Reinstall)" }
-    : { name, ok: true, detail: "granted" };
+  if (body.error === "missing_scope") {
+    return { name, ok: false, detail: "missing — the installed app is behind the manifest; reinstall it (OAuth & Permissions → Reinstall)" };
+  }
+  if (body.ok || ["file_not_found", "channel_not_found", "message_not_found", "no_reaction"].includes(body.error ?? "")) {
+    return { name, ok: true, detail: "granted" };
+  }
+  return { name, ok: false, detail: `unverified — ${body.error ?? "unexpected response"}; resolve the probe failure and rerun doctor` };
 }
 
 export async function runDoctor(): Promise<number> {
@@ -34,11 +37,9 @@ export async function runDoctor(): Promise<number> {
 
   try {
     const { stdout } = await execFileP("opencode", ["--version"], { timeout: 15_000 });
-    const v = stdout.trim().match(/(\d+)\.(\d+)\.(\d+)/);
-    if (!v) throw new Error(`unexpected version output: ${stdout.slice(0, 80).trim()}`);
-    const [M, m, p] = [Number(v[1]), Number(v[2]), Number(v[3])] as const;
-    const okV = M > MIN_OPENCODE[0] || (M === MIN_OPENCODE[0] && (m > MIN_OPENCODE[1] || (m === MIN_OPENCODE[1] && p >= MIN_OPENCODE[2])));
-    checks.push({ name: `opencode ≥ ${MIN_OPENCODE.join(".")}`, ok: okV, detail: `${M}.${m}.${p}` });
+    const version = stdout.trim().replace(/^opencode\s+/, "");
+    checks.push({ name: `opencode V${MIN_OPENCODE[0]} ≥ ${MIN_OPENCODE.join(".")}`, ok: isSupportedOpencodeVersion(version),
+      detail: version.slice(0, 120) || "empty version output" });
   } catch (err) {
     checks.push({ name: "opencode on PATH", ok: false, detail: `not found or failed — ${String(err).slice(0, 120)}` });
   }

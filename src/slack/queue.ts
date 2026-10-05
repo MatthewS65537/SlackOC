@@ -4,12 +4,13 @@
  *
  *  - chat.postMessage is limited to ~1 message/second PER CHANNEL — a busy
  *    thread must never serialize behind traffic to other channels/threads.
- *  - The limit tiers are app+method scoped — a 429 anywhere means everyone
- *    pauses for Retry-After (the global brake below).
+ *  - The limit tiers are app+method scoped — a 429 pauses that method across
+ *    channels for Retry-After, without stopping other methods.
  *
- * Every op is keyed by its channel (the owner-DM channel included). Each
- * channel lane has its own ~1.05s pacing clock and drains independently,
- * interactive ops before background ops:
+ * Every op is keyed by method and channel (the owner-DM channel included).
+ * Posting lanes have a ~1.05s pacing clock; history starts share a 1.5s clock
+ * across channels. Other methods drain independently, interactive ops before
+ * background ops:
  *
  *  - interactive — things the user is actively waiting on: command replies,
  *    permission/question asks, cold-start acks, button-answer updates.
@@ -38,12 +39,16 @@ export { SLACK_UPLOAD_TIMEOUT_MS, slackWebClientOptions } from "./transport.js";
 export const SLACK_OP_TIMEOUT_MS = 30_000;
 /** Pacing between op starts within one channel lane. */
 export const SLACK_PACE_MS = 1_050;
+/** Shared history spacing: 40 starts/minute, below Slack's internal-app Tier 3 allowance. */
+export const SLACK_HISTORY_PACE_MS = 1_500;
 /** Background ops pending longer than this promote ahead of interactive traffic for one round. */
 export const PROMOTE_AFTER_MS = 30_000;
 
 export type SlackLane = "interactive" | "background";
 
 export interface EnqueueOpts {
+  /** Slack rate limits are method/workspace scoped; only posts share the channel clock. */
+  method?: string;
   /** Every outbound Slack call is channel-bound — this drives lane pacing. */
   channel: string;
   /** "interactive" jumps ahead of queued background work in the same channel. */
@@ -68,8 +73,9 @@ interface ChannelLane {
 }
 
 const lanes = new Map<string, ChannelLane>();
-/** 429 brake: all lanes hold until this time (Slack limits are app+method scoped). */
-let globalCooldownUntil = 0;
+/** 429 brakes shared by all channels using the affected method. */
+const cooldowns = new Map<string, number>();
+let nextHistoryCallAt = 0;
 let droppedOps = 0;
 
 /** Ops that failed permanently (retry exhaustion, timeout, hard error) and were dropped — surfaced in \status. */
@@ -86,8 +92,9 @@ export function queueDepth(): number {
 
 /** Pending ops in ONE channel's lane — tick-yield and the sink circuit breaker are channel-local. */
 export function laneDepth(channel: string): number {
-  const lane = lanes.get(channel);
-  return lane ? lane.interactive.length + lane.background.length : 0;
+  let n = 0;
+  for (const [key, lane] of lanes) if (key.endsWith(`:${channel}`)) n += lane.interactive.length + lane.background.length;
+  return n;
 }
 
 /** Age of the oldest pending op across all lanes — queue-health signal for \status. */
@@ -126,7 +133,9 @@ function takeNext(lane: ChannelLane): QueuedOp | undefined {
 }
 
 export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: EnqueueOpts): Promise<T> {
-  const lane = getLane(opts.channel);
+  const method = opts.method ?? "chat.postMessage";
+  const lane = getLane(`${method}:${opts.channel}`);
+  const pace = method === "chat.postMessage" ? SLACK_PACE_MS : 0;
   const laneKind = opts.lane ?? "background";
   return new Promise<T>((resolve, reject) => {
     (laneKind === "interactive" ? lane.interactive : lane.background).push({
@@ -137,11 +146,14 @@ export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: Enqueu
           try {
             // Re-check after every wake: another lane may have extended the brake.
             for (;;) {
-              const wait = Math.max(lane.lastCall + SLACK_PACE_MS, globalCooldownUntil) - Date.now();
+              const wait = Math.max(lane.lastCall + pace, cooldowns.get(method) ?? 0,
+                method === "conversations.replies" ? nextHistoryCallAt : 0) - Date.now();
               if (wait <= 0) break;
               await sleep(wait);
             }
             lane.lastCall = Date.now();
+            // Reserve before any await so cross-channel waiters cannot start together.
+            if (method === "conversations.replies") nextHistoryCallAt = lane.lastCall + SLACK_HISTORY_PACE_MS;
             const timeoutMs = opts.timeoutMs ?? SLACK_OP_TIMEOUT_MS;
             resolve(await withDeadline(
               (signal) => withSlackOperation(signal, timeoutMs, () => op(signal)),
@@ -156,7 +168,7 @@ export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: Enqueu
               retryAfter !== undefined || /^HTTP 429\b/i.test(e?.message ?? "");
             if (limited) {
               const waitMs = retryAfter !== undefined ? retryAfter * 1000 : 2000 * 2 ** Math.min(attempt, 2);
-              globalCooldownUntil = Math.max(globalCooldownUntil, Date.now() + waitMs);
+              cooldowns.set(method, Math.max(cooldowns.get(method) ?? 0, Date.now() + waitMs));
               if (attempt < 3 && opts.retryRateLimits !== false) continue;
             }
             // Permanent failure — the op is dropped. NEVER silently: a summary
@@ -191,6 +203,7 @@ async function drain(lane: ChannelLane): Promise<void> {
 /** Test hook: reset all lanes/brake/drop state between test cases with fresh fake timers. */
 export function _resetQueueForTests(): void {
   lanes.clear();
-  globalCooldownUntil = 0;
+  cooldowns.clear();
+  nextHistoryCallAt = 0;
   droppedOps = 0;
 }
