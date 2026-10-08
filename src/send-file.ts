@@ -89,7 +89,7 @@ async function assertBinding(path: string, binding: Binding): Promise<void> {
 
 /** Credential locations the agent may never ship into Slack, even with permission. */
 const SECRET_DIRS = [".ssh", ".aws", ".gnupg", ".kube", ".docker", join(".config", "gh"), join(".local", "state", "opencode")];
-const SECRET_FILES = /^(id_[a-z0-9]+(\.pub)?|.*\.(pem|key|p12|pfx)|\.netrc|\.npmrc|\.pypirc|credentials(\.json)?)$/i;
+const SECRET_FILES = /^(id_[a-z0-9]+(\.pub)?|.*\.(pem|p12|pfx)|\.env(\..+)?|\.netrc|\.npmrc|\.pypirc|credentials(\.json)?)$/i;
 
 /** Refuse SlackOC's own token file/dir and common credential stores (symlinks resolved). */
 async function assertNotSecret(file: string, configPath: string): Promise<void> {

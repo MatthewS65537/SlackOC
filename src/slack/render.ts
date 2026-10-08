@@ -240,8 +240,8 @@ export class SessionView {
   private readonly msgRoles = new Map<string, string>(); // messageID -> role (filter user echo)
   /** Assistant text part ids already posted to Slack (backstop dedup). */
   private readonly postedPartIds = new Set<string>();
-  /** Answer text being streamed into Slack while the model writes it (partId → live messages). */
-  private readonly streams = new Map<string, TextStream>();
+  /** Paragraph streaming: raw chars of each text part already posted (partId → length). */
+  private readonly streamedLen = new Map<string, number>();
   /** Tool call ids whose start line is already posted (pending → running dedup). */
   private readonly postedToolStarts = new Set<string>();
   private readonly terminalTools = new Set<string>();
@@ -421,8 +421,6 @@ export class SessionView {
     this.active = false;
     this.generation++;
     this.stopTimers();
-    for (const stream of this.streams.values()) clearTimeout(stream.timer);
-    this.streams.clear();
     this.toolBuf.length = 0;
     if (this.statusTs) {
       void this.deleteStatus(this.statusTs);
@@ -918,15 +916,11 @@ export class SessionView {
           const text = part.text ?? "";
           if (part.time?.end) {
             this.pendingText.delete(part.id);
-            if (this.streams.has(part.id)) await this.endStream(part.id, text);
-            else if (text.trim() && !this.postedPartIds.has(part.id)) {
-              this.postedPartIds.add(part.id);
-              await this.postThreadText(text);
-            }
+            if (!this.postedPartIds.has(part.id)) await this.postRemainder(part.id, text);
           } else {
             this.pendingText.set(part.id, text);
             this.activityUpdate("typing…");
-            if (!this.postedPartIds.has(part.id) && this.streamingEnabled()) await this.streamText(part.id, text);
+            if (!this.postedPartIds.has(part.id) && this.streamingEnabled()) await this.postParagraphs(part.id, text);
           }
         } else if (part.type === "tool") {
           await this.handleTool(part);
@@ -1015,8 +1009,6 @@ export class SessionView {
   }
 
   private static readonly TICK_MS = 1_000;
-  private static readonly STREAMING_TICK_MS = 3_000;
-  private lastPlainTickAt = 0;
 
   private tick(): void {
     if (this.finalized || this.disposed || this.tickInFlight) return;
@@ -1035,10 +1027,6 @@ export class SessionView {
     // re-render, and the next beat is 1s away regardless (issue #3). Only the
     // plain re-render yields — the sink above never does.
     if (laneDepth(this.channel) > 0) return;
-    // A growing answer is its own progress signal; keep the combined
-    // chat.update rate (bar + live answer edits) inside Slack's Tier 3.
-    if (this.streams.size && Date.now() - this.lastPlainTickAt < SessionView.STREAMING_TICK_MS) return;
-    this.lastPlainTickAt = Date.now();
     this.tickInFlight = true;
     this.tickSeen += 1;
     void this.updateStatus(this.statusTs, this.statusText())
@@ -1165,16 +1153,14 @@ export class SessionView {
   }
 
   /** Post the section divider + first line as one message when a divider is due. */
-  private async postSection(s: "tools" | "response", firstLine: string, onPrefix?: (prefix: string) => void): Promise<string | undefined> {
+  private async postSection(s: "tools" | "response", firstLine: string): Promise<void> {
     if (this.disposed) return;
     const divider = this.verbose === "off" ? null : this.enterSection(s);
-    const prefix = divider ? `${divider}\n\n` : "";
-    onPrefix?.(prefix);
     // Tool chatter suppresses link previews; answer text keeps them.
-    const { ts } = await this.deps.post(
+    await this.deps.post(
       this.channel,
       this.threadTs,
-      `${prefix}${firstLine}`,
+      divider ? `${divider}\n\n${firstLine}` : firstLine,
       undefined,
       { unfurl: s === "tools" ? false : undefined },
     );
@@ -1183,7 +1169,6 @@ export class SessionView {
     // ack) after its LAST message, so the bar re-homes cleanly below a whole
     // logical step instead of splitting a tools→answer pair mid-flight.
     this.contentBelow = true;
-    return ts;
   }
 
   /** Emit buffered tool lines as a single tools-section message (atomic with the divider). */
@@ -1368,93 +1353,25 @@ export class SessionView {
     return this.state.getThread(this.threadKey)?.stream !== false;
   }
 
-  /** Live answer messages are edited at most this often (chat.update is Tier 3). */
-  static readonly STREAM_UPDATE_MS = 1_500;
-
   /**
-   * Stream a still-growing text part: the first visible text posts at once
-   * (inside the event chain, so it orders after buffered tool lines); later
-   * growth is coalesced into in-place edits OFF the event chain, so a slow
-   * Slack edit never delays processing of the next event.
+   * Paragraph streaming: while a text part grows, post each finished paragraph
+   * (a blank line outside a code fence) as a normal message — no in-place
+   * edits. Posts are paced, so paragraphs finished meanwhile go out together.
    */
-  private async streamText(partId: string, text: string): Promise<void> {
-    if (this.disposed) return;
-    const existing = this.streams.get(partId);
-    if (existing) {
-      existing.latest = text;
-      this.scheduleStreamFlush(existing);
-      return;
-    }
-    const chunks = chunkText(mdToMrkdwn(closeOpenFences(text)).trim());
-    const first = chunks[0];
-    if (!first) return;
-    const stream: TextStream = { partId, latest: text, prefix: "", messages: [], sent: [], chain: Promise.resolve(), failed: false };
-    this.streams.set(partId, stream);
-    await this.flushTools(); // buffered tool chatter precedes response content
-    const ts = await this.postSection("response", first, (prefix) => { stream.prefix = prefix; });
-    if (!ts) { this.streams.delete(partId); return; }
-    stream.messages.push(ts);
-    stream.sent.push(first);
-    this.maybeSink();
-    if (stream.latest !== text) this.scheduleStreamFlush(stream);
+  private async postParagraphs(partId: string, text: string): Promise<void> {
+    const done = this.streamedLen.get(partId) ?? 0;
+    const cut = paragraphCut(text);
+    if (cut <= done) return;
+    this.streamedLen.set(partId, cut);
+    await this.postThreadText(text.slice(done, cut));
   }
 
-  private scheduleStreamFlush(stream: TextStream): void {
-    if (stream.timer || this.disposed) return;
-    stream.timer = setTimeout(() => {
-      stream.timer = undefined;
-      stream.chain = stream.chain.then(() => this.syncStream(stream, false)).catch((err) => {
-        stream.failed = true;
-        logErr(`answer stream update failed (${this.sessionId}): ${errorMessage(err)}`);
-      });
-    }, SessionView.STREAM_UPDATE_MS);
-    stream.timer.unref?.();
-  }
-
-  /** Bring the live messages up to `stream.latest`: edit changed chunks, post overflow chunks. */
-  private async syncStream(stream: TextStream, final: boolean): Promise<void> {
-    if (this.disposed) return;
-    const raw = final ? stream.latest : closeOpenFences(stream.latest);
-    const chunks = chunkText(mdToMrkdwn(raw).trim());
-    for (let i = 0; i < chunks.length; i++) {
-      if (this.disposed) return;
-      const chunk = chunks[i]!;
-      if (i < stream.messages.length) {
-        if (stream.sent[i] === chunk) continue;
-        await this.deps.update(this.channel, stream.messages[i]!, i === 0 ? `${stream.prefix}${chunk}` : chunk);
-        stream.sent[i] = chunk;
-      } else {
-        const { ts } = await this.deps.post(this.channel, this.threadTs, chunk);
-        stream.messages.push(ts);
-        stream.sent.push(chunk);
-        this.contentBelow = true; // a continuation message landed below the bar
-        this.maybeSink();
-      }
-    }
-  }
-
-  /** The part finished: make the live messages match the final text exactly. */
-  private async endStream(partId: string, text: string): Promise<void> {
-    const stream = this.streams.get(partId);
-    if (!stream) return;
-    clearTimeout(stream.timer);
-    stream.timer = undefined;
-    stream.latest = text;
-    await stream.chain;
-    this.streams.delete(partId);
+  /** Part finished (or flushed at finalize): post whatever paragraph streaming hasn't. */
+  private async postRemainder(partId: string, text: string): Promise<void> {
+    const done = this.streamedLen.get(partId) ?? 0;
     this.postedPartIds.add(partId);
-    try {
-      if (stream.failed) throw new Error("an earlier live edit failed");
-      await this.syncStream(stream, true);
-    } catch (err) {
-      // Never lose the answer to a failed edit: replace the stale partial
-      // messages (best effort) with the final text, posted fresh.
-      logErr(`answer stream finalize failed (${this.sessionId}): ${errorMessage(err)} — reposting the full answer`);
-      await Promise.all(stream.messages.map(ts => this.deps.delete(this.channel, ts).catch(() => {})));
-      await this.postThreadText(text);
-      return;
-    }
-    this.maybeSink();
+    this.streamedLen.set(partId, Math.max(done, text.length));
+    if (text.length > done) await this.postThreadText(text.slice(done));
   }
 
   async postThreadText(text: string): Promise<void> {
@@ -1514,17 +1431,6 @@ export class SessionView {
     this.outstandingPrompts = 0;
     await this.flushTools().catch((error) => logErr(`final tool flush failed (${this.sessionId}): ${errorMessage(error)}`));
 
-    // Flush text that never got an explicit `end` marker.
-    for (const [id, text] of this.pendingText) {
-      if (this.streams.has(id)) {
-        await this.endStream(id, text).catch((error) => logErr(`final stream flush failed (${this.sessionId}): ${errorMessage(error)}`));
-      } else if (text.trim() && !this.postedPartIds.has(id)) {
-        this.postedPartIds.add(id);
-        await this.postThreadText(text).catch((error) => logErr(`final text flush failed (${this.sessionId}): ${errorMessage(error)}`));
-      }
-    }
-    this.pendingText.clear();
-
     // Delivery backstop: the SSE stream can drop the final text part (or its
     // post can be silently lost), so pull the session's messages and post any
     // assistant text Slack never got. Only messages created for THIS run are
@@ -1541,9 +1447,9 @@ export class SessionView {
         for (const p of m.parts ?? []) {
           if (p.type === "text") {
             const text = (p as { text?: string }).text ?? "";
-            if (!text.trim() || this.postedPartIds.has(p.id)) continue;
-            this.postedPartIds.add(p.id);
-            await this.postThreadText(text);
+            // A posted part whose tail never arrived over SSE still gets its remainder.
+            if (this.postedPartIds.has(p.id) && (this.streamedLen.get(p.id) ?? Infinity) >= text.length) continue;
+            await this.postRemainder(p.id, text);
           } else if (p.type === "file") {
             await this.postFilePart(p).catch(() => {});
           }
@@ -1552,6 +1458,16 @@ export class SessionView {
     } catch {
       /* best effort — SSE delivery already handled the common path */
     }
+
+    // Then text that never got an explicit `end` marker and the transcript
+    // didn't cover (fetch failed). Runs after the backstop so a part's
+    // authoritative final text wins over its last SSE snapshot.
+    for (const [id, text] of this.pendingText) {
+      if (!this.postedPartIds.has(id)) {
+        await this.postRemainder(id, text).catch((error) => logErr(`final text flush failed (${this.sessionId}): ${errorMessage(error)}`));
+      }
+    }
+    this.pendingText.clear();
 
     const summary: { additions: number; deletions: number; files: number } | null = await summaryFetch;
 
@@ -1636,24 +1552,14 @@ export class SessionView {
   }
 }
 
-interface TextStream {
-  partId: string;
-  /** Newest raw (markdown) text seen for the part. */
-  latest: string;
-  /** Section divider the first message was posted with (kept on every edit). */
-  prefix: string;
-  /** Slack ts of each live message, one per chunk. */
-  messages: string[];
-  /** Converted chunk text last delivered to each message. */
-  sent: string[];
-  /** Serializes edits for this stream. */
-  chain: Promise<void>;
-  timer?: NodeJS.Timeout;
-  failed: boolean;
-}
-
-/** A partial answer may stop mid code block; close it so the live render stays sane. */
-export function closeOpenFences(text: string): string {
-  const fences = text.match(/^\s*```/gm)?.length ?? 0;
-  return fences % 2 ? `${text}\n\`\`\`` : text;
+/** End index of the last paragraph break (blank line) outside a code fence; 0 when none. */
+export function paragraphCut(text: string): number {
+  let cut = 0;
+  let inFence = false;
+  const re = /^[ \t]*```|\n[ \t]*\n/gm;
+  for (let m: RegExpExecArray | null; (m = re.exec(text));) {
+    if (m[0].includes("```")) inFence = !inFence;
+    else if (!inFence) cut = m.index + m[0].length;
+  }
+  return cut;
 }

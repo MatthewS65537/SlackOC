@@ -70,7 +70,6 @@ const SLACK_REJECTIONS = new Set([
   "cannot_reply_to_message", "thread_not_found", "restricted_action_read_only_channel", "restricted_action_thread_only_channel",
 ]);
 
-/** A transport error, 5xx, or unfamiliar Slack error is not proof of rejection. */
 /** Non-rate-limit rejections are terminal after this many delivery attempts. */
 const PERMANENT_REJECTION_ATTEMPTS = 5;
 
@@ -79,6 +78,7 @@ function rateLimited(error: unknown): boolean {
   return e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 || e?.data?.error === "ratelimited";
 }
 
+/** A transport error, 5xx, or unfamiliar Slack error is not proof of rejection. */
 function definiteDeliveryRejection(error: unknown): boolean {
   const e = error as { code?: string; statusCode?: number; data?: { ok?: boolean; error?: string } } | undefined;
   return e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 ||

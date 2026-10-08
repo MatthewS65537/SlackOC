@@ -177,4 +177,14 @@ describe("credential guard", () => {
     writeFileSync(key, "-----BEGIN OPENSSH PRIVATE KEY-----");
     await expect(sendFile({ file: key, session: "ses_current" }, { configPath, statePath })).rejects.toThrow(/credentials/);
   });
+
+  it("refuses .env files but lets Keynote .key decks through", async () => {
+    const env = `${root}/.env.local`;
+    writeFileSync(env, "API_KEY=secret");
+    await expect(sendFile({ file: env, session: "ses_current" }, { configPath, statePath })).rejects.toThrow(/credentials/);
+    const deck = `${root}/talk.key`;
+    writeFileSync(deck, "keynote bytes");
+    const outcome = await sendFile({ file: deck, session: "ses_current" }, { configPath, statePath }).then(() => null, (err: Error) => err);
+    expect(String(outcome?.message ?? "")).not.toMatch(/credentials/);
+  });
 });

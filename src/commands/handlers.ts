@@ -303,7 +303,7 @@ registerCommand({
 registerCommand({
   name: "stream",
   usage: "\\stream [on|off]",
-  summary: "Show answers live as they are written (on), or only once complete (off)",
+  summary: "Post answers paragraph by paragraph as they are written (on), or each part once complete (off)",
   async run(ctx, args) {
     const th = requireThread(ctx);
     const arg = args.toLowerCase();
@@ -314,7 +314,7 @@ registerCommand({
     }
     if (arg !== "on" && arg !== "off") throw new Error("usage: \\stream on|off");
     ctx.state.setThread(ctx.threadKey, { ...th, stream: arg === "on" });
-    await ctx.postToThread(arg === "on" ? "Answers will appear live as they are written." : "Answers will post once each part is complete.");
+    await ctx.postToThread(arg === "on" ? "Answers will post paragraph by paragraph as they are written." : "Answers will post once each part is complete.");
   },
 });
 
