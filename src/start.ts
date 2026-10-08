@@ -1201,8 +1201,9 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     // Channels/groups: any THREAD reply gets routed — threads born from a bare
     // command (e.g. \help, \model) have no session binding yet, but later
     // non-command messages there should still prompt OpenCode (a fresh session
-    // is created on demand). Owner-only gating happens inside the router.
-    if (e.thread_ts) {
+    // is created on demand). \listen channels route top-level messages too.
+    // Owner-only gating and message/app_mention dedup happen inside the router.
+    if (e.thread_ts || state.isAlwaysOn(e.channel)) {
       await handleIncomingMessage(e, bridge).catch((err) => console.error(err));
     }
   });

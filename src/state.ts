@@ -75,6 +75,8 @@ interface SlackocState {
   recoveryPaused?: boolean;
   /** Expired unbound receipts cannot be resurrected by delayed delivery or a later binding. */
   unboundReceiptFloorTs?: string;
+  /** \listen: channels where every top-level owner message prompts, no @ needed (default: none). */
+  alwaysOnChannels?: string[];
 }
 
 export type MessageDisposition = "processing" | "accepted" | "uncertain";
@@ -249,6 +251,16 @@ export class StateStore {
 
   threadKey(channel: string, ts: string): string {
     return `${channel}:${ts}`;
+  }
+
+  isAlwaysOn(channel: string): boolean {
+    return this.state.alwaysOnChannels?.includes(channel) ?? false;
+  }
+
+  setAlwaysOn(channel: string, on: boolean): void {
+    const rest = (this.state.alwaysOnChannels ?? []).filter(c => c !== channel);
+    this.state.alwaysOnChannels = on ? [...rest, channel] : rest;
+    this.save();
   }
 
   getThread(key: string): ThreadState | null {

@@ -108,7 +108,7 @@ async function rebindThread(
 
 /** Grouping + order for `\help`; every registered command must appear here. */
 export const HELP_SECTIONS: Array<{ title: string; names: string[] }> = [
-  { title: "Threads & replies", names: ["hush", "verbose", "stream"] },
+  { title: "Threads & replies", names: ["hush", "listen", "verbose", "stream"] },
   { title: "Sessions", names: ["new", "sessions", "resume", "stop", "abort", "diff"] },
   { title: "Monitoring", names: ["watch", "unwatch", "history", "summary"] },
   { title: "Model & agent", names: ["model", "agent"] },
@@ -258,6 +258,29 @@ registerCommand({
         ? "🤫 Hushed — I'll stay quiet in this thread until you `\\hush` again or @ me."
         : "🔔 Awake — I'll keep replying in this thread.",
     );
+  },
+});
+
+registerCommand({
+  name: "listen",
+  usage: "\\listen [on|off]",
+  summary: "Answer every message of yours in this channel, no @ needed (off by default)",
+  detail: "Applies to the whole channel: each top-level message starts its own thread. DMs always listen.",
+  async run(ctx, args) {
+    if (ctx.channelId.startsWith("D")) {
+      await ctx.postToThread("DMs always listen already — no @ needed here.");
+      return;
+    }
+    const arg = args.toLowerCase();
+    if (!arg) {
+      await ctx.postToThread(`Listening to every message in this channel: \`${ctx.state.isAlwaysOn(ctx.channelId) ? "on" : "off"}\``);
+      return;
+    }
+    if (arg !== "on" && arg !== "off") throw new Error("usage: \\listen on|off");
+    ctx.state.setAlwaysOn(ctx.channelId, arg === "on");
+    await ctx.postToThread(arg === "on"
+      ? "👂 Listening — every message you post in this channel starts a session, no @ needed. `\\listen off` to stop."
+      : "Back to @-only in this channel.");
   },
 });
 

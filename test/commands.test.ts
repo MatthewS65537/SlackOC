@@ -1215,3 +1215,31 @@ describe("\\watch / \\unwatch (RESUME_SESSIONS phase 3)", () => {
     expect(out.at(-1)).toContain("isn't watching");
   });
 });
+
+describe("\\listen", () => {
+  const dir = join(import.meta.dirname, ".fixtures", "listen");
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("is off by default and toggles per channel, persisting across reloads", async () => {
+    rmSync(dir, { recursive: true, force: true });
+    const state = new StateStore(join(dir, "state.json"));
+    const out: string[] = [];
+    const ctx = baseCtx(state, out);
+    expect(state.isAlwaysOn("C1")).toBe(false);
+    await execute({ name: "listen", args: "" }, ctx);
+    expect(out.at(-1)).toMatch(/`off`/);
+    await execute({ name: "listen", args: "on" }, ctx);
+    expect(new StateStore(join(dir, "state.json")).isAlwaysOn("C1")).toBe(true);
+    expect(state.isAlwaysOn("C2")).toBe(false);
+    await execute({ name: "listen", args: "off" }, ctx);
+    expect(new StateStore(join(dir, "state.json")).isAlwaysOn("C1")).toBe(false);
+  });
+
+  it("explains that DMs always listen", async () => {
+    const out: string[] = [];
+    const state = new StateStore(join(dir, "dm-state.json"));
+    await execute({ name: "listen", args: "on" }, baseCtx(state, out, null, { channelId: "D1" }));
+    expect(out.at(-1)).toMatch(/DMs always listen/);
+    expect(state.isAlwaysOn("D1")).toBe(false);
+  });
+});

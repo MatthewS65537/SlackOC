@@ -38,6 +38,7 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 ## Features
 
 - **Remote prompting** from Slack DM or mention, with answers streamed into threads
+- **Always-on channels** — `\listen on` in a channel makes every top-level message of yours start a session without an @ (off by default; DMs always listen)
 - **Proactive threads with a mute** — once a thread has a session, replies are answered with no @ mention needed; `\hush` quiets the thread (an @ always wakes it)
 - **Tool visibility by default** — `\verbose full|on|off`; compact tool batches flush after 1.5 seconds or at a size threshold, and before answers. Paths, commands, and search patterns use inline code; shell descriptions stay concise. `full` adds output snippets. Slack queueing or rate limits may delay delivery
 - **Clear progress** — literal ⏳/⌛ characters, elapsed time, waiting-for-answer/permission and connection states; the indicator moves below new content, with bounded retry backoff when Slack is unavailable
