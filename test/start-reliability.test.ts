@@ -1364,8 +1364,12 @@ describe("startBridge reliability wiring", () => {
     await boot();
     const bot = f.app.options.clientOptions;
     const socket = f.receiver.options.installerOptions.clientOptions;
-    expect(socket).toBe(bot);
+    // The socket client must NOT share the bot's retries:0 — that is what let one
+    // failed apps.connections.open end Socket Mode permanently. The supervisor owns reconnects.
+    expect(socket).not.toBe(bot);
     expect(bot.retryConfig.retries).toBe(0);
+    expect(socket.retryConfig.retries).toBeGreaterThan(0);
+    expect(f.receiver.options.autoReconnectEnabled).toBe(false);
     const signals: AbortSignal[] = [];
     vi.mocked(fetch).mockImplementation(async (_url, init) => {
       const signal = init!.signal!;

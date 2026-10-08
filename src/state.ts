@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalDir } from "./paths.js";
 import { logErr } from "./log.js";
@@ -19,6 +19,8 @@ export interface ThreadState {
   hushed?: boolean;
   /** \notify toggle: when true, run completions are DM'd to the owner */
   notify?: boolean;
+  /** \stream toggle: false posts answer text only once each part completes (default: stream live). */
+  stream?: boolean;
   /** Private context owned by a durable scheduled report, not a replayed prompt. */
   scheduledRunId?: string;
   /**
@@ -108,13 +110,20 @@ export class StateStore {
   constructor(private path: string, readonly now: () => number = Date.now) {
     this.state = { threads: {}, projects: {} };
     if (existsSync(path)) {
+      let problem: string | undefined;
       try {
         const parsed = JSON.parse(readFileSync(path, "utf8")) as SlackocState;
-        if (parsed && typeof parsed === "object" && parsed.threads && parsed.projects) {
-          this.state = parsed;
-        }
-      } catch {
-        /* corrupt state → start clean */
+        if (parsed && typeof parsed === "object" && parsed.threads && parsed.projects) this.state = parsed;
+        else problem = "unexpected shape";
+      } catch (err) {
+        problem = String((err as Error)?.message ?? err);
+      }
+      if (problem) {
+        // Never let the first save() silently overwrite the only copy of every
+        // thread binding: keep the damaged file for inspection, then start clean.
+        const backup = `${path}.corrupt-${new Date(now()).toISOString().replace(/[:.]/g, "-")}`;
+        try { renameSync(path, backup); } catch { /* best effort */ }
+        logErr(`state.json unreadable (${problem}) — moved to ${backup}; starting with empty state`);
       }
     }
     this.normalizeProjects();
@@ -512,13 +521,20 @@ export class StateStore {
       uncertain: receipts.filter((r) => r.disposition === "uncertain").length, ...counts, threads };
   }
 
-  /** tmp + rename: a crash mid-write can corrupt the tmp file, never the live state.json. */
+  /** tmp + fsync + rename: a crash mid-write can corrupt the tmp file, never the live state.json. */
   save(): void {
     this.normalizeProjects();
     this.prune();
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
+    // fsync before rename: after power loss the rename must not expose a truncated file.
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeSync(fd, JSON.stringify(this.state, null, 2));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, this.path);
     try {
       chmodSync(this.path, 0o600);

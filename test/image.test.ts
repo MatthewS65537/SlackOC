@@ -52,7 +52,7 @@ describe("shrinkImage", () => {
     expect(out!.data.length).toBeLessThanOrEqual(TARGET_IMAGE_BYTES);
     const back = await Jimp.read(out!.data);
     expect(back.bitmap.width).toBeGreaterThan(0);
-  });
+  }, 30_000); // CPU-heavy JPEG search; slow CI/laptops exceeded the 5s default
 
   it("appends .jpg to a filename that has no extension", async () => {
     const png = await noisePng(400, 300);

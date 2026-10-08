@@ -592,7 +592,7 @@ describe("attachments key off files presence, not subtype", () => {
     expect(String(file?.url)).toMatch(/^data:image\/jpeg;base64,/);
     expect(log.posted.some((p) => p.includes("compressed"))).toBe(true);
     expect(log.posted.some((p) => p.includes("too large to send"))).toBe(false);
-  });
+  }, 30_000); // CPU-heavy JPEG search; slow CI/laptops exceeded the 5s default
 
   it("mid-size image (over 1MB target, under 8MB) is now compressed, not passed through", async () => {
     // The 413 regression: a 2MB image is a 2.7MB data URI — under the old 8MB

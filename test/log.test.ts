@@ -150,3 +150,24 @@ describe("follow cursor (\\logs --follow)", () => {
     expect(newLogsSince(0)).toEqual([]);
   });
 });
+
+describe("repeated-line collapsing", () => {
+  it("writes the first 5 copies, flags the 6th, suppresses the rest, then summarizes", () => {
+    vi.useFakeTimers();
+    try {
+      clearLogs();
+      for (let i = 0; i < 100; i++) pushLog("slack op dropped: fetch failed");
+      const lines = recentLogs(200);
+      expect(lines).toHaveLength(6);
+      expect(lines[5]).toContain("further copies suppressed");
+      vi.advanceTimersByTime(60_000);
+      pushLog("slack op dropped: fetch failed");
+      expect(recentLogs(1)[0]).toContain("(+95 identical in the last 60s)");
+      pushLog("other line");
+      expect(recentLogs(1)[0]).toMatch(/other line$/);
+    } finally {
+      vi.useRealTimers();
+      clearLogs();
+    }
+  });
+});

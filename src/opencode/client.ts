@@ -62,14 +62,19 @@ export function makeClient(baseUrl: string, options: ClientOptions = {}): OCClie
       request = new Request(url, { method: request.method, headers, body: request.body,
         signal: request.signal, ...(request.body ? { duplex: "half" } : {}) } as RequestInit);
     }
-    if (new URL(request.url).pathname === "/api/event") return fetch(request);
+    if (new URL(request.url).pathname === "/api/event") return fetchHeaders(request, EVENT_CONNECT_TIMEOUT_MS);
     const release = options.onRequest?.();
     const timeoutMs = new URL(request.url).pathname.endsWith("/command") ? COMMAND_TIMEOUT_MS : options.timeoutMs;
     try {
       const response = await abortableFetch(request, {}, { ...options, timeoutMs });
-      if (response.status === 401 || response.status >= 500) options.onFault?.();
+      // Only a credential/endpoint change warrants rediscovery. A 5xx or a slow
+      // request says nothing about the shared event stream.
+      if (response.status === 401) options.onFault?.();
       return response;
-    } catch (err) { if (!options.signal?.aborted) options.onFault?.(); throw err; }
+    } catch (err) {
+      if (!options.signal?.aborted && !request.signal.aborted && !/timed out/.test(String((err as Error)?.message ?? err))) options.onFault?.();
+      throw err;
+    }
     finally { release?.(); }
   } }));
   const location = options.directory ? { directory: options.directory } : undefined;
@@ -415,10 +420,24 @@ export async function* sseEvents(url: string, signal: AbortSignal, idleMs = SSE_
   }
 }
 
-/** V2 subscriptions are live-only. The pool owns resubscription and reconciliation. */
-export async function* clientEvents(client: OCClient, signal: AbortSignal): AsyncGenerator<OcEvent> {
+/** Bound on the event stream's connect + response headers (the body is open-ended). */
+export const EVENT_CONNECT_TIMEOUT_MS = 15_000;
+
+/** fetch whose deadline covers only connect + headers, leaving the SSE body unbounded. */
+async function fetchHeaders(request: Request, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`event stream connect timed out (${timeoutMs / 1000}s)`)), timeoutMs);
+  try {
+    return await fetch(request, { signal: AbortSignal.any([request.signal, controller.signal]) });
+  } finally { clearTimeout(timer); }
+}
+
+/** V2 subscriptions are live-only. The pool owns resubscription and reconciliation.
+ * `onActivity` fires for every transport read, keepalives included — the pool's idle watchdog. */
+export async function* clientEvents(client: OCClient, signal: AbortSignal, onActivity?: () => void): AsyncGenerator<OcEvent> {
   const adapter = new V2Events();
-  for await (const event of client.v2!.event.subscribe({ signal })) {
+  for await (const event of client.v2!.event.subscribe({ signal, onActivity })) {
+    onActivity?.();
     for (const mapped of adapter.translate(event)) yield { ...mapped, directory: event.location?.directory };
   }
 }

@@ -71,6 +71,14 @@ const SLACK_REJECTIONS = new Set([
 ]);
 
 /** A transport error, 5xx, or unfamiliar Slack error is not proof of rejection. */
+/** Non-rate-limit rejections are terminal after this many delivery attempts. */
+const PERMANENT_REJECTION_ATTEMPTS = 5;
+
+function rateLimited(error: unknown): boolean {
+  const e = error as { code?: string; statusCode?: number; data?: { error?: string } } | undefined;
+  return e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 || e?.data?.error === "ratelimited";
+}
+
 function definiteDeliveryRejection(error: unknown): boolean {
   const e = error as { code?: string; statusCode?: number; data?: { ok?: boolean; error?: string } } | undefined;
   return e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 ||
@@ -331,9 +339,17 @@ export class ReportRunner {
     catch (error) {
       this.check(id);
       const rejected = definiteDeliveryRejection(error);
+      const attempts = (this.retries.get(id)?.attempts ?? 0) + 1;
+      // A channel/auth rejection will not fix itself: stop after a few spaced
+      // attempts (time to re-invite the bot) instead of retrying every minute forever.
+      if (rejected && !rateLimited(error) && attempts >= PERMANENT_REJECTION_ATTEMPTS) {
+        this.retries.delete(id);
+        // notified resets so the owner hears that retries stopped, not just the first rejection.
+        this.update(id, r => { r.status = "failed"; r.notified = false; r.error = `Saved report delivery was rejected ${attempts} times: ${errorText(error)} — fix the destination, then \\schedule run again`; });
+        return;
+      }
       this.update(id, r => { r.status = rejected ? "ready" : "uncertain"; r.error = `Saved report delivery ${rejected ? "was rejected" : "is unconfirmed"}: ${errorText(error)}`; });
       if (rejected) {
-        const attempts = (this.retries.get(id)?.attempts ?? 0) + 1;
         const retry = error as { retryAfter?: number; data?: { retry_after?: number } };
         const seconds = retry?.retryAfter ?? retry?.data?.retry_after;
         const rateDelay = typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;

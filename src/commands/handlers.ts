@@ -108,7 +108,7 @@ async function rebindThread(
 
 /** Grouping + order for `\help`; every registered command must appear here. */
 export const HELP_SECTIONS: Array<{ title: string; names: string[] }> = [
-  { title: "Threads & replies", names: ["hush", "verbose"] },
+  { title: "Threads & replies", names: ["hush", "verbose", "stream"] },
   { title: "Sessions", names: ["new", "sessions", "resume", "stop", "abort", "diff"] },
   { title: "Monitoring", names: ["watch", "unwatch", "history", "summary"] },
   { title: "Model & agent", names: ["model", "agent"] },
@@ -180,6 +180,10 @@ registerCommand({
       lines.push(
         `*Bridge:* up ${dur(Date.now() - ctx.bridgeInfo.startedAt)} · owner DMs ${ctx.bridgeInfo.dmAvailable() ? ":white_check_mark:" : ":x: unavailable (notifications off)"}`,
       );
+      const socket = ctx.bridgeInfo.socket?.();
+      if (socket?.reconnects) {
+        lines.push(`*Slack socket:* ${socket.reconnects} reconnect(s) since boot${socket.lastError ? ` · last error: ${truncate(socket.lastError, 120)}` : ""}`);
+      }
     }
     // Runs in flight — the phone-at-a-glance answer to "what's it doing now?"
     const runs = describeActiveRuns();
@@ -293,6 +297,24 @@ registerCommand({
     if (arg !== "on" && arg !== "off") throw new Error("usage: \\notify on|off");
     ctx.state.setThread(ctx.threadKey, { ...th, notify: arg === "on" });
     await ctx.postToThread(arg === "on" ? "🔔 I'll DM you when runs in this thread finish." : "🔕 Completion DMs off — failures and permission asks still reach you.");
+  },
+});
+
+registerCommand({
+  name: "stream",
+  usage: "\\stream [on|off]",
+  summary: "Show answers live as they are written (on), or only once complete (off)",
+  async run(ctx, args) {
+    const th = requireThread(ctx);
+    const arg = args.toLowerCase();
+    const on = th.stream !== false;
+    if (!arg) {
+      await ctx.postToThread(`Live answers here: \`${on ? "on" : "off"}\``);
+      return;
+    }
+    if (arg !== "on" && arg !== "off") throw new Error("usage: \\stream on|off");
+    ctx.state.setThread(ctx.threadKey, { ...th, stream: arg === "on" });
+    await ctx.postToThread(arg === "on" ? "Answers will appear live as they are written." : "Answers will post once each part is complete.");
   },
 });
 

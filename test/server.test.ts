@@ -10,9 +10,12 @@ describe("V2 shared-service ownership", () => {
     vi.useFakeTimers(); vi.clearAllMocks();
     f.ensure.mockResolvedValue({ url: "http://127.0.0.1:1234" });
     f.make.mockImplementation((_url, options) => ({ directory: options.directory, options }));
-    f.events.mockImplementation(async function* (_client, signal: AbortSignal) {
+    f.events.mockImplementation(async function* (_client, signal: AbortSignal, onActivity?: () => void) {
       yield { type: "server.connected" };
+      // The real service sends a keepalive frame every 15s.
+      const keepalive = setInterval(() => onActivity?.(), 15_000);
       await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+      clearInterval(keepalive);
     });
     pool = new ServerPool(vi.fn());
   });
@@ -77,5 +80,44 @@ describe("V2 shared-service ownership", () => {
     await pool.ensure("/a"); await vi.advanceTimersByTimeAsync(0);
     expect(event).toHaveBeenCalledWith("/a", "question.asked", { id: "yes" });
     expect(event).not.toHaveBeenCalledWith("/other", expect.anything(), expect.anything());
+  });
+  it("resubscribes when the stream goes silent (no keepalives) for the idle timeout", async () => {
+    const log = vi.fn(); const resume = vi.fn();
+    pool = new ServerPool(vi.fn(), log, undefined, resume);
+    f.events.mockImplementationOnce(async function* (_client, signal: AbortSignal) {
+      yield { type: "server.connected" };
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    });
+    await pool.ensure("/a");
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(f.events).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(f.events).toHaveBeenCalledTimes(2);
+    expect(log.mock.calls.some(([l]) => /no OpenCode stream activity/.test(l))).toBe(true);
+    expect(resume).toHaveBeenCalledTimes(2);
+  });
+  it("backs off a stream that connects then immediately drops", async () => {
+    f.events.mockImplementation(async function* () { yield { type: "server.connected" }; });
+    pool = new ServerPool(vi.fn());
+    await pool.ensure("/a");
+    await vi.advanceTimersByTimeAsync(20_000);
+    // 100,200,400,...,5000 cap: ~8 attempts in 20s, not 200.
+    expect(f.events.mock.calls.length).toBeLessThan(15);
+  });
+  it("a startup timeout keeps the directory registered and it becomes ready when the stream connects", async () => {
+    let connect!: () => void;
+    f.events.mockImplementationOnce(async function* (_client, signal: AbortSignal) {
+      await new Promise<void>(resolve => { connect = resolve; });
+      yield { type: "server.connected" };
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    });
+    const event = vi.fn(); pool = new ServerPool(event);
+    const first = pool.ensure("/a"); first.catch(() => {});
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(first).rejects.toThrow("within 10s");
+    expect(pool.get("/a")).toBeNull();
+    expect(pool.list().map(e => e.dir)).toContain("/a");
+    connect(); await vi.advanceTimersByTimeAsync(0);
+    expect(pool.get("/a")?.status).toBe("ready");
   });
 });

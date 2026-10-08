@@ -1,3 +1,4 @@
+import type { SocketHealth } from "./socket-supervisor.js";
 import type { SlackocConfig } from "../config.js";
 import { randomBytes } from "node:crypto";
 import { promptAsync, sessionCreate } from "../opencode/client.js";
@@ -58,7 +59,7 @@ export interface BridgeDeps {
   cwd: string;
   isStopping?: () => boolean;
   /** Bridge self-report for \status (uptime, owner-DM reachability). */
-  bridgeInfo?: { startedAt: number; dmAvailable: () => boolean };
+  bridgeInfo?: { startedAt: number; dmAvailable: () => boolean; socket?: () => SocketHealth | undefined };
   /** Archives permalink for a state threadKey — null when the team URL is unknown. */
   threadUrl?: (threadKey: string) => string | null;
   permissions?: PermissionCommands;
@@ -297,16 +298,21 @@ async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingA
   return runPrompt(text, msg, d, attempt, fileParts);
 }
 
-/** Download Slack file attachments and convert to OpenCode data-URI file parts. */
+/** Download Slack file attachments and convert to OpenCode data-URI file parts.
+ * Files download/shrink in parallel (order preserved); notices are
+ * fire-and-forget so a paced Slack post never delays the prompt. */
 async function downloadAttachments(
   files: SlackMsg["files"],
   msg: SlackMsg,
   d: BridgeDeps,
 ): Promise<ImagePart[]> {
-  const parts: ImagePart[] = [];
-  for (const f of files ?? []) {
+  const notify = (text: string): void => {
+    void d.render.post(msg.channel, threadRootTs(msg), text, undefined, { unfurl: false })
+      .catch(err => logErr(`attachment notice failed: ${String((err as Error)?.message ?? err)}`));
+  };
+  const results = await Promise.all((files ?? []).map(async (f): Promise<ImagePart | undefined> => {
     try {
-      if (d.isStopping?.()) break;
+      if (d.isStopping?.()) return;
       const res = await abortableFetch(f.url_private_download!, {
         headers: { authorization: `Bearer ${d.config.slackBotToken}` },
       });
@@ -323,70 +329,31 @@ async function downloadAttachments(
         // byte-heavy) gets JPEG-re-encoded to fit. Undecodable/unshrinkable
         // images skip+warn.
         if (buf.length > MAX_IMAGE_DOWNLOAD_BYTES) {
-          await d.render.post(
-            msg.channel,
-            threadRootTs(msg),
-            `:warning: ${filename} is too large to process (${Math.round(buf.length / 1024 / 1024)} MB) — skipped.`,
-            undefined,
-            { unfurl: false },
-          );
-          continue;
+          notify(`:warning: ${filename} is too large to process (${Math.round(buf.length / 1024 / 1024)} MB) — skipped.`);
+          return;
         }
         const decoded = await readImage(buf);
         const longest = decoded ? Math.max(decoded.bitmap.width, decoded.bitmap.height) : 0;
         if (buf.length > TARGET_IMAGE_BYTES || longest > MAX_IMAGE_EDGE) {
           const shrunk = await shrinkImage(buf, mime, filename, TARGET_IMAGE_BYTES, decoded ?? undefined);
           if (shrunk) {
-            parts.push({
-              mime: shrunk.mime,
-              filename: shrunk.filename,
-              dataUrl: `data:${shrunk.mime};base64,${shrunk.data.toString("base64")}`,
-            });
-            await d.render.post(
-              msg.channel,
-              threadRootTs(msg),
-              `:small_orange_diamond: ${filename} was ${Math.round(buf.length / 1024)} kB — compressed to ${Math.round(shrunk.data.length / 1024)} kB to fit.`,
-              undefined,
-              { unfurl: false },
-            );
-            continue;
+            notify(`:small_orange_diamond: ${filename} was ${Math.round(buf.length / 1024)} kB — compressed to ${Math.round(shrunk.data.length / 1024)} kB to fit.`);
+            return { mime: shrunk.mime, filename: shrunk.filename, dataUrl: `data:${shrunk.mime};base64,${shrunk.data.toString("base64")}` };
           }
-          await d.render.post(
-            msg.channel,
-            threadRootTs(msg),
-            `:warning: couldn't compress ${filename} to fit — skipped.`,
-            undefined,
-            { unfurl: false },
-          );
-          continue;
+          notify(`:warning: couldn't compress ${filename} to fit — skipped.`);
+          return;
         }
       }
       if (buf.length > MAX_ATTACHMENT_BYTES) {
-        await d.render.post(
-          msg.channel,
-          threadRootTs(msg),
-          `:warning: ${filename} is too large to send (${Math.round(buf.length / 1024)} kB) — skipped.`,
-          undefined,
-          { unfurl: false },
-        );
-        continue;
+        notify(`:warning: ${filename} is too large to send (${Math.round(buf.length / 1024)} kB) — skipped.`);
+        return;
       }
-      parts.push({
-        mime,
-        filename,
-        dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
-      });
+      return { mime, filename, dataUrl: `data:${mime};base64,${buf.toString("base64")}` };
     } catch (err) {
-      await d.render.post(
-        msg.channel,
-        threadRootTs(msg),
-        `:warning: couldn't attach ${f.name ?? "file"}: ${truncate(String((err as Error)?.message ?? err), 200)}`,
-        undefined,
-        { unfurl: false },
-      );
+      notify(`:warning: couldn't attach ${f.name ?? "file"}: ${truncate(String((err as Error)?.message ?? err), 200)}`);
     }
-  }
-  return parts;
+  }));
+  return results.filter((p): p is ImagePart => !!p);
 }
 
 function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = null, source: IncomingContext["source"] = "live"): CmdCtx {

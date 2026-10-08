@@ -26,6 +26,11 @@
  * Two failure guards (unchanged from the single-queue design):
  *
  *  - Rate limits (HTTP 429 / Retry-After) back off 2s→4s→8s and then give up.
+ *  - Transient network errors (DNS, refused, reset — e.g. right after wake)
+ *    retry 1s→2s→4s→8s. Posts and uploads retry only when the request
+ *    provably never reached Slack, so a retry cannot duplicate a message.
+ *    Repeated network failures engage a shared offline brake so every lane
+ *    waits instead of each burning its attempts (and the log) in parallel.
  *  - Any single operation that never resolves (stalled upload, hung socket)
  *    times out after 30s so one bad call can't freeze its lane (head-of-line
  *    blocking); other lanes are unaffected.
@@ -77,6 +82,48 @@ const lanes = new Map<string, ChannelLane>();
 const cooldowns = new Map<string, number>();
 let nextHistoryCallAt = 0;
 let droppedOps = 0;
+/** Shared network brake: consecutive transient failures across all lanes. */
+let offlineUntil = 0;
+let transientStreak = 0;
+const TRANSIENT_RETRIES = 4;
+const OFFLINE_BRAKE_AFTER = 3;
+const OFFLINE_BRAKE_MAX_MS = 30_000;
+
+/** Error codes proving the request never reached Slack (safe to replay any call). */
+const CONNECT_PHASE = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH",
+  "ENETDOWN", "EADDRNOTAVAIL", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_CONNECT", "CERT_HAS_EXPIRED"]);
+/** Error codes where the request may or may not have landed. */
+const MID_FLIGHT = new Set(["ECONNRESET", "EPIPE", "ETIMEDOUT", "UND_ERR_SOCKET", "UND_ERR_CLOSED", "ECONNABORTED"]);
+
+/** "connect": never reached Slack · "ambiguous": network failed mid-request · null: not a network error. */
+export function classifyTransport(err: unknown): "connect" | "ambiguous" | null {
+  for (let e: unknown = err, depth = 0; e && depth < 5; e = (e as { cause?: unknown; original?: unknown }).original ?? (e as { cause?: unknown }).cause, depth++) {
+    const code = (e as { code?: string }).code;
+    if (code && CONNECT_PHASE.has(code)) return "connect";
+    if (code && MID_FLIGHT.has(code)) return "ambiguous";
+  }
+  const msg = String((err as Error)?.message ?? err);
+  return /fetch failed|socket hang up|network/i.test(msg) ? "ambiguous" : null;
+}
+
+/** True while repeated network failures have engaged the shared brake (catch-up skips its sweep). */
+export function slackOffline(now = Date.now()): boolean {
+  return offlineUntil > now;
+}
+
+/** Socket reconnected — Slack is reachable again; release the brake immediately. */
+export function noteSlackOnline(): void {
+  offlineUntil = 0;
+  transientStreak = 0;
+}
+
+function noteTransient(): void {
+  transientStreak += 1;
+  if (transientStreak >= OFFLINE_BRAKE_AFTER) {
+    const ms = Math.min(OFFLINE_BRAKE_MAX_MS, 2_000 * 2 ** Math.min(transientStreak - OFFLINE_BRAKE_AFTER, 4));
+    offlineUntil = Math.max(offlineUntil, Date.now() + ms);
+  }
+}
 
 /** Ops that failed permanently (retry exhaustion, timeout, hard error) and were dropped — surfaced in \status. */
 export function droppedOpCount(): number {
@@ -132,6 +179,9 @@ function takeNext(lane: ChannelLane): QueuedOp | undefined {
   return lane.background.shift();
 }
 
+/** Methods where an ambiguous network failure may already have taken effect. */
+const NON_IDEMPOTENT = new Set(["chat.postMessage", "files.upload", "filesUploadV2", "chat.postEphemeral"]);
+
 export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: EnqueueOpts): Promise<T> {
   const method = opts.method ?? "chat.postMessage";
   const lane = getLane(`${method}:${opts.channel}`);
@@ -146,7 +196,7 @@ export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: Enqueu
           try {
             // Re-check after every wake: another lane may have extended the brake.
             for (;;) {
-              const wait = Math.max(lane.lastCall + pace, cooldowns.get(method) ?? 0,
+              const wait = Math.max(lane.lastCall + pace, cooldowns.get(method) ?? 0, offlineUntil,
                 method === "conversations.replies" ? nextHistoryCallAt : 0) - Date.now();
               if (wait <= 0) break;
               await sleep(wait);
@@ -155,10 +205,13 @@ export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: Enqueu
             // Reserve before any await so cross-channel waiters cannot start together.
             if (method === "conversations.replies") nextHistoryCallAt = lane.lastCall + SLACK_HISTORY_PACE_MS;
             const timeoutMs = opts.timeoutMs ?? SLACK_OP_TIMEOUT_MS;
-            resolve(await withDeadline(
+            const result = await withDeadline(
               (signal) => withSlackOperation(signal, timeoutMs, () => op(signal)),
               { timeoutMs }, "slack call",
-            ));
+            );
+            transientStreak = 0;
+            offlineUntil = 0;
+            resolve(result);
             return;
           } catch (err) {
             const e = err as { code?: string; statusCode?: number; retryAfter?: number; data?: { retry_after?: number }; message?: string };
@@ -170,6 +223,16 @@ export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: Enqueu
               const waitMs = retryAfter !== undefined ? retryAfter * 1000 : 2000 * 2 ** Math.min(attempt, 2);
               cooldowns.set(method, Math.max(cooldowns.get(method) ?? 0, Date.now() + waitMs));
               if (attempt < 3 && opts.retryRateLimits !== false) continue;
+            }
+            const transport = limited ? null : classifyTransport(err);
+            if (transport) {
+              noteTransient();
+              // Posts/uploads only replay when the request never left the machine.
+              const replaySafe = transport === "connect" || !NON_IDEMPOTENT.has(method);
+              if (replaySafe && attempt < TRANSIENT_RETRIES && opts.retryRateLimits !== false) {
+                await sleep(1_000 * 2 ** Math.min(attempt, 3));
+                continue;
+              }
             }
             // Permanent failure — the op is dropped. NEVER silently: a summary
             // or answer can vanish this way, and from a phone there is no
@@ -206,4 +269,6 @@ export function _resetQueueForTests(): void {
   cooldowns.clear();
   nextHistoryCallAt = 0;
   droppedOps = 0;
+  offlineUntil = 0;
+  transientStreak = 0;
 }

@@ -7,7 +7,7 @@ import type { CmdCtx, ScheduleCommands } from "../commands/registry.js";
 import { canonicalDir } from "../paths.js";
 import { chunkText, esc } from "../util.js";
 import { nextOccurrence } from "./recurrence.js";
-import type { NewScheduleJob, ScheduleJob, ScheduleStore } from "./store.js";
+import { isGenerationActive, type NewScheduleJob, type ScheduleJob, type ScheduleStore } from "./store.js";
 
 const ADD_ACTION = "schedule_add";
 const EDIT_VIEW = "schedule_create";
@@ -189,7 +189,7 @@ export function installScheduleControls(opts: ControlOptions): ScheduleCommands 
         opts.store.removeJob(id);
         await ctx.postToThread(`Removed *${esc(job.name)}*. Run history and any active occurrence are retained.`);
       } else if (action === "run") {
-        if (opts.store.runs().some(r => ["claimed", "creating", "submitting", "running", "waiting", "uncertain"].includes(r.status) && !r.output)) throw new Error("another scheduled report is active or uncertain — inspect \\schedule history first");
+        if (opts.store.runs().some(r => isGenerationActive(r, now()))) throw new Error("another scheduled report is active or uncertain — inspect \\schedule history first");
         const run = opts.store.claim(id, now(), true);
         await ctx.postToThread(`Queued report \`${run.id}\`. Its saved destination and read-only policy apply.`);
         void opts.poll();

@@ -14,7 +14,7 @@ import {
   questionBlocks,
   VIEW_DIFF_ACTION,
 } from "./slack/blocks.js";
-import { PermissionDeliveryStore, PermissionResponder, parsePermissionButton, type PermissionRecord } from "./slack/permissions.js";
+import { PERMISSION_STORE_PATH, PermissionDeliveryStore, PermissionResponder, parsePermissionButton, type PermissionRecord } from "./slack/permissions.js";
 import { PermissionDeliveryManager } from "./slack/permission-delivery.js";
 import { QuestionsStore, questionBindingToken, sameQuestionBinding, type QuestionSnapshot } from "./slack/questions-store.js";
 import { QuestionUiReconciler, questionPresentationMarker } from "./slack/question-ui.js";
@@ -28,8 +28,9 @@ import { finalizeViewsForProject, getView, hasActiveViewForProject, reconcileSta
 import type { RenderDeps } from "./slack/render.js";
 import { sweepMissedMessages, type CatchupDeps } from "./slack/catchup.js";
 import { GhostDetector } from "./ghosts.js";
-import { enqueue } from "./slack/queue.js";
-import { slackWebClientOptions, SLACK_UPLOAD_TIMEOUT_MS } from "./slack/transport.js";
+import { enqueue, noteSlackOnline, slackOffline } from "./slack/queue.js";
+import { slackWebClientOptions, slackSocketClientOptions, SLACK_UPLOAD_TIMEOUT_MS } from "./slack/transport.js";
+import { isSocketModeFailure, SocketSupervisor } from "./slack/socket-supervisor.js";
 import { boundedShutdown, startManagedRuntime, stopManagedService } from "./service.js";
 import { enableFileLog, logErr, pushLog, ringLogger } from "./log.js";
 import { normalizePermission, type OcPermission, type OcQuestionRequest, type OcMessageInfo } from "./opencode/api.js";
@@ -46,6 +47,8 @@ const REAPER_INTERVAL_MS = 5 * 60_000;
 const RECONCILE_INTERVAL_MS = 60_000;
 const RECONCILE_STALE_MS = 120_000;
 const CATCHUP_INTERVAL_MS = 10_000;
+/** Managed runs exit (launchd restarts a clean process) after Slack is unreachable this long. */
+const SOCKET_FATAL_MS = 10 * 60_000;
 
 export async function startBridge(opts: StartOpts): Promise<void> {
   // Persistent log (rotated bridge.log in the config dir) — crashes, ghost
@@ -99,7 +102,13 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     logErr(`uncaught exception: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
     void shutdown(1);
   };
+  let socketSupervisor: SocketSupervisor | undefined;
   const onRejection = (err: unknown) => {
+    if (isSocketModeFailure(err) && socketSupervisor) {
+      logErr(`slack socket rejection: ${String((err as Error)?.message ?? err).slice(0, 200)}`);
+      socketSupervisor.noteLibraryFailure(err);
+      return;
+    }
     logErr(`unhandled rejection: ${String((err as Error)?.stack ?? err).slice(0, 400)}`);
   };
   process.on("SIGINT", onSignal);
@@ -109,16 +118,17 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   try {
   // Keep a one-time pre-migration rollback copy, before StateStore's first save.
   if (existsSync(STATE_PATH) && !existsSync(`${STATE_PATH}.pre-recovery-v1`)) {
-    const disk = JSON.parse(readFileSync(STATE_PATH, "utf8")) as { threads?: Record<string, { recovery?: { version?: number } }> };
-    if (Object.values(disk.threads ?? {}).some(t => t.recovery?.version !== 1)) {
+    let disk: { threads?: Record<string, { recovery?: { version?: number } }> } = {};
+    try { disk = JSON.parse(readFileSync(STATE_PATH, "utf8")); } catch { /* StateStore quarantines a corrupt file */ }
+    if (Object.values(disk?.threads ?? {}).some(t => t.recovery?.version !== 1)) {
       copyFileSync(STATE_PATH, `${STATE_PATH}.pre-recovery-v1`);
       chmodSync(`${STATE_PATH}.pre-recovery-v1`, 0o600);
     }
   }
   const state = new StateStore(STATE_PATH);
   state.migrateRecovery();
-  const permissionStore = new PermissionDeliveryStore();
-  const questionStore = new QuestionsStore(`${dirname(STATE_PATH)}/questions.json`);
+  const permissionStore = openStore(PERMISSION_STORE_PATH, (path) => new PermissionDeliveryStore(path));
+  const questionStore = openStore(`${dirname(STATE_PATH)}/questions.json`, (path) => new QuestionsStore(path));
   let scheduledReports: ScheduledReports | undefined;
   let interactionsEnabled = false;
   // The launch cwd owns the default project on EVERY start. currentProjectDir
@@ -133,9 +143,19 @@ export async function startBridge(opts: StartOpts): Promise<void> {
       ...init, signal: AbortSignal.any([lifetime.signal, ...(init?.signal ? [init.signal] : [])]),
     }),
   };
+  // The socket client gets its own options (bounded retries for
+  // apps.connections.open) and NO library auto-reconnect: SocketSupervisor
+  // owns reconnection, because the library abandons it after one network error.
+  const socketClientOptions: typeof slackWebClientOptions = {
+    ...slackSocketClientOptions,
+    fetch: (url, init) => slackSocketClientOptions.fetch!(url, {
+      ...init, signal: AbortSignal.any([lifetime.signal, ...(init?.signal ? [init.signal] : [])]),
+    }),
+  };
   const receiver = new SocketModeReceiver({
     appToken: config.slackAppToken, logger: ringLogger(), logLevel: LogLevel.INFO,
-    installerOptions: { clientOptions },
+    autoReconnectEnabled: false,
+    installerOptions: { clientOptions: socketClientOptions },
   });
   const app = new App({
     token: config.slackBotToken,
@@ -1140,7 +1160,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     botUserId,
     cwd: opts.cwd,
     isStopping: () => stopping,
-    bridgeInfo: { startedAt: Date.now(), dmAvailable: () => dmChannelId !== null },
+    bridgeInfo: { startedAt: Date.now(), dmAvailable: () => dmChannelId !== null, socket: () => socketSupervisor?.health() },
     ownerDmChannel: () => dmChannelId,
     permissions: {
       list: async (context, refresh = false) => {
@@ -1690,15 +1710,29 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   if (stopping) return;
   const onConnected = () => {
     if (stopping) return;
+    noteSlackOnline();
     void scheduledReports?.poll().catch(err => logErr(`scheduled report reconnect: ${String(err)}`));
     void runCatchup();
     void refreshPermissions(true).catch(err => logErr(`interaction reconnect recovery: ${String(err)}`));
   };
   receiver.client.on("connected", onConnected);
   cleanup.push(() => { receiver.client.off("connected", onConnected); });
+  socketSupervisor = new SocketSupervisor(receiver.client, {
+    log: pushLog,
+    onRecovered: () => { if (!stopping) void runCatchup(); },
+    // Only a service manager can restart us; a foreground bridge keeps retrying.
+    fatalAfterMs: process.env.SLACKOC_SERVICE === "bridge" ? SOCKET_FATAL_MS : Infinity,
+    onFatal: () => { void shutdown(1); },
+  });
+  socketSupervisor.start();
+  // Stop supervising BEFORE app.stop() disconnects, or the disconnect would schedule a reconnect.
+  cleanup.unshift(() => socketSupervisor?.stop());
   // Every tick requests recovery, including the first tick after sleep.
   // Slow passes coalesce; shared history pacing bounds request starts.
   const catchup = setInterval(() => {
+    // While offline, every sweep would just fail N history calls (and log each).
+    // The supervisor's reconnect runs a sweep the moment Slack is back.
+    if (slackOffline() || socketSupervisor?.health().connected === false) return;
     void runCatchup();
   }, CATCHUP_INTERVAL_MS);
   catchup.unref();
@@ -1726,6 +1760,20 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   } catch (err) {
     logErr(`bridge startup failed: ${String((err as Error)?.stack ?? err)}`);
     await shutdown(1);
+  }
+}
+
+/** A damaged interaction store must not crash-loop the bridge under launchd.
+ * Move it aside (kept for inspection) and start empty; OpenCode stays the
+ * authority for pending permissions/questions, which are re-polled on boot. */
+function openStore<T>(path: string, open: (path: string) => T): T {
+  try {
+    return open(path);
+  } catch (err) {
+    const backup = `${path}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    try { renameSync(path, backup); } catch { /* best effort */ }
+    logErr(`${path} unreadable (${String((err as Error)?.message ?? err)}) — moved to ${backup}; starting empty`);
+    return open(path);
   }
 }
 

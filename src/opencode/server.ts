@@ -17,6 +17,8 @@ export interface PoolEntry extends PoolServerInfo {
   killedIntentionally?: boolean;
   lastUsedAt?: number;
   connectionState?: ConnectionState;
+  /** Startup failed; the directory stays registered so its events still route. */
+  failed?: boolean;
 }
 export interface PoolHooks {
   isBusy?: (dir: string) => boolean;
@@ -24,11 +26,17 @@ export interface PoolHooks {
 }
 export interface RequestLease { entry: PoolEntry; release: () => void }
 export const STALE_HEALTH_MS = 30_000;
+/** No transport activity (events or keepalives) this long ⇒ the stream is wedged; resubscribe. */
+export const EVENT_IDLE_TIMEOUT_MS = 45_000; // the service sends keepalives every 15s
+/** A stream must stay up this long before reconnect backoff resets (stops connect-drop flapping). */
+export const EVENT_HEALTHY_MS = 30_000;
 export function shouldNotifyDeath(wasReady: boolean, intentional: boolean): boolean { return wasReady && !intentional; }
 export function isActivityEvent(type: string): boolean { return type !== "server.heartbeat" && type !== "server.connected"; }
 export function shouldReap(e: { status: string; lastEventAt: number; lastUsedAt?: number }, now: number, ttl: number, busy: boolean): boolean {
   return e.status === "ready" && !busy && now - Math.max(e.lastEventAt, e.lastUsedAt ?? 0) > ttl;
 }
+
+const reasonText = (reason: unknown): string => String((reason as Error)?.message ?? reason);
 
 export class ServerPool {
   private entries = new Map<string, PoolEntry>();
@@ -76,8 +84,13 @@ export class ServerPool {
   private client(dir?: string): OCClient {
     return makeClient(this.endpoint!.url, { directory: dir, signal: this.lifetime.signal,
       endpoint: () => this.endpoint!, onFault: () => {
-        // Never retry a mutating request here. Refresh discovery/event observation only.
-        this.streamAbort?.abort(new Error("OpenCode request transport failed"));
+        // Never retry a mutating request here. Refresh discovery; only a moved
+        // service (new port/credentials) needs a new event subscription.
+        if (this.closed) return;
+        const before = this.endpoint?.url;
+        void this.discover().then(() => {
+          if (this.endpoint?.url !== before) this.streamAbort?.abort(new Error("OpenCode service moved"));
+        }, err => this.log(`OpenCode rediscovery: ${String(err)}`));
       } });
   }
 
@@ -85,9 +98,10 @@ export class ServerPool {
     if (this.closed) return Promise.reject(new Error("server pool is closed"));
     const key = canonicalDir(dir);
     const existing = this.entries.get(key);
-    if (existing) return existing.ready.then(() => existing);
-    const entry: PoolEntry = { dir: key, url: null, baseUrl: null, status: "starting", client: null,
+    if (existing && !existing.failed) return existing.ready.then(() => existing);
+    const entry: PoolEntry = existing ?? { dir: key, url: null, baseUrl: null, status: "starting", client: null,
       ready: Promise.resolve(), sseAbort: null, proc: null, lastEventAt: Date.now(), lastUsedAt: Date.now(), connectionState: "connecting" };
+    entry.failed = false;
     this.entries.set(key, entry);
     entry.ready = (async () => {
       if (!this.endpoint) await this.discover();
@@ -110,8 +124,12 @@ export class ServerPool {
       this.hooks.onConnectionState?.(key, "connected");
       this.onReady?.(key, entry.url);
     })().catch(err => {
-      if (this.entries.get(key) === entry) this.entries.delete(key);
-      entry.status = "dead"; throw err;
+      // Keep the directory registered (not "ready"): its events keep routing
+      // and onResume still reconciles its views once the stream returns. The
+      // next ensure() retries startup.
+      if (this.entries.get(key) === entry && !this.closed) { entry.failed = true; entry.status = "starting"; }
+      else entry.status = "dead";
+      throw err;
     });
     return entry.ready.then(() => entry);
   }
@@ -160,16 +178,32 @@ export class ServerPool {
   }
 
   private async pipeEvents(): Promise<void> {
-    let delay = 100; let downSince = Date.now(); let connected = false;
+    let delay = 100; let downSince = Date.now(); let connected = false; let connectedAt = 0;
     while (!this.closed) {
-      this.streamAbort = new AbortController();
-      const signal = AbortSignal.any([this.lifetime.signal, this.streamAbort.signal]);
+      const streamAbort = this.streamAbort = new AbortController();
+      const signal = AbortSignal.any([this.lifetime.signal, streamAbort.signal]);
+      // Idle watchdog: an open-but-silent stream (hung service, half-dead
+      // socket after sleep) would otherwise never be noticed.
+      let idle: NodeJS.Timeout | undefined;
+      const touch = () => {
+        clearTimeout(idle);
+        idle = setTimeout(() => streamAbort.abort(new Error(`no OpenCode stream activity for ${EVENT_IDLE_TIMEOUT_MS / 1000}s`)), EVENT_IDLE_TIMEOUT_MS);
+        idle.unref?.();
+      };
+      touch();
       try {
-        for await (const event of clientEvents(this.eventClient!, signal)) {
+        for await (const event of clientEvents(this.eventClient!, signal, touch)) {
           if (this.closed) return;
           if (!connected) {
-            connected = true; delay = 100;
+            connected = true; connectedAt = Date.now();
             this.connected = true;
+            for (const entry of this.entries.values()) {
+              // A directory whose startup timed out waiting for this stream is usable now.
+              if (entry.failed && this.endpoint) {
+                entry.failed = false; entry.status = "ready"; entry.ready = Promise.resolve();
+                entry.url = entry.baseUrl = this.endpoint.url; entry.client ??= this.client(entry.dir);
+              }
+            }
             for (const ready of this.waiters) ready();
             this.connection("connected");
             for (const entry of this.entries.values()) this.onResume?.(entry.dir, Date.now() - downSince);
@@ -182,9 +216,14 @@ export class ServerPool {
           if (entry && isActivityEvent(event.type)) entry.lastEventAt = Date.now();
           this.onEvent(dir, event.type, props);
         }
-      } catch (err) { if (!this.closed) this.log(`OpenCode event connection: ${String(err)}`); }
+        if (!this.closed) this.log(`OpenCode event connection ended${streamAbort.signal.aborted ? `: ${reasonText(streamAbort.signal.reason)}` : ""}`);
+      } catch (err) {
+        if (!this.closed) this.log(`OpenCode event connection: ${streamAbort.signal.aborted ? reasonText(streamAbort.signal.reason) : String(err)}`);
+      } finally { clearTimeout(idle); }
       if (this.closed) return;
       if (connected) downSince = Date.now();
+      // Only a stream that stayed up resets backoff; connect-then-drop keeps growing it.
+      if (connected && Date.now() - connectedAt >= EVENT_HEALTHY_MS) delay = 100;
       connected = false;
       this.connected = false;
       this.connection("reconnecting");

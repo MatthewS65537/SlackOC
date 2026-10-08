@@ -29,3 +29,13 @@ export const slackWebClientOptions: WebClientOptions = {
   // The bridge already schedules calls. A second queue can lose the caller's ALS context.
   maxRequestConcurrency: Infinity,
 };
+
+/** The Socket Mode client's own web client (apps.connections.open only).
+ * A few quick SDK retries absorb a DNS blip right after wake; SocketSupervisor
+ * owns the longer backoff. Never share slackWebClientOptions here — its
+ * `retries: 0` is what made one failed lookup end Socket Mode for good. */
+export const slackSocketClientOptions: WebClientOptions = {
+  ...slackWebClientOptions,
+  retryConfig: { retries: 3, factor: 2, minTimeout: 1_000, maxTimeout: 8_000 },
+  rejectRateLimitedCalls: false,
+};

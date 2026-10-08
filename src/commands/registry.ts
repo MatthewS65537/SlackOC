@@ -1,3 +1,4 @@
+import type { SocketHealth } from "../slack/socket-supervisor.js";
 import type { SlackocConfig } from "../config.js";
 import type { ServerPool } from "../opencode/server.js";
 import type { StateStore, ThreadState } from "../state.js";
@@ -30,7 +31,7 @@ export interface CmdCtx {
   pool: ServerPool;
   cwd: string;
   /** Bridge self-report for \status (uptime, owner-DM reachability). */
-  bridgeInfo?: { startedAt: number; dmAvailable: () => boolean };
+  bridgeInfo?: { startedAt: number; dmAvailable: () => boolean; socket?: () => SocketHealth | undefined };
   /** Build an archives permalink for a state threadKey (`${channel}:${ts}`) — null when the team URL is unknown. */
   threadUrl?(threadKey: string): string | null;
   /** Post into the current thread/DM. */

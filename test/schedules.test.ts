@@ -336,6 +336,7 @@ describe("singleflight scheduling and recovery", () => {
 
   it.each(["running", "waiting", "uncertain"] as const)("skips overlapping automatic work while a manual run is %s", async status => {
     const job = store.createJob(definition());
+    now = job.nextRunAt - 60_000;
     const manual = store.claim(job.id, now, true);
     store.updateRun(manual.id, run => { run.status = status; });
     now = job.nextRunAt;
@@ -347,6 +348,18 @@ describe("singleflight scheduling and recovery", () => {
     expect(store.run(automaticRunId(job.id, now))).toMatchObject({ status: "skipped", error: expect.stringMatching(/overlap/) });
     await scheduler.poll();
     expect(store.runs()).toHaveLength(2);
+  });
+
+  it("an uncertain run past its deadline no longer blocks later reports", async () => {
+    const job = store.createJob(definition());
+    now = job.nextRunAt - 2 * 60 * 60_000;
+    const manual = store.claim(job.id, now, true);
+    store.updateRun(manual.id, run => { run.status = "uncertain"; run.error = "Report runtime deadline exceeded; external admission remains unconfirmed"; });
+    now = job.nextRunAt;
+    expect(now).toBeGreaterThan(store.run(manual.id)!.deadlineAt);
+    const tickRun = vi.fn(async (_run: ScheduleRun) => {});
+    await new Scheduler({ store, now: () => now, tickRun }).poll();
+    expect(store.run(automaticRunId(job.id, now))?.status).toBe("claimed");
   });
 
   it("allows only one global generation, not one per job", async () => {

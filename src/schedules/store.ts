@@ -61,10 +61,13 @@ export function isTerminalRun(run: ScheduleRun): boolean {
   if (run.status === "failed" && run.error && !run.notified) return false;
   return TERMINAL.has(run.status);
 }
-export function isGenerationActive(run: ScheduleRun): boolean {
+export function isGenerationActive(run: ScheduleRun, now: number = Date.now()): boolean {
   // Saved output proves generation ended; uncertain delivery must not block
   // unrelated future reports, though its own post still requires reconciliation.
-  return GENERATING.has(run.status) && !(run.status === "uncertain" && run.output !== undefined);
+  // Past its deadline an uncertain run can no longer produce a report (the
+  // runner interrupted it), so it must not block every later report forever.
+  return GENERATING.has(run.status) &&
+    !(run.status === "uncertain" && (run.output !== undefined || now >= run.deadlineAt));
 }
 
 export function automaticRunId(jobId: string, scheduledAt: number): string {

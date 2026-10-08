@@ -1,8 +1,9 @@
 import { constants } from "node:fs";
-import { open, readFile } from "node:fs/promises";
-import { basename, isAbsolute } from "node:path";
+import { open, readFile, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, isAbsolute, join, sep } from "node:path";
 import { LogLevel, WebClient } from "@slack/web-api";
-import { CONFIG_PATH, STATE_PATH } from "./config.js";
+import { CONFIG_DIR, CONFIG_PATH, STATE_PATH } from "./config.js";
 import { withDeadline, type RequestOptions } from "./http.js";
 import { slackWebClientOptions, SLACK_UPLOAD_TIMEOUT_MS, withSlackOperation } from "./slack/transport.js";
 import { safePayload } from "./slack/tool-format.js";
@@ -86,6 +87,24 @@ async function assertBinding(path: string, binding: Binding): Promise<void> {
   }
 }
 
+/** Credential locations the agent may never ship into Slack, even with permission. */
+const SECRET_DIRS = [".ssh", ".aws", ".gnupg", ".kube", ".docker", join(".config", "gh"), join(".local", "state", "opencode")];
+const SECRET_FILES = /^(id_[a-z0-9]+(\.pub)?|.*\.(pem|key|p12|pfx)|\.netrc|\.npmrc|\.pypirc|credentials(\.json)?)$/i;
+
+/** Refuse SlackOC's own token file/dir and common credential stores (symlinks resolved). */
+async function assertNotSecret(file: string, configPath: string): Promise<void> {
+  let resolved: string;
+  try { resolved = await realpath(file); } catch { throw new FileSendError("File is missing or unreadable"); }
+  const home = homedir();
+  const dirs = [CONFIG_DIR, ...SECRET_DIRS.map(d => join(home, d))];
+  const [resolvedDirs, resolvedConfig] = await Promise.all([
+    Promise.all(dirs.map(d => realpath(d).catch(() => d))), realpath(configPath).catch(() => configPath)]);
+  const inside = (dir: string) => resolved === dir || resolved.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+  if (resolved === resolvedConfig || resolvedDirs.some(inside) || SECRET_FILES.test(basename(resolved))) {
+    throw new FileSendError("Refusing to send credentials or SlackOC configuration files");
+  }
+}
+
 /** Nonblocking open rejects FIFOs/devices; descriptor checks and one extra byte bound growth. */
 async function fileBytes(path: string, signal?: AbortSignal): Promise<Buffer> {
   let handle;
@@ -153,6 +172,7 @@ export async function sendFile(opts: SendFileOptions, deps: SendFileDeps = {}): 
   deps.signal?.throwIfAborted();
   const statePath = deps.statePath ?? STATE_PATH;
   const binding = await bindingFor(statePath, opts.session);
+  await assertNotSecret(opts.file, deps.configPath ?? CONFIG_PATH);
   const data = await fileBytes(opts.file, deps.signal);
   const config = await jsonFile(deps.configPath ?? CONFIG_PATH, "SlackOC config is missing or unreadable; run slackoc init first");
   if (!record(config) || typeof config.slackBotToken !== "string" || !config.slackBotToken.startsWith("xoxb-") ||

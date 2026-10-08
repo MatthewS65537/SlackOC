@@ -52,7 +52,7 @@ export class Scheduler {
         const run = store.run(saved.id);
         if (!run || isTerminalRun(run)) continue;
         if (run.status === "claimed") {
-          const active = store.runs().filter(isGenerationActive).sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+          const active = store.runs().filter(r => isGenerationActive(r, this.now())).sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
           // Recover effects already started; do not start another bare claim beside them.
           const primary = active.find(item => item.status !== "claimed") ?? active[0];
           if (primary && primary.id !== run.id) {
@@ -81,7 +81,7 @@ export class Scheduler {
         const existing = store.run(id);
         if (!existing) {
           if (now - latest > SCHEDULE_GRACE_MS) store.skipOccurrence(job.id, latest, "Missed occurrence outside the 2-hour grace window.");
-          else if (store.runs().some(isGenerationActive)) store.skipOccurrence(job.id, latest, "Skipped overlap with another generating or uncertain scheduled report.");
+          else if (store.runs().some(r => isGenerationActive(r, now))) store.skipOccurrence(job.id, latest, "Skipped overlap with another generating or uncertain scheduled report.");
           else store.claim(job.id, latest);
         }
         // Claims precede advancing the pointer; their stable keys survive a crash between commits.

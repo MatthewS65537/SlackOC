@@ -169,3 +169,12 @@ describe("active-thread file delivery through the installed Slack SDK", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("credential guard", () => {
+  it("refuses SlackOC's own config file and key-like files even when bound", async () => {
+    await expect(sendFile({ file: configPath, session: "ses_current" }, { configPath, statePath })).rejects.toThrow(/credentials or SlackOC configuration/);
+    const key = `${root}/id_ed25519`;
+    writeFileSync(key, "-----BEGIN OPENSSH PRIVATE KEY-----");
+    await expect(sendFile({ file: key, session: "ses_current" }, { configPath, statePath })).rejects.toThrow(/credentials/);
+  });
+});

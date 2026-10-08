@@ -48,7 +48,34 @@ function rotateIfNeeded(): void {
   }
 }
 
+/** Identical lines beyond this many per window are counted, not written (outage spam). */
+const REPEAT_LIMIT = 5;
+const REPEAT_WINDOW_MS = 60_000;
+const repeats = new Map<string, { since: number; count: number }>();
+
+/** Collapse exact-duplicate lines: during a network outage the same failure repeats ~1/s for hours. */
+function admitRepeat(line: string, now: number): string | null {
+  let r = repeats.get(line);
+  if (r && now - r.since >= REPEAT_WINDOW_MS) {
+    const suppressed = r.count - REPEAT_LIMIT;
+    repeats.delete(line);
+    r = undefined;
+    if (suppressed > 0) line = `${line} (+${suppressed} identical in the last ${Math.round(REPEAT_WINDOW_MS / 1000)}s)`;
+  }
+  if (!r) {
+    if (repeats.size > 500) repeats.clear();
+    repeats.set(line.replace(/ \(\+\d+ identical in the last \d+s\)$/, ""), { since: now, count: 1 });
+    return line;
+  }
+  r.count += 1;
+  if (r.count === REPEAT_LIMIT + 1) return `${line} (repeating — further copies suppressed for up to ${Math.round(REPEAT_WINDOW_MS / 1000)}s)`;
+  return r.count > REPEAT_LIMIT ? null : line;
+}
+
 export function pushLog(line: string): void {
+  const admitted = admitRepeat(line, Date.now());
+  if (admitted === null) return;
+  line = admitted;
   const now = new Date();
   const stamped = `${now.toISOString().slice(11, 19)} ${line}`;
   buf.push(stamped);
@@ -88,8 +115,9 @@ export function newLogsSince(cursor: number): string[] {
  * whole point of the ring buffer.
  */
 export function logErr(line: string): void {
+  const before = totalPushed;
   pushLog(line);
-  console.error(line);
+  if (totalPushed !== before) console.error(line); // suppressed repeats stay off stderr too
 }
 
 export function recentLogs(n = 50): string[] {
@@ -135,6 +163,7 @@ export function ringLogger(name = "slack"): Logger {
 
 /** Test hook. */
 export function clearLogs(): void {
+  repeats.clear();
   buf.length = 0;
   totalPushed = 0;
 }

@@ -410,6 +410,16 @@ describe("saved report delivery", () => {
     expect(h.notify).toHaveBeenCalledTimes(1); expect(h.submit).toHaveBeenCalledTimes(1);
   });
 
+  it("stops retrying a permanent channel rejection after 5 attempts and tells the owner", async () => {
+    const h = setup(); await h.ready();
+    h.deliver.mockRejectedValue({ code: "slack_webapi_platform_error", data: { ok: false, error: "channel_not_found" } });
+    for (let i = 0; i < 10; i++) { await h.tick(); h.advance(60_000); }
+    expect(h.deliver).toHaveBeenCalledTimes(5);
+    expect(h.latest()).toMatchObject({ status: "failed", output: "Final report" });
+    expect(h.latest().error).toMatch(/rejected 5 times.*channel_not_found/);
+    expect(h.notify).toHaveBeenCalledTimes(2);
+  });
+
   it("honors rate-limit Retry-After without adding transport retry loops", async () => {
     const h = setup(); await h.ready();
     h.deliver.mockRejectedValue({ code: "slack_webapi_rate_limited_error", retryAfter: 30 });

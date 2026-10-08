@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -26,14 +26,25 @@ export function loadConfig(): SlackocConfig | null {
   if (!existsSync(CONFIG_PATH)) return null;
   try {
     return JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as SlackocConfig;
-  } catch {
+  } catch (err) {
+    console.error(`${CONFIG_PATH} is unreadable (${String((err as Error)?.message ?? err)}) — re-run \`slackoc init\`.`);
     return null;
   }
 }
 
 export function saveConfig(cfg: SlackocConfig): void {
   mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  // tmp + fsync + rename: a crash mid-write must not leave a truncated token file
+  // (loadConfig would then report "not set up" with no hint why).
+  const tmp = `${CONFIG_PATH}.tmp`;
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeSync(fd, JSON.stringify(cfg, null, 2));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, CONFIG_PATH);
   try {
     chmodSync(CONFIG_PATH, 0o600);
   } catch {

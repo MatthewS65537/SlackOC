@@ -413,3 +413,20 @@ describe("versioned recovery migration (legacy-thread migration)", () => {
     expect(restarted.getThread("C:T")?.historyCursorTs).toBe(ts(0));
   });
 });
+
+describe("corrupt state.json", () => {
+  it("is moved aside (never silently overwritten) and the store starts clean", async () => {
+    const { readdirSync } = await import("node:fs");
+    const dir = join(FIXTURES, "corrupt");
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    writeFileSync(path, '{"threads": {"C1:1.0": {"sessionId": "ses_x"');
+    const store = new StateStore(path);
+    store.setCurrentProject("/tmp");
+    const backups = readdirSync(dir).filter(f => f.startsWith("state.json.corrupt-"));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(dir, backups[0]!), "utf8")).toContain("ses_x");
+    expect(JSON.parse(readFileSync(path, "utf8")).threads).toEqual({});
+  });
+});
