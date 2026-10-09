@@ -1,5 +1,26 @@
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { chunkText, mdToMrkdwn, money, shortId, shortPath, slackToPlain, tok } from "../src/util.js";
+import { chunkText, mdToMrkdwn, money, shortId, shortPath, slackToPlain, tok, writeFileAtomic } from "../src/util.js";
+
+describe("writeFileAtomic", () => {
+  it("replaces the file, forces the mode, and leaves no tmp behind", () => {
+    // Fixtures stay inside the project (never the system tmpdir).
+    const dir = join(import.meta.dirname ?? __dirname, ".fixtures", "util-atomic");
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "f.json");
+    writeFileSync(path, "old", { mode: 0o644 });
+    try {
+      writeFileAtomic(path, "new", 0o600);
+      expect(readFileSync(path, "utf8")).toBe("new");
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(readdirSync(dir)).toEqual(["f.json"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("slackToPlain (Slack entities → model-friendly text)", () => {
   it("decodes entities (&amp; last, so &amp;lt; stays literal)", () => {

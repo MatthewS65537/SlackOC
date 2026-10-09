@@ -8,17 +8,17 @@ export interface OcSession {
   id: string;
   directory: string;
   title: string;
+  /** Set on subagent (child) sessions. */
+  parentID?: string | null;
   summary?: { additions: number; deletions: number; files: number };
   time: { created: number; updated: number };
 }
 
 export interface OcFileDiff {
   file: string;
-  before: string;
-  after: string;
   additions: number;
   deletions: number;
-  patch?: string;
+  patch: string;
 }
 
 export interface OcToolState {
@@ -76,40 +76,13 @@ export interface OcPermission {
   time?: { created: number };
 }
 
-/**
- * opencode auto-updates and renamed the permission-ask event: ≤1.18.25 emits
- * `permission.updated` with the legacy shape below; ≥1.18.2x emits
- * `permission.asked` with `{permission, patterns, metadata, always, tool?}`.
- * The bridge must accept BOTH — otherwise a routine auto-update silently drops
- * every permission ask (verified: the 1.18.30 binary has 0 `permission.updated`
- * strings). Maps the new shape onto the legacy OcPermission the renderer
- * already consumes; legacy payloads pass through untouched.
- */
+/** Maps a V2 PermissionRequest (`action`/`resources`/`source`) onto the OcPermission the renderer consumes. */
 export function normalizePermission(props: Record<string, unknown>): OcPermission {
-  if (typeof props.action === "string") {
-    const source = props.source as { messageID?: string; id?: string } | undefined;
-    return { id: String(props.id), sessionID: String(props.sessionID), type: props.action,
-      title: String(props.message ?? props.action), pattern: props.resources as string[],
-      metadata: props.metadata as Record<string, unknown> | undefined,
-      messageID: source?.messageID, callID: source?.id };
-  }
-  // New shape discriminator: a string `permission` field (legacy uses `type`).
-  if (typeof props.permission === "string") {
-    const permission = props.permission;
-    const metadata = (props.metadata ?? {}) as Record<string, unknown>;
-    const tool = props.tool as { messageID?: string; callID?: string } | undefined;
-    return {
-      id: String(props.id ?? ""),
-      sessionID: String(props.sessionID ?? ""),
-      messageID: tool?.messageID,
-      callID: tool?.callID,
-      type: permission,
-      pattern: Array.isArray(props.patterns) ? (props.patterns as string[]) : undefined,
-      title: typeof metadata.title === "string" ? metadata.title : permission,
-      metadata,
-    };
-  }
-  return props as unknown as OcPermission;
+  const source = props.source as { messageID?: string; id?: string } | undefined;
+  return { id: String(props.id), sessionID: String(props.sessionID), type: String(props.action),
+    title: String(props.message ?? props.action), pattern: props.resources as string[],
+    metadata: props.metadata as Record<string, unknown> | undefined,
+    messageID: source?.messageID, callID: source?.id };
 }
 
 /** One selectable choice in a question (label is what gets sent back). */
@@ -124,9 +97,9 @@ export interface OcQuestionInfo {
   question: string;
   header: string;
   options: OcQuestionOption[];
-  /** Multi-select — deferred this round; only single-select is rendered. */
+  /** Multi-select (V2 `multiselect`): options toggle, then "Submit selection" sends them. */
   multiple?: boolean;
-  /** Free-text answer — deferred this round. */
+  /** Accepts a typed answer (free text or a number) via the "Type your own answer" modal. */
   custom?: boolean;
   field?: import("@opencode/client").FormField;
 }
@@ -134,7 +107,7 @@ export interface OcQuestionInfo {
 /**
  * A parked, blocking question. The server holds the tool call open until a
  * client replies or rejects; the announcement arrives as SSE `question.asked`.
- * Mirrors QuestionRequest from the opencode API (v1 endpoints, no /api prefix).
+ * Normalized from a V2 form (`form.created` / `GET /api/form`) by normalizeForm.
  */
 export interface OcQuestionRequest {
   id: string;
@@ -144,10 +117,8 @@ export interface OcQuestionRequest {
   form?: import("@opencode/client").FormInfo;
 }
 
-export type OcSessionStatus =
-  | { type: "idle" }
-  | { type: "busy" }
-  | { type: "retry"; attempt: number; message: string; next: number };
+/** The V2 adapter reports running sessions as busy; absent means idle. */
+export type OcSessionStatus = { type: "idle" } | { type: "busy" };
 
 export interface OcSessionStatusPayload {
   sessionID?: string;
@@ -175,4 +146,5 @@ export interface OCClient {
   config: { providers: Call; get: Call };
   app: { agents: Call };
   postSessionIdPermissionsPermissionId: Call;
+  commands: Call; projectId: Call; stats: Call;
 }

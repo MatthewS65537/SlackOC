@@ -1,6 +1,7 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import { writeFileAtomic } from "../util.js";
 import type { OcQuestionRequest } from "../opencode/api.js";
 
 export interface QuestionRelocation {
@@ -141,13 +142,7 @@ export class QuestionsStore {
       !Object.keys(r.relocation ?? {}).length && Date.now() - r.updatedAt > 7 * 86400_000) next.delete(id);
     if (next.size > 512) throw new Error("Question store full; pending answers retained");
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const temp = `${this.path}.${randomUUID()}.tmp`;
-    let fd: number | undefined;
-    try {
-      fd = openSync(temp, "wx", 0o600);
-      writeFileSync(fd, JSON.stringify({ version: 1, records: [...next.values()] }));
-      fsyncSync(fd); closeSync(fd); fd = undefined;
-      renameSync(temp, this.path); this.records = next;
-    } finally { if (fd !== undefined) closeSync(fd); if (existsSync(temp)) unlinkSync(temp); }
+    writeFileAtomic(this.path, JSON.stringify({ version: 1, records: [...next.values()] }));
+    this.records = next;
   }
 }

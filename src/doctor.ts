@@ -1,6 +1,11 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
-import { loadConfig } from "./config.js";
+import { CONFIG_DIR, loadConfig } from "./config.js";
+import { ScheduleStore } from "./schedules/store.js";
+import { slackApi } from "./init.js";
 import { isSupportedOpencodeVersion, MIN_OPENCODE, VERSION } from "./version.js";
 
 const execFileP = promisify(execFile);
@@ -9,6 +14,8 @@ export interface Check {
   name: string;
   ok: boolean;
   detail: string;
+  /** Optional piece missing: shown with "!", never counted as a failure. */
+  warn?: boolean;
 }
 
 /**
@@ -24,6 +31,34 @@ export function scopeCheck(name: string, body: { ok: boolean; error?: string }):
     return { name, ok: true, detail: "granted" };
   }
   return { name, ok: false, detail: `unverified — ${body.error ?? "unexpected response"}; resolve the probe failure and rerun doctor` };
+}
+
+const OPENCODE_CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode");
+
+/**
+ * Local install checks: the optional file-send plugin and skill (docs/SETUP.md,
+ * "Agent file delivery") and, when present, that schedules.json still loads.
+ * The store constructor only reads; a store it rejects keeps \schedule offline.
+ */
+export function localChecks(configDir = CONFIG_DIR, opencodeDir = OPENCODE_CONFIG_DIR): Check[] {
+  const checks: Check[] = [];
+  for (const [name, file] of [
+    ["file-send plugin", join(opencodeDir, "plugins", "slackoc-files.js")],
+    ["slackoc-send-file skill", join(opencodeDir, "skills", "slackoc-send-file", "SKILL.md")],
+  ] as const) {
+    checks.push(existsSync(file)
+      ? { name, ok: true, detail: file }
+      : { name, ok: true, warn: true, detail: `not installed at ${file} — optional; agents can't send files to Slack (see docs/SETUP.md)` });
+  }
+  const schedules = join(configDir, "schedules.json");
+  if (existsSync(schedules)) {
+    try {
+      checks.push({ name: "schedules.json", ok: true, detail: `${new ScheduleStore(schedules).jobs().length} job(s)` });
+    } catch (err) {
+      checks.push({ name: "schedules.json", ok: false, detail: `unreadable, scheduled reports are off — ${String((err as Error)?.message ?? err).slice(0, 120)}` });
+    }
+  }
+  return checks;
 }
 
 export async function runDoctor(): Promise<number> {
@@ -44,6 +79,8 @@ export async function runDoctor(): Promise<number> {
     checks.push({ name: "opencode on PATH", ok: false, detail: `not found or failed — ${String(err).slice(0, 120)}` });
   }
 
+  checks.push(...localChecks());
+
   const cfg = loadConfig();
   if (!cfg) {
     checks.push({ name: "config exists", ok: false, detail: "run `slackoc init`" });
@@ -52,10 +89,7 @@ export async function runDoctor(): Promise<number> {
     checks.push({ name: "bot token shape", ok: cfg.slackBotToken.startsWith("xoxb-"), detail: "xoxb-…" });
     checks.push({ name: "app-level token shape", ok: cfg.slackAppToken.startsWith("xapp-"), detail: "xapp-…" });
     try {
-      const auth = await fetch("https://slack.com/api/auth.test", {
-        method: "POST",
-        headers: { authorization: `Bearer ${cfg.slackBotToken}` },
-      }).then((r) => r.json() as Promise<{ ok: boolean; team?: string; user?: string; error?: string; url?: string }>);
+      const auth = await slackApi<{ ok: boolean; team?: string; user?: string; error?: string; url?: string }>("auth.test", cfg.slackBotToken);
       checks.push(
         auth.ok
           ? { name: "bot token auth.test", ok: true, detail: `@${auth.user}${auth.team ? ` in ${auth.team}` : ""}${auth.url ? ` — ${auth.url}` : ""}` }
@@ -66,10 +100,7 @@ export async function runDoctor(): Promise<number> {
     }
     if (cfg.slackAppToken.startsWith("xapp-")) {
       try {
-        const body = await fetch("https://slack.com/api/apps.connections.open", {
-          method: "POST",
-          headers: { authorization: `Bearer ${cfg.slackAppToken}` },
-        }).then((r) => r.json() as Promise<{ ok: boolean; error?: string }>);
+        const body = await slackApi<{ ok: boolean; error?: string }>("apps.connections.open", cfg.slackAppToken);
         checks.push(
           body.ok
             ? { name: "app-level token (Socket Mode)", ok: true, detail: "connects" }
@@ -80,15 +111,9 @@ export async function runDoctor(): Promise<number> {
       }
     }
     {
-      const body: { ok: boolean; user?: { real_name?: string }; error?: string } = await fetch(
-        `https://slack.com/api/users.info?user=${cfg.ownerSlackUserId}`,
-        {
-          method: "POST",
-          headers: { authorization: `Bearer ${cfg.slackBotToken}` },
-        },
-      )
-        .then((r) => r.json() as Promise<{ ok: boolean; user?: { real_name?: string }; error?: string }>)
-        .catch(() => ({ ok: false }));
+      const body = await slackApi<{ ok: boolean; user?: { real_name?: string }; error?: string }>(
+        `users.info?user=${cfg.ownerSlackUserId}`, cfg.slackBotToken,
+      ).catch((): { ok: boolean; user?: { real_name?: string }; error?: string } => ({ ok: false }));
       if (body.ok) {
         checks.push({ name: "paired owner found", ok: true, detail: (body.user?.real_name ?? cfg.ownerSlackUserId) as string });
       } else if (body.error === "missing_scope") {
@@ -106,11 +131,7 @@ export async function runDoctor(): Promise<number> {
       { name: "scope reactions:write (✅/❌)", method: "reactions.add", payload: { channel: "C0000000000", name: "x", timestamp: "0" } },
     ] as const) {
       try {
-        const b = await fetch(`https://slack.com/api/${probe.method}`, {
-          method: "POST",
-          headers: { authorization: `Bearer ${cfg.slackBotToken}`, "content-type": "application/json" },
-          body: JSON.stringify(probe.payload),
-        }).then((r) => r.json() as Promise<{ ok: boolean; error?: string }>);
+        const b = await slackApi<{ ok: boolean; error?: string }>(probe.method, cfg.slackBotToken, probe.payload);
         checks.push(scopeCheck(probe.name, b));
       } catch (err) {
         checks.push({ name: probe.name, ok: false, detail: String(err).slice(0, 120) });
@@ -121,7 +142,7 @@ export async function runDoctor(): Promise<number> {
   let fail = 0;
   console.log(`slackoc v${VERSION} doctor`);
   for (const c of checks) {
-    console.log(` ${c.ok ? "✓" : "✗"} ${c.name} — ${c.detail}`);
+    console.log(` ${c.warn ? "!" : c.ok ? "✓" : "✗"} ${c.name} — ${c.detail}`);
     if (!c.ok) fail += 1;
   }
   if (fail) {

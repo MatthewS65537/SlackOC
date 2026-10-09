@@ -2,16 +2,12 @@
  * Session picker shared by \sessions, \resume, \watch, \history and \summary:
  * one listing, one numbering, one resolution path.
  *
- * Grounded in two live spikes (2026-09-16, opencode 1.18.31):
- *  - `GET /session` is MACHINE-GLOBAL: a server rooted at dir A lists sessions
- *    created via other processes/servers on the box (shared on-disk storage),
- *    and accepts `?directory=` to scope it. So machine scope is a single call —
- *    no per-dir fan-out needed.
- *  - Cross-process SSE does NOT propagate (a TUI-driven session's events stay
- *    on the TUI's own server bus), so "running" markers come from two cheap
- *    signals instead of live events for every session: the process-wide
- *    activity map fed by `session.status` events (SlackOC's own servers), plus
- *    a recency fallback for TUI-driven sessions.
+ * OpenCode V2 runs one shared service per machine, so `session.list` is
+ * machine-wide in a single call (no per-dir fan-out) and the one event stream
+ * sees every session on it. "Running" markers come from the process-wide
+ * activity map fed by `session.status` events, plus a recency fallback for
+ * sessions whose busy state this bridge never observed (e.g. a run that
+ * started before the bridge did).
  */
 
 import { sessionList } from "../opencode/client.js";
@@ -98,9 +94,9 @@ export function cacheProjectList(ctx: CmdCtx, dirs: string[]): void {
   if (cache.size > 100) cache.delete(cache.keys().next().value!);
 }
 
-export function projectListSnapshot(ctx: CmdCtx, now = Date.now()): string[] | null {
+export function projectListSnapshot(ctx: CmdCtx): string[] | null {
   const hit = projectLists.get(ctx.state)?.get(ctx.threadKey);
-  return hit && now - hit.at <= LIST_TTL_MS ? [...hit.dirs] : null;
+  return hit && Date.now() - hit.at <= LIST_TTL_MS ? [...hit.dirs] : null;
 }
 
 export function invalidateProjectList(ctx: CmdCtx): void {
@@ -136,7 +132,7 @@ function toRefs(ctx: CmdCtx, sessions: OcSession[], serverDir: string): SessionR
  * Fetch machine-wide refs (uncapped). One server call: `GET /session` on any
  * local server lists every session in the shared on-disk storage (spike 2).
  */
-export async function pickerRefs(ctx: CmdCtx): Promise<SessionRef[]> {
+async function pickerRefs(ctx: CmdCtx): Promise<SessionRef[]> {
   const serverDir = canonicalDir(ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd);
   const entry = await ctx.pool.ensure(serverDir);
   const raw = (await sessionList(entry.client!)) as OcSession[];
@@ -151,7 +147,7 @@ export async function pickerRefs(ctx: CmdCtx): Promise<SessionRef[]> {
  */
 export async function pickerList(
   ctx: CmdCtx,
-  opts: { scope: "project" | "all"; filter?: string } = { scope: "all" },
+  opts: { scope: "project" | "all"; filter?: string },
 ): Promise<{ refs: SessionRef[]; total: number }> {
   const all = await pickerRefs(ctx);
   const serverDir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
@@ -188,7 +184,7 @@ export function renderPickerList(refs: SessionRef[], opts: { heading: string; to
   return lines.join("\n");
 }
 
-export type ResolvedPick =
+type ResolvedPick =
   | { kind: "ref"; ref: SessionRef }
   /** `#` given but the seen-list expired: fresh list attached, ask the user to pick again. */
   | { kind: "stale"; list: SessionRef[]; total: number };

@@ -3,7 +3,7 @@
  * requests use @opencode/client with service authentication and locations.
  */
 
-import { OpenCode, type OpenCodeClient, type SessionMessageInfo } from "@opencode/client";
+import { OpenCode, type OpenCodeClient, type SessionMessageInfo, type SessionStatsInfo, type SessionStatsInput } from "@opencode/client";
 import { normalizeForm, formAnswer, normalizeMessages, V2Events } from "./v2.js";
 import { abortableFetch, COMMAND_TIMEOUT_MS, type RequestOptions } from "../http.js";
 import { normalizePermission } from "./api.js";
@@ -115,8 +115,7 @@ export function makeClient(baseUrl: string, options: ClientOptions = {}): OCClie
         }
         return rows;
       },
-      diff: async ({ path, signal }) => (await native.session.diff({ sessionID: path.id }, { signal }))
-        .map(d => ({ ...d, before: "", after: "" })),
+      diff: ({ path, signal }) => native.session.diff({ sessionID: path.id }, { signal }),
       abort: ({ path, signal }) => native.session.interrupt({ sessionID: path.id }, { signal }),
       delete: ({ path, signal }) => native.session.remove({ sessionID: path.id }, { signal }),
       promptAsync: async ({ path, body, signal }) => {
@@ -154,6 +153,10 @@ export function makeClient(baseUrl: string, options: ClientOptions = {}): OCClie
     app: { agents: async ({ signal } = {}) => (await native.agent.list({ location }, { signal })).data
       .filter(a => !a.hidden).map(a => ({ ...a, name: a.id })) },
     postSessionIdPermissionsPermissionId: ({ path, body, signal }) => native.permission.reply({ sessionID: path.id, requestID: path.permissionID, decision: body.response }, { signal }),
+    commands: async ({ signal } = {}) => (await native.command.list({ location }, { signal })).data,
+    /** Project.ID owning this client's directory (the `project` filter for stats). */
+    projectId: async ({ signal } = {}) => (await native.location.get({ location }, { signal })).project.id,
+    stats: ({ signal, ...input } = {}) => native.session.stats(input, { signal }),
   };
 }
 
@@ -164,13 +167,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Full, non-paginated map. OpenCode removes idle entries; use sessionIdle for that inference. */
 export async function sessionStatus(c: OCClient, options: { signal?: AbortSignal } = {}): Promise<Record<string, OcSessionStatus>> {
   const result = await data<unknown>(c.session.status({ signal: options.signal }));
-  if (!isRecord(result) || Object.values(result).some((status) => {
-    if (!isRecord(status)) return true;
-    if (status.type === "idle" || status.type === "busy") return false;
-    return status.type !== "retry" || typeof status.message !== "string" ||
-      typeof status.attempt !== "number" || !Number.isFinite(status.attempt) ||
-      typeof status.next !== "number" || !Number.isFinite(status.next);
-  })) throw new Error("invalid session status response");
+  if (!isRecord(result) || Object.values(result).some((status) => !isRecord(status) || (status.type !== "busy" && status.type !== "idle"))) {
+    throw new Error("invalid session status response");
+  }
   return result as Record<string, OcSessionStatus>;
 }
 
@@ -302,11 +301,6 @@ export async function configGet(c: OCClient, signal?: AbortSignal): Promise<OcCo
   return data(c.config.get({ signal }));
 }
 
-/** Resolve the location's default model without spending tokens or creating a session. */
-export async function detectDefaultModel(c: OCClient, _projectDir: string): Promise<string | undefined> {
-  return (await configGet(c)).model;
-}
-
 export interface AgentInfo {
   name: string;
   description?: string;
@@ -318,21 +312,35 @@ export async function agentsList(c: OCClient, signal?: AbortSignal): Promise<Age
   return data(c.app.agents({ signal }));
 }
 
+export interface CommandInfo { name: string; description?: string }
+
+/** Native OpenCode commands available in this client's location. */
+export async function commandList(c: OCClient, signal?: AbortSignal): Promise<CommandInfo[]> {
+  return data(c.commands({ signal }));
+}
+
+/** Aggregate usage (cost, tokens, sessions, daily activity) over a time range. */
+export async function sessionStats(c: OCClient, input: SessionStatsInput & { signal?: AbortSignal } = {}): Promise<SessionStatsInfo> {
+  return data(c.stats(input));
+}
+
+export async function projectId(c: OCClient, signal?: AbortSignal): Promise<string> {
+  return data(c.projectId({ signal }));
+}
+
 /** GET /api/permission/request — pending permissions in this location. */
-export async function pendingPermissions(client: OCClient | string, options: RequestOptions = {}): Promise<OcPermission[]> {
-  const c = typeof client === "string" ? makeClient(client, options) : client;
+export async function pendingPermissions(c: OCClient, options: RequestOptions = {}): Promise<OcPermission[]> {
   const result: unknown = (await c.v2!.permission.request.list({ location: c.directory ? { directory: c.directory } : undefined }, options))?.data;
   if (!Array.isArray(result) || result.some((row) => !isRecord(row) ||
     typeof row.id !== "string" || typeof row.sessionID !== "string" ||
-    (typeof row.action !== "string" && typeof row.permission !== "string" && typeof row.type !== "string"))) {
+    typeof row.action !== "string")) {
     throw new Error("invalid pending permissions response");
   }
   return result.map(normalizePermission);
 }
 
 /** GET /api/form — pending session forms in this location. */
-export async function pendingQuestions(client: OCClient | string, options: RequestOptions = {}): Promise<OcQuestionRequest[]> {
-  const c = typeof client === "string" ? makeClient(client, options) : client;
+export async function pendingQuestions(c: OCClient, options: RequestOptions = {}): Promise<OcQuestionRequest[]> {
   const result = (await c.v2!.form.list({ location: c.directory ? { directory: c.directory } : undefined }, options))?.data;
   if (!Array.isArray(result) || result.some(r => !r || typeof r.id !== "string" || typeof r.sessionID !== "string" || !Array.isArray(r.fields))) throw new Error("invalid pending questions response");
   return result.map(normalizeForm);
@@ -342,82 +350,17 @@ export async function pendingQuestions(client: OCClient | string, options: Reque
  * Reply to a V2 form. `answers` contains option values or free text, converted
  * into the field-keyed, typed FormAnswer contract before submission.
  */
-export async function questionReply(client: OCClient | string, requestId: string, answers: string[][], options: RequestOptions & { request?: OcQuestionRequest } = {}): Promise<unknown> {
-  const c = typeof client === "string" ? makeClient(client) : client;
+export async function questionReply(c: OCClient, requestId: string, answers: string[][], options: RequestOptions & { request?: OcQuestionRequest } = {}): Promise<unknown> {
   const req = options.request ?? (await pendingQuestions(c, options)).find(q => q.id === requestId);
   if (!req) throw new Error("Form is no longer pending");
   return c.v2!.session.form.reply({ sessionID: req.sessionID, formID: req.id, answer: formAnswer(req, answers) }, options);
 }
 
 /** DELETE /api/session/{sessionID}/form/{formID} — cancel a pending form. */
-export async function questionReject(client: OCClient | string, requestId: string, options: RequestOptions & { sessionId?: string } = {}): Promise<unknown> {
-  const c = typeof client === "string" ? makeClient(client) : client;
+export async function questionReject(c: OCClient, requestId: string, options: RequestOptions & { sessionId?: string } = {}): Promise<unknown> {
   const sessionID = options.sessionId ?? (await pendingQuestions(c, options)).find(q => q.id === requestId)?.sessionID;
   if (!sessionID) throw new Error("Form is no longer pending");
   return c.v2!.session.form.cancel({ sessionID, formID: requestId }, options);
-}
-
-/**
- * Raw SSE diagnostic reader. Production subscriptions use clientEvents below.
- * Throws on connection failure; res.body ends when the server closes.
- */
-// Installed server binary emits server.heartbeat every 10 seconds (Sep 18, 2026).
-// Six missed beats allow scheduling jitter without an overall run lifetime limit.
-export const SSE_IDLE_TIMEOUT_MS = 60_000;
-
-export async function* sseEvents(url: string, signal: AbortSignal, idleMs = SSE_IDLE_TIMEOUT_MS): AsyncGenerator<OcEvent> {
-  const controller = new AbortController();
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let timer: ReturnType<typeof setTimeout>;
-  const cancelReader = () => { void reader?.cancel(controller.signal.reason).catch(() => {}); };
-  const cancel = () => controller.abort(signal.reason);
-  const reset = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => controller.abort(new Error(`SSE idle timeout (${idleMs / 1000}s)`)), idleMs);
-    timer.unref?.();
-  };
-  controller.signal.addEventListener("abort", cancelReader);
-  signal.addEventListener("abort", cancel, { once: true });
-  if (signal.aborted) cancel();
-  reset();
-  try {
-    controller.signal.throwIfAborted();
-    const res = await fetch(`${url}/api/event`, { signal: controller.signal, headers: { accept: "text/event-stream" } });
-    if (!res.ok || !res.body) {
-      void res.body?.cancel().catch(() => {});
-      throw new Error(`SSE subscribe failed: HTTP ${res.status}`);
-    }
-    reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      controller.signal.throwIfAborted();
-      const { done, value } = await reader.read();
-      controller.signal.throwIfAborted();
-      if (done) break;
-      reset();
-      buf += dec.decode(value, { stream: true });
-      let match: RegExpExecArray | null;
-      while ((match = /\r?\n\r?\n/.exec(buf))) {
-        const frame = buf.slice(0, match.index);
-        buf = buf.slice(match.index + match[0].length);
-        const payload = frame.split(/\r?\n/).filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trimStart()).join("\n");
-        if (!payload || payload === "[DONE]") continue;
-        let event: OcEvent;
-        try { event = JSON.parse(payload) as OcEvent; } catch { continue; }
-        if (event && typeof event.type === "string") yield event;
-      }
-      if (buf.length > 4 * 1024 * 1024) throw new Error("SSE frame exceeds 4 MiB");
-    }
-  } finally {
-    clearTimeout(timer!);
-    signal.removeEventListener("abort", cancel);
-    controller.signal.removeEventListener("abort", cancelReader);
-    controller.abort();
-    void reader?.cancel().catch(() => {});
-    reader?.releaseLock();
-  }
 }
 
 /** Bound on the event stream's connect + response headers (the body is open-ended). */

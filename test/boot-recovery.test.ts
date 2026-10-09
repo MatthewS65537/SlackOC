@@ -58,7 +58,7 @@ function fixture(options: { age?: number; evidence?: "accepted" | "uncertain" | 
     create: vi.fn(async () => { throw new Error("boot must never create a session"); }),
   } };
   const entry: PoolEntry = { dir: root, url: "http://boot.invalid", baseUrl: "http://boot.invalid", status: "ready",
-    client: client as unknown as OCClient, ready: Promise.resolve(), sseAbort: null, proc: null, lastEventAt: Date.now() };
+    client: client as unknown as OCClient, ready: Promise.resolve() };
   const release = vi.fn();
   const pool = { acquire: vi.fn(async () => ({ entry, release })), get: vi.fn((): PoolEntry | null => entry) };
   const render: RenderDeps = {

@@ -1,11 +1,15 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { runDoctor, scopeCheck } from "../src/doctor.js";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { localChecks, runDoctor, scopeCheck } from "../src/doctor.js";
 
 const f = vi.hoisted(() => ({ exec: vi.fn() }));
 vi.mock("node:child_process", () => ({ execFile: Object.assign(vi.fn(), {
   [Symbol.for("nodejs.util.promisify.custom")]: f.exec,
 }) }));
-vi.mock("../src/config.js", () => ({ loadConfig: () => null }));
+const FIXTURES = vi.hoisted(() => `${import.meta.dirname}/.fixtures/doctor`);
+vi.mock("../src/config.js", () => ({ loadConfig: () => null, CONFIG_DIR: `${FIXTURES}/slackoc` }));
+afterAll(() => rmSync(FIXTURES, { recursive: true, force: true }));
 afterEach(() => vi.restoreAllMocks());
 
 describe("doctor V2 CLI version check", () => {
@@ -48,5 +52,33 @@ describe("doctor live scope probes (RQ6)", () => {
 
   it("a failed response without an error is inconclusive, not granted", () => {
     expect(scopeCheck("s", { ok: false }).ok).toBe(false);
+  });
+});
+
+describe("doctor local install checks", () => {
+  const slackoc = join(FIXTURES, "slackoc"); const opencode = join(FIXTURES, "opencode");
+  const byName = () => Object.fromEntries(localChecks(slackoc, opencode).map(c => [c.name, c]));
+
+  it("warns (never fails) when the file-send plugin or skill is missing, and skips an absent schedules.json", () => {
+    rmSync(FIXTURES, { recursive: true, force: true });
+    const checks = byName();
+    expect(checks["file-send plugin"]).toMatchObject({ ok: true, warn: true });
+    expect(checks["slackoc-send-file skill"]).toMatchObject({ ok: true, warn: true });
+    expect(checks["schedules.json"]).toBeUndefined();
+  });
+
+  it("passes installed pieces and fails a schedules.json the store rejects", () => {
+    mkdirSync(join(opencode, "plugins"), { recursive: true });
+    mkdirSync(join(opencode, "skills", "slackoc-send-file"), { recursive: true });
+    mkdirSync(slackoc, { recursive: true });
+    writeFileSync(join(opencode, "plugins", "slackoc-files.js"), "");
+    writeFileSync(join(opencode, "skills", "slackoc-send-file", "SKILL.md"), "");
+    writeFileSync(join(slackoc, "schedules.json"), JSON.stringify({ version: 1, jobs: [], runs: [] }));
+    let checks = byName();
+    for (const name of ["file-send plugin", "slackoc-send-file skill"]) expect(checks[name]).toEqual({ name, ok: true, detail: expect.any(String) });
+    expect(checks["schedules.json"]).toMatchObject({ ok: true, detail: "0 job(s)" });
+    writeFileSync(join(slackoc, "schedules.json"), JSON.stringify({ version: 2, jobs: [], runs: [] }));
+    checks = byName();
+    expect(checks["schedules.json"]).toMatchObject({ ok: false, detail: expect.stringContaining("Unsupported schedule store version") });
   });
 });

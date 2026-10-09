@@ -5,9 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OCClient, OcPart } from "../src/opencode/api.js";
 import type { sessionMessages } from "../src/opencode/client.js";
 import type { PoolEntry } from "../src/opencode/server.js";
-import { hasReportPermissions, MAX_REPORT_BYTES, reportPermissions, ReportRunner, type ReportRunnerOptions } from "../src/schedules/runner.js";
+import { hasReportPermissions, reportPermissions, ReportRunner, type ReportRunnerOptions } from "../src/schedules/runner.js";
 import { Scheduler } from "../src/schedules/scheduler.js";
-import { isTerminalRun, ScheduleStore, type NewScheduleJob, type ScheduleRun } from "../src/schedules/store.js";
+import { isTerminalRun, MAX_SCHEDULE_OUTPUT_BYTES, ScheduleStore, type NewScheduleJob, type ScheduleRun } from "../src/schedules/store.js";
 
 const dir = resolve("test/.fixtures/schedule-runner");
 const projectDir = resolve(dir, "project");
@@ -83,7 +83,7 @@ function setup(jobOverrides: Partial<NewScheduleJob> = {}, optionOverrides: Part
   });
   const findDelivery = vi.fn<ReportRunnerOptions["findDelivery"]>(async () => undefined);
   const notify = vi.fn<ReportRunnerOptions["notify"]>(async r => { expect(store.run(r.id)!.notified).toBe(true); });
-  const onDelivered = vi.fn<NonNullable<ReportRunnerOptions["onDelivered"]>>(async r => {
+  const onDelivered = vi.fn<ReportRunnerOptions["onDelivered"]>(async r => {
     expect(store.run(r.id)).toMatchObject({ status: "delivered", delivery: r.delivery, deliveryBindingPending: true });
   });
   const options: ReportRunnerOptions = { store, pool: { acquire }, now, ensureContext, deliver, findDelivery, notify, onDelivered, ...optionOverrides };
@@ -362,9 +362,9 @@ describe("scheduled completion proof", () => {
   });
 
   it("bounds saved output by UTF-8 bytes without leaking reasoning/tool text", async () => {
-    const h = setup(); await h.start(); h.transcript([user(h.latest()), answer(h.latest(), "a" + "🦖".repeat(MAX_REPORT_BYTES))]);
+    const h = setup(); await h.start(); h.transcript([user(h.latest()), answer(h.latest(), "a" + "🦖".repeat(MAX_SCHEDULE_OUTPUT_BYTES))]);
     await h.tick(); expect(h.latest().status).toBe("ready");
-    expect(Buffer.byteLength(h.latest().output!)).toBeLessThanOrEqual(MAX_REPORT_BYTES);
+    expect(Buffer.byteLength(h.latest().output!)).toBeLessThanOrEqual(MAX_SCHEDULE_OUTPUT_BYTES);
     expect(h.latest().output).not.toContain("\uFFFD");
   });
 

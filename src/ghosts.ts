@@ -15,30 +15,19 @@
  * an ongoing incident pages once an hour, not once a minute.
  */
 
-export interface GhostDetectorOpts {
+const DEFAULTS = {
   /** Observation window; older bumps fall out of both counters. */
-  windowMs?: number;
+  windowMs: 15 * 60_000,
   /** Minimum replayed messages in-window before a warning is even considered. */
-  threshold?: number;
+  threshold: 3,
   /** Minimum spacing between two warnings. */
-  cooldownMs?: number;
-}
-
-const DEFAULTS = { windowMs: 15 * 60_000, threshold: 3, cooldownMs: 60 * 60_000 };
+  cooldownMs: 60 * 60_000,
+};
 
 export class GhostDetector {
   private live: number[] = [];
   private replays: number[] = [];
   private lastWarnAt = 0;
-  private readonly windowMs: number;
-  private readonly threshold: number;
-  private readonly cooldownMs: number;
-
-  constructor(opts: GhostDetectorOpts = {}) {
-    this.windowMs = opts.windowMs ?? DEFAULTS.windowMs;
-    this.threshold = opts.threshold ?? DEFAULTS.threshold;
-    this.cooldownMs = opts.cooldownMs ?? DEFAULTS.cooldownMs;
-  }
 
   /** The socket delivered an envelope live. */
   noteLive(now = Date.now()): void {
@@ -55,15 +44,15 @@ export class GhostDetector {
    * or null. Call after every sweep pass.
    */
   check(now = Date.now()): string | null {
-    this.live = this.live.filter((t) => now - t <= this.windowMs);
-    this.replays = this.replays.filter((t) => now - t <= this.windowMs);
-    if (this.replays.length < this.threshold) return null;
+    this.live = this.live.filter((t) => now - t <= DEFAULTS.windowMs);
+    this.replays = this.replays.filter((t) => now - t <= DEFAULTS.windowMs);
+    if (this.replays.length < DEFAULTS.threshold) return null;
     if (this.replays.length < this.live.length) return null;
-    if (now - this.lastWarnAt < this.cooldownMs) return null;
+    if (now - this.lastWarnAt < DEFAULTS.cooldownMs) return null;
     this.lastWarnAt = now;
     return (
       `catch-up: ${this.replays.length} message(s) arrived via sweep vs ${this.live.length} via socket in the last ` +
-      `${Math.round(this.windowMs / 60_000)} min — a second bridge instance with this app token may be consuming ` +
+      `${Math.round(DEFAULTS.windowMs / 60_000)} min — a second bridge instance with this app token may be consuming ` +
       `your events. Kill it (slackoc stop on the other machine) or regenerate the app-level token.`
     );
   }

@@ -1,8 +1,9 @@
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalDir } from "./paths.js";
+import { writeFileAtomic } from "./util.js";
 import { logErr } from "./log.js";
-import { compareTs, replayAge, replayFloor, timestampMicros, type RecoveryDecision } from "./slack/recovery-policy.js";
+import { compareTs, replayAge, replayFloor, timestampFromMs, timestampMicros, type RecoveryDecision } from "./slack/recovery-policy.js";
 import type { SlackMsg } from "./slack/router.js";
 
 export type VerboseMode = "off" | "on" | "full";
@@ -14,7 +15,6 @@ export interface ThreadState {
   /** provider/model string incl. reasoning-variant suffix, applied to future prompts */
   model?: string;
   agent?: string;
-  title?: string;
   /** \hush toggle: when true, plain thread messages are ignored (commands pass; an explicit @mention wakes it) */
   hushed?: boolean;
   /** \notify toggle: when true, run completions are DM'd to the owner */
@@ -38,13 +38,13 @@ export interface ThreadState {
   lastSeenTs?: string;
   /** Only the history poll advances this, after verifying contiguous dispositions. */
   historyCursorTs?: string;
+  /** Always set on stored threads (constructor + setThread); optional only for callers building a ThreadState. */
   recovery?: ThreadRecovery;
   createdAt: number;
   lastUsedAt: number;
 }
 
-export interface ThreadRecovery {
-  version: 1;
+interface ThreadRecovery {
   ownerActivityTs?: string;
   replayFloorTs: string;
   trustedAfterTs?: string;
@@ -55,11 +55,10 @@ export interface ThreadRecovery {
   /** A missed state-changing command makes subsequent historical context ambiguous. */
   needsFreshIntent?: boolean;
   lastRun?: { generation: number; sessionId: string; userMsgTs: string[]; messageIds: string[];
-    outcome: "active" | "completed" | "stopped" | "failed" | "interrupted"; completedThroughTs?: string };
+    outcome: "active" | "completed" | "stopped" | "failed" | "interrupted" };
   scan?: { upperTs: string; afterTs: string; cursor?: string; generation: number; intentVersion: number;
     candidates: SlackMsg[]; complete: boolean };
   counts?: { recovered: number; held: number; expired: number; canceled: number };
-  reasons?: Record<string, number>;
   lastDecision?: { ts: string; decision: RecoveryDecision["decision"]; reason: string };
 }
 
@@ -67,7 +66,12 @@ interface ProjectInfo {
   lastUsedAt: number;
 }
 
+/** state.json format. send-file reads it from another process, so its shape is a contract. */
+export const STATE_VERSION = 1;
+
 interface SlackocState {
+  /** Absent in files written before versioning; treated as 1. */
+  version?: number;
   threads: Record<string, ThreadState>;
   projects: Record<string, ProjectInfo>;
   currentProjectDir?: string;
@@ -77,9 +81,11 @@ interface SlackocState {
   unboundReceiptFloorTs?: string;
   /** \listen: channels where every top-level owner message prompts, no @ needed (default: none). */
   alwaysOnChannels?: string[];
+  /** Top-level catch-up watermark per \listen channel / owner DM: history at or before it is never replayed. */
+  topLevelSeenTs?: Record<string, string>;
 }
 
-export type MessageDisposition = "processing" | "accepted" | "uncertain";
+type MessageDisposition = "processing" | "accepted" | "uncertain";
 export interface MessageReceipt {
   threadKey: string;
   ts: string;
@@ -92,12 +98,12 @@ export interface MessageReceipt {
   generation?: number;
   cancellationBoundary?: boolean;
 }
-export interface PromptSubmission {
+interface PromptSubmission {
   projectDir: string;
   sessionId: string;
   messageId: string;
 }
-export interface PromptAcceptanceEvidence {
+interface PromptAcceptanceEvidence {
   id: string;
   sessionID: string;
   role: string;
@@ -110,12 +116,14 @@ export class StateStore {
   private state: SlackocState;
 
   constructor(private path: string, readonly now: () => number = Date.now) {
-    this.state = { threads: {}, projects: {} };
+    this.state = { version: STATE_VERSION, threads: {}, projects: {} };
     if (existsSync(path)) {
       let problem: string | undefined;
       try {
         const parsed = JSON.parse(readFileSync(path, "utf8")) as SlackocState;
-        if (parsed && typeof parsed === "object" && parsed.threads && parsed.projects) this.state = parsed;
+        // A newer format is quarantined like a corrupt file: kept intact on disk, never overwritten.
+        if (parsed?.version !== undefined && parsed.version !== STATE_VERSION) problem = `unsupported version ${String(parsed.version)}`;
+        else if (parsed && typeof parsed === "object" && parsed.threads && parsed.projects) this.state = { ...parsed, version: STATE_VERSION };
         else problem = "unexpected shape";
       } catch (err) {
         problem = String((err as Error)?.message ?? err);
@@ -128,9 +136,11 @@ export class StateStore {
         logErr(`state.json unreadable (${problem}) — moved to ${backup}; starting with empty state`);
       }
     }
+    // Load-time normalization; the first save (setCurrentProject at boot) persists it.
     this.normalizeProjects();
     for (const t of Object.values(this.state.threads)) {
-      // Last-seen is observation, not acceptance. Keep legacy gaps conservative.
+      // Last-seen is observation, not acceptance. Keep legacy gaps conservative;
+      // never seed owner activity from maintenance time.
       t.recovery ??= this.newRecovery(t);
     }
     for (const r of Object.values(this.state.receipts ?? {})) {
@@ -140,19 +150,9 @@ export class StateStore {
   }
 
   private newRecovery(t: ThreadState): ThreadRecovery {
-    return { version: 1, ownerActivityTs: replayAge(t.lastSeenTs, this.now()).reason !== "invalid_timestamp" ? t.lastSeenTs : undefined,
+    return { ownerActivityTs: replayAge(t.lastSeenTs, this.now()).reason !== "invalid_timestamp" ? t.lastSeenTs : undefined,
       replayFloorTs: maxTs(replayFloor(this.now()), this.state.unboundReceiptFloorTs)!, trustedAfterTs: t.historyCursorTs,
       bindingGeneration: 1, intentVersion: 0 };
-  }
-
-  /** Idempotent versioned migration; never seed owner activity from maintenance time. */
-  migrateRecovery(): number {
-    let changed = 0;
-    for (const t of Object.values(this.state.threads)) {
-      if (!t.recovery) { t.recovery = this.newRecovery(t); changed++; }
-    }
-    this.save();
-    return changed;
   }
 
   bindingGeneration(key: string): number { return this.state.threads[key]?.recovery?.bindingGeneration ?? 0; }
@@ -163,7 +163,7 @@ export class StateStore {
     const command = ts ? this.state.receipts?.[this.receiptKey(key, ts)] : undefined;
     if (command) command.cancellationBoundary = true;
     if (!t) { if (command) this.save(); return; }
-    const r = t.recovery ??= this.newRecovery(t);
+    const r = t.recovery!;
     const boundary = ts ?? r.ownerActivityTs;
     if (boundary && r.canceledThroughTs && compareTs(boundary, r.canceledThroughTs) <= 0) return;
     if (timestampMicros(boundary) !== undefined) r.canceledThroughTs = maxTs(r.canceledThroughTs, boundary);
@@ -181,7 +181,7 @@ export class StateStore {
   noteLiveIntent(key: string): void {
     const t = this.state.threads[key];
     if (!t) return;
-    const r = t.recovery ??= this.newRecovery(t);
+    const r = t.recovery!;
     r.intentVersion++;
     r.needsFreshIntent = false;
     this.save();
@@ -190,29 +190,28 @@ export class StateStore {
   holdHistoricalContext(key: string): void {
     const t = this.state.threads[key];
     if (!t) return;
-    (t.recovery ??= this.newRecovery(t)).needsFreshIntent = true;
+    t.recovery!.needsFreshIntent = true;
     this.save();
   }
 
   recordRunOutcome(key: string, sessionId: string, outcome: NonNullable<ThreadRecovery["lastRun"]>["outcome"], userMsgTs?: string[]): void {
     const t = this.state.threads[key];
     if (!t || t.sessionId !== sessionId) return;
-    const r = t.recovery ??= this.newRecovery(t);
+    const r = t.recovery!;
     const timestamps = userMsgTs ?? t.pendingRun?.userMsgTs ?? r.lastRun?.userMsgTs ?? [];
     if (!timestamps.length) return;
     // An idle/error echo after owner cancellation cannot turn stopped work into completion.
     const stopped = timestamps.every((ts) => r.canceledThroughTs && compareTs(ts, r.canceledThroughTs) <= 0);
     r.lastRun = { generation: r.bindingGeneration, sessionId, userMsgTs: [...timestamps],
       messageIds: timestamps.flatMap((ts) => this.getReceipt(key, ts)?.submission?.messageId ?? []),
-      outcome: stopped ? "stopped" : outcome,
-      ...(outcome === "completed" && !stopped ? { completedThroughTs: timestamps.reduce((a, b) => maxTs(a, b)!) } : {}) };
+      outcome: stopped ? "stopped" : outcome };
     this.save();
   }
 
   setRecoveryScan(key: string, scan: ThreadRecovery["scan"]): void {
     const t = this.state.threads[key];
     if (!t) return;
-    (t.recovery ??= this.newRecovery(t)).scan = scan ? structuredClone(scan) : undefined;
+    t.recovery!.scan = scan ? structuredClone(scan) : undefined;
     this.save();
   }
 
@@ -222,15 +221,11 @@ export class StateStore {
     if (receipt?.recoveryDecision?.reason === decision.reason) return;
     if (receipt && decision.decision !== "recover" && decision.decision !== "already_handled") receipt.recoveryDecision = decision;
     if (t) {
-      const r = t.recovery ??= this.newRecovery(t);
+      const r = t.recovery!;
       if (r.lastDecision?.ts === ts && r.lastDecision.reason === decision.reason) return;
       const counts = r.counts ??= { recovered: 0, held: 0, expired: 0, canceled: 0 };
       if (decision.decision === "recover") counts.recovered++;
       else if (decision.decision !== "already_handled") counts[decision.decision]++;
-      if (decision.decision !== "recover" && decision.decision !== "already_handled") {
-        const reasons = r.reasons ??= {};
-        reasons[decision.reason] = (reasons[decision.reason] ?? 0) + 1;
-      }
       r.lastDecision = { ts, ...decision };
     }
     this.save();
@@ -240,7 +235,7 @@ export class StateStore {
   retireHistory(key: string, ts: string): void {
     const t = this.state.threads[key];
     if (!t) return;
-    const r = t.recovery ??= this.newRecovery(t);
+    const r = t.recovery!;
     r.replayFloorTs = maxTs(r.replayFloorTs, ts)!;
     this.save();
   }
@@ -257,9 +252,26 @@ export class StateStore {
     return this.state.alwaysOnChannels?.includes(channel) ?? false;
   }
 
+  alwaysOnChannels(): string[] {
+    return [...(this.state.alwaysOnChannels ?? [])];
+  }
+
+  /** Enabling (re)starts the watermark at now, so messages from while it was off are never replayed. */
   setAlwaysOn(channel: string, on: boolean): void {
     const rest = (this.state.alwaysOnChannels ?? []).filter(c => c !== channel);
     this.state.alwaysOnChannels = on ? [...rest, channel] : rest;
+    const marks = this.state.topLevelSeenTs ??= {};
+    if (on) marks[channel] = timestampFromMs(this.now());
+    else delete marks[channel];
+    this.save();
+  }
+
+  topLevelWatermark(channel: string): string | undefined {
+    return this.state.topLevelSeenTs?.[channel];
+  }
+
+  setTopLevelWatermark(channel: string, ts: string): void {
+    (this.state.topLevelSeenTs ??= {})[channel] = ts;
     this.save();
   }
 
@@ -308,20 +320,14 @@ export class StateStore {
     if (replayAge(ts, this.now()).reason === "invalid_timestamp") return;
     if (t.lastSeenTs && compareTs(t.lastSeenTs, ts) >= 0) return;
     t.lastSeenTs = ts;
-    (t.recovery ??= this.newRecovery(t)).ownerActivityTs = ts;
+    t.recovery!.ownerActivityTs = ts;
     t.lastUsedAt = Number(timestampMicros(ts)! / 1000n);
     this.save();
   }
 
-  /** Compatibility entry point: persists recovery migration, never invents owner watermarks. */
-  seedMissingWatermarks(): number {
-    return this.migrateRecovery();
-  }
-
-  /** Owner-activity candidates; omit the window for bounded dormant discovery. */
-  threadsForCatchup(sinceMs = 0): Array<{ key: string; thread: ThreadState }> {
+  /** Owner-activity candidates, newest first. */
+  threadsForCatchup(): Array<{ key: string; thread: ThreadState }> {
     return Object.entries(this.state.threads)
-      .filter(([, t]) => !sinceMs || Number((timestampMicros(t.recovery?.ownerActivityTs) ?? 0n) / 1000n) >= sinceMs)
       .sort((a, b) => compareTs(b[1].recovery?.ownerActivityTs ?? "0.0", a[1].recovery?.ownerActivityTs ?? "0.0"))
       .map(([key, t]) => ({ key, thread: structuredClone(t) }));
   }
@@ -346,7 +352,6 @@ export class StateStore {
   }
 
   listProjects(): Array<{ dir: string; lastUsedAt: number }> {
-    this.normalizeProjects();
     return Object.entries(this.state.projects)
       .map(([dir, p]) => ({ dir, lastUsedAt: p.lastUsedAt }))
       .sort((a, b) => b.lastUsedAt - a.lastUsedAt);
@@ -359,6 +364,7 @@ export class StateStore {
     return null;
   }
 
+  /** Load-time only: canonicalizes old state; every writer canonicalizes its own dirs. */
   private normalizeProjects(): void {
     const projects: Record<string, ProjectInfo> = {};
     for (const [dir, info] of Object.entries(this.state.projects)) {
@@ -443,7 +449,7 @@ export class StateStore {
   private noteAcceptedPrompt(receipt: MessageReceipt): void {
     const t = this.state.threads[receipt.threadKey];
     if (!t || t.sessionId !== receipt.submission?.sessionId) return;
-    const r = t.recovery ??= this.newRecovery(t);
+    const r = t.recovery!;
     r.latestAcceptedTs = maxTs(r.latestAcceptedTs, receipt.ts);
   }
 
@@ -526,33 +532,18 @@ export class StateStore {
   recoveryStatus() {
     const receipts = Object.values(this.state.receipts ?? {});
     const threads = Object.entries(this.state.threads).flatMap(([key, t]) => t.recovery?.lastDecision ? [{ key, ...t.recovery.lastDecision,
-      reasons: { ...t.recovery.reasons }, recent: replayAge(t.recovery.ownerActivityTs, this.now()).decision === "recover" }] : []);
+      recent: replayAge(t.recovery.ownerActivityTs, this.now()).decision === "recover" }] : []);
     const counts = { recovered: 0, held: 0, expired: 0, canceled: 0 };
     for (const t of Object.values(this.state.threads)) for (const key of Object.keys(counts) as Array<keyof typeof counts>) counts[key] += t.recovery?.counts?.[key] ?? 0;
     return { paused: !!this.state.recoveryPaused, receipts: receipts.length,
       uncertain: receipts.filter((r) => r.disposition === "uncertain").length, ...counts, threads };
   }
 
-  /** tmp + fsync + rename: a crash mid-write can corrupt the tmp file, never the live state.json. */
+  /** Atomic write: a crash mid-write can corrupt the tmp file, never the live state.json. */
   save(): void {
-    this.normalizeProjects();
     this.prune();
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const tmp = `${this.path}.tmp`;
-    // fsync before rename: after power loss the rename must not expose a truncated file.
-    const fd = openSync(tmp, "w", 0o600);
-    try {
-      writeSync(fd, JSON.stringify(this.state, null, 2));
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(tmp, this.path);
-    try {
-      chmodSync(this.path, 0o600);
-    } catch {
-      /* best effort */
-    }
+    writeFileAtomic(this.path, JSON.stringify(this.state, null, 2), 0o600);
   }
 
   /**

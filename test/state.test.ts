@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { MAX_MESSAGE_RECEIPTS, StateStore, UNBOUND_RECEIPT_HORIZON_MS } from "../src/state.js";
 import { canonicalDir } from "../src/paths.js";
@@ -130,7 +130,7 @@ describe("StateStore save durability (RB3)", () => {
   it("save leaves no .tmp behind and reloads fine", () => {
     const { store: s, path } = tempStore("atomic");
     s.setThread("C:1", { sessionId: "ses_a", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 });
-    expect(existsSync(`${path}.tmp`)).toBe(false);
+    expect(readdirSync(dirname(path)).filter((f) => f.endsWith(".tmp"))).toEqual([]);
     const s2 = new StateStore(path);
     expect(s2.getThread("C:1")?.sessionId).toBe("ses_a");
   });
@@ -162,7 +162,7 @@ describe("canonical identity and durable recovery", () => {
     const s = new StateStore(path);
     expect(s.listProjects()).toEqual([{ dir: canonicalDir(real), lastUsedAt: 8 }]);
     expect(s.currentProjectDir).toBe(canonicalDir(real));
-    expect(s.getThread("C:100")).toMatchObject({ ...thread, projectDir: canonicalDir(real), recovery: { version: 1, ownerActivityTs: thread.lastSeenTs } });
+    expect(s.getThread("C:100")).toMatchObject({ ...thread, projectDir: canonicalDir(real), recovery: { ownerActivityTs: thread.lastSeenTs } });
     expect(s.getThread("C:100")?.historyCursorTs).toBeUndefined();
     expect(s.anyThreadInDir(alias)).toBe(true);
     s.save();
@@ -298,7 +298,7 @@ describe("catch-up watermark (markThreadSeen / threadsForCatchup)", () => {
     expect(s.getThread("C:9")).toBeNull();
   });
 
-  it("threadsForCatchup filters by window, newest first", () => {
+  it("threadsForCatchup lists threads newest first", () => {
     const { store: s } = tempStore("wm-sweep");
     const now = NOW;
     s.setThread("C:new", { sessionId: "a", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: now, lastSeenTs: timestampFromMs(now) });
@@ -306,8 +306,8 @@ describe("catch-up watermark (markThreadSeen / threadsForCatchup)", () => {
     const stale = storeStale("wm-sweep", "C:old", now - 13 * 60 * 60 * 1000);
     expect(stale).toBeDefined(); // sanity
     const s2 = new StateStore(join(FIXTURES, "wm-sweep", "state.json"), () => now);
-    const keys = s2.threadsForCatchup(now - 12 * 60 * 60 * 1000).map((r) => r.key);
-    expect(keys).toEqual(["C:new", "C:recent"]); // stale excluded, newest first
+    const keys = s2.threadsForCatchup().map((r) => r.key);
+    expect(keys).toEqual(["C:new", "C:recent", "C:old"]);
   });
 
   /** Exercise migration of a legacy binding without recovery metadata. */
@@ -336,13 +336,13 @@ describe("versioned recovery migration (legacy-thread migration)", () => {
       "C1:100.1": { sessionId: "s1", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW },
       "C2:200.2": { sessionId: "s2", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW, lastSeenTs: "1788220800.000002" },
     });
-    s.seedMissingWatermarks();
     expect(s.getThread("C1:100.1")?.lastSeenTs).toBeUndefined();
     expect(s.getThread("C1:100.1")?.recovery?.ownerActivityTs).toBeUndefined();
-    expect(s.getThread("C2:200.2")?.recovery).toMatchObject({ version: 1, ownerActivityTs: "1788220800.000002", replayFloorTs: replayFloor(NOW) });
+    expect(s.getThread("C2:200.2")?.recovery).toMatchObject({ ownerActivityTs: "1788220800.000002", replayFloorTs: replayFloor(NOW) });
     expect(s.getThread("C2:200.2")?.historyCursorTs).toBeUndefined();
+    s.save();
     const once = readFileSync(join(FIXTURES, "seed-basic", "state.json"), "utf8");
-    s.seedMissingWatermarks();
+    new StateStore(join(FIXTURES, "seed-basic", "state.json"), () => NOW).save();
     expect(readFileSync(join(FIXTURES, "seed-basic", "state.json"), "utf8")).toBe(once);
   });
 
@@ -351,7 +351,6 @@ describe("versioned recovery migration (legacy-thread migration)", () => {
       "C1:100.1": { sessionId: "s1", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW,
         lastSeenTs: "1790035000.098000", historyCursorTs: "1790034999.000000" },
     });
-    s.seedMissingWatermarks();
     s.markThreadSeen("C1:100.1", "1790035000.09");
     expect(s.getThread("C1:100.1")?.lastSeenTs).toBe("1790035000.098000");
     s.markThreadSeen("C1:100.1", "1790035001.000000");
@@ -372,7 +371,7 @@ describe("versioned recovery migration (legacy-thread migration)", () => {
         pendingRun: { userMsgTs: [] },
       },
     });
-    s.seedMissingWatermarks();
+    s.save();
     expect(s.getThread("C1:100.1")?.lastSeenTs).toBeUndefined();
     expect(s.getThread("C1:100.1")?.pendingRun).toBeDefined();
   });
@@ -428,5 +427,32 @@ describe("corrupt state.json", () => {
     expect(backups).toHaveLength(1);
     expect(readFileSync(join(dir, backups[0]!), "utf8")).toContain("ses_x");
     expect(JSON.parse(readFileSync(path, "utf8")).threads).toEqual({});
+  });
+});
+
+describe("state.json version", () => {
+  it("loads an unversioned file as version 1 and persists the version", () => {
+    const dir = join(FIXTURES, "version-legacy");
+    rmSync(dir, { recursive: true, force: true }); mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    writeFileSync(path, JSON.stringify({ threads: { "C:T": { sessionId: "ses_old", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: NOW } }, projects: {} }));
+    const store = new StateStore(path, () => NOW);
+    expect(store.getThread("C:T")?.sessionId).toBe("ses_old");
+    store.setCurrentProject("/p");
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(1);
+  });
+
+  it("quarantines a future version instead of overwriting it", () => {
+    const dir = join(FIXTURES, "version-future");
+    rmSync(dir, { recursive: true, force: true }); mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    const future = JSON.stringify({ version: 2, threads: { "C:T": { sessionId: "ses_new" } }, projects: {} });
+    writeFileSync(path, future);
+    const store = new StateStore(path, () => NOW);
+    expect(store.getThread("C:T")).toBeNull();
+    store.setCurrentProject("/p");
+    const backups = readdirSync(dir).filter(f => f.startsWith("state.json.corrupt-"));
+    expect(backups.map(f => readFileSync(join(dir, f), "utf8"))).toEqual([future]);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ version: 1, threads: {} });
   });
 });

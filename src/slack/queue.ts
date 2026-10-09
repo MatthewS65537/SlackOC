@@ -38,8 +38,7 @@
 
 import { logErr } from "../log.js";
 import { withDeadline } from "../http.js";
-import { withSlackOperation } from "./transport.js";
-export { SLACK_UPLOAD_TIMEOUT_MS, slackWebClientOptions } from "./transport.js";
+import { isRateLimited, retryAfterSeconds, withSlackOperation } from "./transport.js";
 
 export const SLACK_OP_TIMEOUT_MS = 30_000;
 /** Pacing between op starts within one channel lane. */
@@ -214,11 +213,8 @@ export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: Enqueu
             resolve(result);
             return;
           } catch (err) {
-            const e = err as { code?: string; statusCode?: number; retryAfter?: number; data?: { retry_after?: number }; message?: string };
-            const value = e?.retryAfter ?? e?.data?.retry_after;
-            const retryAfter = typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
-            const limited = e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 ||
-              retryAfter !== undefined || /^HTTP 429\b/i.test(e?.message ?? "");
+            const retryAfter = retryAfterSeconds(err);
+            const limited = isRateLimited(err) || retryAfter !== undefined || /^HTTP 429\b/i.test((err as Error)?.message ?? "");
             if (limited) {
               const waitMs = retryAfter !== undefined ? retryAfter * 1000 : 2000 * 2 ** Math.min(attempt, 2);
               cooldowns.set(method, Math.max(cooldowns.get(method) ?? 0, Date.now() + waitMs));

@@ -7,16 +7,22 @@ export interface ScheduleSpec {
   days: number[];
 }
 
+// Per-field checks, shared with the creation form (which reports each field separately).
+export const validTime = (time: unknown): boolean => typeof time === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time);
+export const validDays = (days: unknown): boolean => Array.isArray(days) && days.length > 0 && days.length <= 7 &&
+  new Set(days).size === days.length && [...days].every(day => Number.isInteger(day) && day >= 0 && day <= 6); // spread: holes are invalid
+export function ianaZone(timezone: string): boolean {
+  try { new Intl.DateTimeFormat("en-US", { timeZone: timezone }); return true; }
+  catch { return false; }
+}
+
 export function validateSchedule(schedule: ScheduleSpec): void {
-  if (!schedule || typeof schedule.time !== "string" || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(schedule.time) ||
+  if (!schedule || !validTime(schedule.time) ||
       typeof schedule.timezone !== "string" || !schedule.timezone || schedule.timezone.length > 128 ||
-      /^[+-]/.test(schedule.timezone) || !Array.isArray(schedule.days) || !schedule.days.length ||
-      schedule.days.length > 7 || new Set(schedule.days).size !== schedule.days.length ||
-      [...schedule.days].some(day => !Number.isInteger(day) || day < 0 || day > 6)) {
+      /^[+-]/.test(schedule.timezone) || !validDays(schedule.days)) {
     throw new Error("Invalid schedule; use HH:mm, an explicit IANA time zone, and distinct weekdays (0–6)");
   }
-  try { new Intl.DateTimeFormat("en-US", { timeZone: schedule.timezone }); }
-  catch { throw new Error("Invalid IANA schedule time zone"); }
+  if (!ianaZone(schedule.timezone)) throw new Error("Invalid IANA schedule time zone");
 }
 
 function expression(schedule: ScheduleSpec): string {

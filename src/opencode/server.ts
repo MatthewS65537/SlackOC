@@ -11,36 +11,25 @@ export interface PoolEntry extends PoolServerInfo {
   baseUrl: string | null;
   client: OCClient | null;
   ready: Promise<void>;
-  sseAbort: AbortController | null;
-  proc: import("node:child_process").ChildProcess | null;
-  lastEventAt: number;
-  killedIntentionally?: boolean;
-  lastUsedAt?: number;
   connectionState?: ConnectionState;
   /** Startup failed; the directory stays registered so its events still route. */
   failed?: boolean;
 }
 export interface PoolHooks {
-  isBusy?: (dir: string) => boolean;
   onConnectionState?: (dir: string, state: ConnectionState) => void;
+  /** Authoritative session→directory lookup (thread bindings) for events that arrive without a location. */
+  sessionDir?: (sessionID: string) => string | undefined;
 }
 export interface RequestLease { entry: PoolEntry; release: () => void }
-export const STALE_HEALTH_MS = 30_000;
 /** No transport activity (events or keepalives) this long ⇒ the stream is wedged; resubscribe. */
 export const EVENT_IDLE_TIMEOUT_MS = 45_000; // the service sends keepalives every 15s
 /** A stream must stay up this long before reconnect backoff resets (stops connect-drop flapping). */
 export const EVENT_HEALTHY_MS = 30_000;
-export function shouldNotifyDeath(wasReady: boolean, intentional: boolean): boolean { return wasReady && !intentional; }
-export function isActivityEvent(type: string): boolean { return type !== "server.heartbeat" && type !== "server.connected"; }
-export function shouldReap(e: { status: string; lastEventAt: number; lastUsedAt?: number }, now: number, ttl: number, busy: boolean): boolean {
-  return e.status === "ready" && !busy && now - Math.max(e.lastEventAt, e.lastUsedAt ?? 0) > ttl;
-}
 
 const reasonText = (reason: unknown): string => String((reason as Error)?.message ?? reason);
 
 export class ServerPool {
   private entries = new Map<string, PoolEntry>();
-  private leases = new Map<string, number>();
   private lifetime = new AbortController();
   private endpoint?: { url: string; headers?: Record<string, string> };
   private discovering?: Promise<void>;
@@ -50,11 +39,12 @@ export class ServerPool {
   private closed = false;
   private connected = false;
   private waiters = new Set<() => void>();
+  /** sessionID → dir, learned from located events; routes a later location-less event for the same session. */
+  private sessionDirs = new Map<string, string>();
 
   constructor(
     private onEvent: (dir: string, eventType: string, properties: Record<string, unknown>) => void,
     private log: (message: string) => void = () => {},
-    private onDeath?: (dir: string, code: number | null) => void,
     private onResume?: (dir: string, gapMs: number) => void,
     private onReady?: (dir: string, baseUrl: string) => void,
     private hooks: PoolHooks = {},
@@ -100,7 +90,7 @@ export class ServerPool {
     const existing = this.entries.get(key);
     if (existing && !existing.failed) return existing.ready.then(() => existing);
     const entry: PoolEntry = existing ?? { dir: key, url: null, baseUrl: null, status: "starting", client: null,
-      ready: Promise.resolve(), sseAbort: null, proc: null, lastEventAt: Date.now(), lastUsedAt: Date.now(), connectionState: "connecting" };
+      ready: Promise.resolve(), connectionState: "connecting" };
     entry.failed = false;
     this.entries.set(key, entry);
     entry.ready = (async () => {
@@ -134,14 +124,9 @@ export class ServerPool {
     return entry.ready.then(() => entry);
   }
 
+  /** Nothing tracks leases; release() is a no-op kept so callers retain their try/finally shape. */
   private lease(entry: PoolEntry): RequestLease {
-    this.leases.set(entry.dir, (this.leases.get(entry.dir) ?? 0) + 1);
-    let released = false;
-    return { entry, release: () => {
-      if (released) return; released = true;
-      this.leases.set(entry.dir, Math.max(0, (this.leases.get(entry.dir) ?? 1) - 1));
-      entry.lastUsedAt = Date.now();
-    } };
+    return { entry, release: () => {} };
   }
   async acquire(dir: string): Promise<RequestLease> { return this.lease(await this.ensure(dir)); }
   acquireExisting(dir: string): RequestLease | undefined {
@@ -153,12 +138,10 @@ export class ServerPool {
     return entry?.status === "ready" ? entry : null;
   }
   list(): PoolServerInfo[] { return [...this.entries.values()].map(({ dir, url, status }) => ({ dir, url, status })); }
-  // The shared service owns idle resource management. Keeping handles warm costs no process.
-  reapIdle(_ttl: number, _isBusy: (dir: string) => boolean, _now = Date.now()): number { return 0; }
   async killOne(dir: string): Promise<void> {
     const key = canonicalDir(dir); const entry = this.entries.get(key);
     if (!entry) return;
-    entry.status = "dead"; entry.killedIntentionally = true;
+    entry.status = "dead";
     this.entries.delete(key);
     this.hooks.onConnectionState?.(key, "disconnected");
   }
@@ -175,6 +158,27 @@ export class ServerPool {
   async reconnect(): Promise<void> {
     await this.discover();
     this.streamAbort?.abort(new Error("reconnect requested"));
+  }
+
+  /**
+   * Native session events carry a location. One that lacks it is routed by its
+   * session's known directory and dropped when that is unknown, never guessed.
+   * The only translated event without a session (server.connected) is global
+   * and has no per-directory consumer, so it is dropped too.
+   */
+  private route(directory: string | undefined, props: Record<string, unknown>): string | undefined {
+    const sid = (props.sessionID ?? (props.info as { sessionID?: unknown } | undefined)?.sessionID
+      ?? (props.part as { sessionID?: unknown } | undefined)?.sessionID) as string | undefined;
+    if (directory) {
+      const dir = canonicalDir(directory);
+      if (!this.entries.has(dir)) return;
+      if (typeof sid === "string") this.sessionDirs.set(sid, dir);
+      return dir;
+    }
+    if (typeof sid !== "string") return;
+    const known = this.sessionDirs.get(sid) ?? this.hooks.sessionDir?.(sid);
+    const dir = known ? canonicalDir(known) : undefined;
+    return dir && this.entries.has(dir) ? dir : undefined;
   }
 
   private async pipeEvents(): Promise<void> {
@@ -209,12 +213,8 @@ export class ServerPool {
             for (const entry of this.entries.values()) this.onResume?.(entry.dir, Date.now() - downSince);
           }
           const props = (event.properties ?? {}) as Record<string, unknown>;
-          // Native events carry location; a session-bound event lacking one is resolved by start.ts.
-          const dir = event.directory ? canonicalDir(event.directory) : this.entries.keys().next().value;
-          if (!dir || (event.directory && !this.entries.has(dir))) continue;
-          const entry = this.entries.get(dir);
-          if (entry && isActivityEvent(event.type)) entry.lastEventAt = Date.now();
-          this.onEvent(dir, event.type, props);
+          const dir = this.route(event.directory, props);
+          if (dir) this.onEvent(dir, event.type, props);
         }
         if (!this.closed) this.log(`OpenCode event connection ended${streamAbort.signal.aborted ? `: ${reasonText(streamAbort.signal.reason)}` : ""}`);
       } catch (err) {

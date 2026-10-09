@@ -1,9 +1,10 @@
 /** Bounded, fair recovery from retained Slack threads; live observations never confirm history. */
 import type { StateStore } from "../state.js";
 import { logErr } from "../log.js";
-import type { IncomingOutcome, SlackMsg } from "./router.js";
-import { classifyRecovery, compareTs, isRecentRecoveryEligibleThread, microsTimestamp, replayAge, replayFloor, timestampFromMs, timestampMicros, type IncomingContext } from "./recovery-policy.js";
+import { cleanMentionText, type IncomingOutcome, type SlackMsg } from "./router.js";
+import { classifyRecovery, compareTs, isRecentRecoveryEligibleThread, nextTs, replayAge, replayFloor, timestampFromMs, timestampMicros, type IncomingContext } from "./recovery-policy.js";
 import { parseBackslash } from "../commands/parse.js";
+import { resolveCommandName } from "../commands/registry.js";
 import { slackToPlain } from "../util.js";
 
 export interface RepliesPage {
@@ -21,16 +22,16 @@ export interface CatchupDeps {
   /**
    * The callback owns Slack pagination, honoring maxPages (including empty pages).
    * On a page failure, throw or return only the contiguous successful prefix.
-   * Arrays remain supported for a SINGLE page. Never silently fetch unbounded pages.
+   * Never silently fetch unbounded pages.
    */
-  fetchReplies(channel: string, rootTs: string, oldest: string, budget: { maxPages: number; latest: string; inclusive: boolean; cursor?: string }): Promise<RepliesPage | SlackMsg[]>;
+  fetchReplies(channel: string, rootTs: string, oldest: string, budget: { maxPages: number; latest: string; inclusive: boolean; cursor?: string }): Promise<RepliesPage>;
   /** Return the real router outcome, or persist its receipt before resolving. */
   dispatch(msg: SlackMsg, context: IncomingContext): Promise<IncomingOutcome | void>;
 }
 
-export const MAX_THREADS_PER_SWEEP = 10;
-export const MAX_PAGES_PER_SWEEP = 20;
-export const MAX_PAGES_PER_THREAD = 2;
+const MAX_THREADS_PER_SWEEP = 10;
+const MAX_PAGES_PER_SWEEP = 20;
+const MAX_PAGES_PER_THREAD = 2;
 export const MAX_SNAPSHOT_CANDIDATES = 200;
 
 interface Scheduler {
@@ -42,12 +43,7 @@ interface Scheduler {
 }
 const schedulers = new WeakMap<StateStore, Scheduler>();
 
-/** Boot/timer/reconnect can all call request; concurrent triggers share one coalesced flight. */
-export function createCatchupCoordinator(deps: CatchupDeps): { request: () => Promise<number> } {
-  return { request: () => sweepMissedMessages(deps) };
-}
-
-/** Single-flight even when callers do not explicitly use the coordinator. */
+/** Boot/timer/reconnect can all call this; concurrent triggers share one coalesced flight. */
 export function sweepMissedMessages(deps: CatchupDeps): Promise<number> {
   let scheduler = schedulers.get(deps.state);
   if (!scheduler) {
@@ -120,10 +116,10 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
     if (!scan.complete) {
     try {
       const page = await fetchReplies(channel, rootTs, scan.afterTs, { maxPages, latest: scan.upperTs, inclusive: true, cursor: scan.cursor });
-      const used = Array.isArray(page) ? 1 : page.pagesUsed;
+      const used = page.pagesUsed;
       if (!Number.isInteger(used) || used < 1 || used > maxPages) throw new Error("fetchReplies exceeded/omitted its page budget");
       pagesLeft -= used;
-      const replies = (Array.isArray(page) ? page : page.messages).filter((m) => timestampMicros(m.ts) !== undefined && compareTs(m.ts, scan!.upperTs) <= 0);
+      const replies = page.messages.filter((m) => timestampMicros(m.ts) !== undefined && compareTs(m.ts, scan!.upperTs) <= 0);
       const owner = replies.filter((m) => !m.bot_id && (!m.subtype || m.subtype === "file_share") && m.user === ownerSlackUserId);
       for (const m of owner) {
         if (compareTs(m.ts, scan.afterTs) < 0 || scan.candidates.some((row) => row.ts === m.ts)) continue;
@@ -132,18 +128,18 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
       scan.candidates.sort((a, b) => compareTs(a.ts, b.ts));
       if (scan.candidates.length > MAX_SNAPSHOT_CANDIDATES || state.threadsForCatchup().reduce((n, row) => n + (row.thread.recovery?.scan?.candidates.length ?? 0), 0) + owner.length > 2000) {
         state.recordRecoveryDecision(key, scan.upperTs, { decision: "held", reason: "backlog_overflow" });
-        state.retireHistory(key, microsTimestamp(timestampMicros(scan.upperTs)! + 1n));
+        state.retireHistory(key, nextTs(scan.upperTs));
         state.setRecoveryScan(key, undefined);
         continue;
       }
-      scan.complete = Array.isArray(page) || !page.hasMore;
-      scan.cursor = Array.isArray(page) ? undefined : page.nextCursor;
+      scan.complete = !page.hasMore;
+      scan.cursor = page.nextCursor;
       if (!scan.complete) {
         // Resume a contiguous ascending prefix by timestamp; empty pages alone
         // need the opaque Slack cursor. This keeps every later read age-clamped.
         const last = replies.map((m) => m.ts).sort(compareTs).at(-1);
         if (last && compareTs(last, scan.afterTs) >= 0) {
-          scan.afterTs = microsTimestamp(timestampMicros(last)! + 1n);
+          scan.afterTs = nextTs(last);
           scan.cursor = undefined;
         } else if (!scan.cursor) {
           state.recordRecoveryDecision(key, scan.upperTs, { decision: "held", reason: "pagination_incomplete" });
@@ -173,8 +169,8 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
       state.markThreadSeen(key, m.ts);
       if (state.isMessageAccepted(key, m.ts)) continue;
       const command = historyCommand(m);
-      if (command && !["help", "status", "permissions", "stop", "abort"].includes(command) && !state.isMessageAccepted(key, m.ts)) state.holdHistoricalContext(key);
-      if (["stop", "abort", "hush", "new", "cd", "project", "projects", "resume", "watch", "unwatch"].includes(command ?? "")) {
+      if (command && !["help", "status", "permissions", "stop"].includes(command) && !state.isMessageAccepted(key, m.ts)) state.holdHistoricalContext(key);
+      if (["stop", "hush", "new", "cd", "project", "resume", "watch", "unwatch"].includes(command ?? "")) {
         const current = state.getThread(key)?.recovery?.canceledThroughTs;
         const priorIntent = state.getThread(key)!.recovery!.intentVersion;
         if (!current || compareTs(m.ts, current) > 0) state.cancelRecovery(key, m.ts);
@@ -220,12 +216,12 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
       }
       retired ||= decision.decision !== "recover" && decision.decision !== "already_handled";
       if (!retired) state.confirmHistory(key, m.ts);
-      state.retireHistory(key, microsTimestamp(timestampMicros(m.ts)! + 1n));
+      state.retireHistory(key, nextTs(m.ts));
       scan.candidates.shift();
       state.setRecoveryScan(key, scan);
     }
     if (!scan.candidates.length) {
-      state.retireHistory(key, microsTimestamp(timestampMicros(scan.upperTs)! + 1n));
+      state.retireHistory(key, nextTs(scan.upperTs));
       state.setRecoveryScan(key, undefined);
     }
   }
@@ -233,6 +229,73 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
   return replayed;
 }
 
+export interface TopLevelCatchupDeps {
+  state: StateStore;
+  ownerSlackUserId: string;
+  /** \listen channels plus the owner DM — where an owner top-level message is itself a prompt. */
+  channels: string[];
+  /** conversations.history after `oldest`, ascending, up to a bounded page budget. */
+  fetchHistory(channel: string, oldest: string): Promise<{ messages: SlackMsg[]; hasMore: boolean }>;
+  dispatch(msg: SlackMsg, context: IncomingContext): Promise<IncomingOutcome | void>;
+}
+
+/**
+ * Thread sweeps only see replies inside bound threads, so a top-level message
+ * Socket Mode dropped in a \listen channel or the owner DM needs its own pass.
+ * Per-channel watermark: a missing one is seeded at now (nothing older replays);
+ * live-handled messages already hold receipts and are skipped; "processing"/"retry"
+ * stop the channel so the next sweep retries from there.
+ */
+export async function sweepTopLevelMessages(deps: TopLevelCatchupDeps): Promise<number> {
+  const { state, ownerSlackUserId, dispatch } = deps;
+  let replayed = 0;
+  for (const channel of deps.channels) {
+    const mark = state.topLevelWatermark(channel);
+    if (!mark) { state.setTopLevelWatermark(channel, timestampFromMs(state.now())); continue; }
+    const floor = replayFloor(state.now());
+    let page: Awaited<ReturnType<TopLevelCatchupDeps["fetchHistory"]>>;
+    try {
+      page = await deps.fetchHistory(channel, compareTs(mark, floor) > 0 ? mark : floor);
+    } catch (err) {
+      logErr(`catch-up: history fetch failed for ${channel} (${String(err)}) — retrying next sweep`);
+      continue;
+    }
+    const newer = page.messages.filter((m) => timestampMicros(m.ts) !== undefined && compareTs(m.ts, mark) > 0);
+    const newest = newer.map((m) => m.ts).sort(compareTs).at(-1);
+    if (!newest) continue;
+    if (page.hasMore) {
+      // Pages arrive newest-first, so an over-budget gap has no contiguous oldest
+      // edge. A backlog that large is not something to replay blind.
+      logErr(`catch-up: ${channel} top-level backlog exceeds the page budget — held, watermark moved to ${newest}`);
+      state.setTopLevelWatermark(channel, newest);
+      continue;
+    }
+    let advanced = mark;
+    for (const m of newer) {
+      const isOwnerPrompt = !m.bot_id && (!m.subtype || m.subtype === "file_share") && m.user === ownerSlackUserId
+        && (!m.thread_ts || m.thread_ts === m.ts);
+      const receipt = isOwnerPrompt ? state.getReceipt(state.threadKey(channel, m.ts), m.ts) : undefined;
+      if (receipt?.disposition === "processing") break; // live delivery is mid-flight
+      if (isOwnerPrompt && !receipt) {
+        try {
+          const outcome = await dispatch({ ...m, channel }, { source: "history", topLevel: true });
+          if (outcome === "retry" || outcome === "processing" || outcome === "paused") break;
+          if (outcome === "accepted" && !historyCommand(m)) replayed += 1;
+        } catch (err) {
+          logErr(`catch-up replay failed (${channel} ${m.ts}): ${String(err)} — disposition retained`);
+          break;
+        }
+      }
+      advanced = m.ts;
+    }
+    if (advanced !== mark) state.setTopLevelWatermark(channel, advanced);
+  }
+  if (replayed) logErr(`catch-up: replayed ${replayed} missed top-level message(s)`);
+  return replayed;
+}
+
+/** Canonical (alias-resolved) command name of a history message, if it is one. */
 function historyCommand(m: SlackMsg): string | undefined {
-  return parseBackslash(slackToPlain(m.text ?? "").replace(/<@[A-Z0-9]+>/g, "").trim())?.name;
+  const name = parseBackslash(cleanMentionText(slackToPlain(m.text ?? "")))?.name;
+  return name && resolveCommandName(name);
 }

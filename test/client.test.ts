@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { makeClient, detectDefaultModel, pendingPermissions, pendingQuestions, questionReply, questionReject,
+import { makeClient, configGet, pendingPermissions, pendingQuestions, questionReply, questionReject,
   sessionIdle, sessionMessages, sessionStatus, promptAsync, permRespond } from "../src/opencode/client.js";
 import { formAnswer, visibleQuestions, normalizeForm, V2Events } from "../src/opencode/v2.js";
 import type { FormInfo, V2Event } from "@opencode/client";
@@ -19,7 +19,7 @@ describe("V2 HTTP contracts", () => {
       expect(new URL(request.url).pathname).toBe("/api/model/default");
       return Response.json({ location: { directory: "/project" }, data: { id: "model", providerID: "provider" } });
     });
-    expect(await detectDefaultModel(makeClient("http://fixture", { directory: "/project" }), "/project")).toBe("provider/model");
+    expect((await configGet(makeClient("http://fixture", { directory: "/project" }))).model).toBe("provider/model");
     expect(calls).toHaveBeenCalledOnce();
   });
   it("submits durable input with the correlation ID, queue policy, and V2 file URI", async () => {
@@ -79,12 +79,12 @@ describe("V2 HTTP contracts", () => {
   });
   it.each([null, {}, { data: [{ id: "broken" }] }])("refuses malformed pending interaction responses %j", async body => {
     wire(() => Response.json(body));
-    await expect(pendingQuestions("http://fixture")).rejects.toThrow("invalid pending questions");
-    await expect(pendingPermissions("http://fixture")).rejects.toThrow("invalid pending permissions");
+    await expect(pendingQuestions(makeClient("http://fixture"))).rejects.toThrow("invalid pending questions");
+    await expect(pendingPermissions(makeClient("http://fixture"))).rejects.toThrow("invalid pending permissions");
   });
   it("propagates an unavailable service rather than reporting no pending interactions", async () => {
     wire(() => new Response(null, { status: 503 }));
-    await expect(pendingPermissions("http://fixture")).rejects.toThrow("503");
+    await expect(pendingPermissions(makeClient("http://fixture"))).rejects.toThrow("503");
   });
 });
 
@@ -123,6 +123,17 @@ describe("native V2 event translation", () => {
     expect(e("session.idle", { sessionID: "s" })).toEqual([]);
     e("session.execution.started", { sessionID: "s" });
     expect(e("session.execution.succeeded", { sessionID: "s" })).toHaveLength(1);
+  });
+  it("surfaces compaction and provider retries instead of silent pauses", () => {
+    const events = new V2Events();
+    const e = (type: string, data: object) => events.translate({ type, data } as V2Event)[0];
+    expect(e("session.compaction.started", { sessionID: "s", reason: "auto", recent: 4 }))
+      .toEqual({ type: "session.compaction", properties: { sessionID: "s", phase: "started" } });
+    expect(e("session.compaction.ended", { sessionID: "s", text: "summary" })?.properties).toMatchObject({ phase: "ended" });
+    expect(e("session.compaction.failed", { sessionID: "s", error: { type: "x", message: "too big" } })?.properties)
+      .toMatchObject({ phase: "failed", error: "too big" });
+    expect(e("session.retry.scheduled", { sessionID: "s", assistantMessageID: "m", attempt: 2, at: 9_000, error: { type: "x", message: "overloaded" } }))
+      .toEqual({ type: "session.status", properties: { sessionID: "s", status: { type: "retry", attempt: 2, message: "overloaded", next: 9_000 } } });
   });
   it("routes forms and complete text with stable transcript part identities", () => {
     const events = new V2Events();

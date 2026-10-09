@@ -31,12 +31,8 @@ export interface SocketSupervisorOptions {
   checkEveryMs?: number;
   /** Down this long in total ⇒ onFatal. Infinity disables. */
   fatalAfterMs?: number;
-  /** Timer drift beyond this ⇒ the machine slept. */
-  wakeDriftMs?: number;
   /** Bound on one start() attempt (WSS URL fetch + websocket open + hello). */
   startTimeoutMs?: number;
-  /** Bound on disconnect() before a fresh start. */
-  disconnectTimeoutMs?: number;
   random?: () => number;
 }
 
@@ -51,6 +47,10 @@ export type SocketHealth = {
 
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
+/** Timer drift beyond this ⇒ the machine slept. */
+const WAKE_DRIFT_MS = 30_000;
+/** Bound on disconnect() before a fresh start. */
+const DISCONNECT_TIMEOUT_MS = 5_000;
 
 export class SocketSupervisor {
   private connected = false;
@@ -69,18 +69,14 @@ export class SocketSupervisor {
   private readonly now: () => number;
   private readonly checkEveryMs: number;
   private readonly fatalAfterMs: number;
-  private readonly wakeDriftMs: number;
   private readonly startTimeoutMs: number;
-  private readonly disconnectTimeoutMs: number;
   private readonly random: () => number;
 
   constructor(private readonly client: SocketLike, private readonly opts: SocketSupervisorOptions) {
     this.now = opts.now ?? Date.now;
     this.checkEveryMs = opts.checkEveryMs ?? 15_000;
     this.fatalAfterMs = opts.fatalAfterMs ?? Infinity;
-    this.wakeDriftMs = opts.wakeDriftMs ?? 30_000;
     this.startTimeoutMs = opts.startTimeoutMs ?? 90_000;
-    this.disconnectTimeoutMs = opts.disconnectTimeoutMs ?? 5_000;
     this.random = opts.random ?? Math.random;
     this.downSince = this.lastTick = this.now();
   }
@@ -127,7 +123,7 @@ export class SocketSupervisor {
     const now = this.now();
     const drift = now - this.lastTick - this.checkEveryMs;
     this.lastTick = now;
-    if (drift > this.wakeDriftMs) {
+    if (drift > WAKE_DRIFT_MS) {
       // A socket that survived sleep is fine; a dead one trips the library's
       // 30s server-ping timeout, closes, and lands in markDown.
       this.opts.log(`slack socket: wake detected (timers ${Math.round(drift / 1000)}s late)`);
@@ -161,7 +157,7 @@ export class SocketSupervisor {
     let timeout: NodeJS.Timeout | undefined;
     try {
       // Flush any half-open socket first; the library resolves once it emits `disconnected`.
-      await this.bounded(this.client.disconnect().catch(() => {}), this.disconnectTimeoutMs);
+      await this.bounded(this.client.disconnect().catch(() => {}), DISCONNECT_TIMEOUT_MS);
       if (this.stopped) return;
       const started = this.client.start();
       started.catch(() => {}); // a late rejection after the timeout won must not go unhandled

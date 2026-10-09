@@ -2,9 +2,13 @@ import type { MessageReceipt, ThreadState } from "../state.js";
 import { canonicalDir } from "../paths.js";
 
 export const MAX_REPLAY_AGE_MS = 72 * 60 * 60 * 1000;
-export const FUTURE_TOLERANCE_MS = 60_000;
+const FUTURE_TOLERANCE_MS = 60_000;
 export type RecoveryDecision = { decision: "recover" | "already_handled" | "expired" | "canceled" | "held"; reason: string };
-export interface IncomingContext { source: "live" | "history"; generation?: number; intentVersion?: number }
+export interface IncomingContext { source: "live" | "history"; generation?: number; intentVersion?: number;
+  /** Project for a brand-new thread session (the shortcut's choice); defaults to the current project. */
+  projectDir?: string;
+  /** History sweep of a \listen channel / owner DM: an unbound top-level message after the channel watermark. */
+  topLevel?: boolean }
 
 /** Slack timestamps are decimal seconds, with at most six microsecond digits. */
 export function timestampMicros(ts: string | undefined): bigint | undefined {
@@ -14,6 +18,12 @@ export function timestampMicros(ts: string | undefined): bigint | undefined {
 }
 export function microsTimestamp(us: bigint): string {
   return `${us / 1_000_000n}.${String(us % 1_000_000n).padStart(6, "0")}`;
+}
+/** Adjacent timestamps (one microsecond apart) for exclusive history bounds; `ts` must be valid. */
+export function nextTs(ts: string): string { return microsTimestamp(timestampMicros(ts)! + 1n); }
+export function prevTs(ts: string): string {
+  const us = timestampMicros(ts)!;
+  return microsTimestamp(us > 0n ? us - 1n : 0n);
 }
 export function timestampFromMs(ms: number): string { return microsTimestamp(BigInt(Math.floor(ms)) * 1000n); }
 export function compareTs(a: string, b: string): number {
@@ -63,6 +73,7 @@ export function classifyRecovery(input: {
   if (t?.hushed || t?.watchOnly) return { decision: "canceled", reason: t.watchOnly ? "watch_only" : "hushed" };
   if (ctx.intentVersion !== undefined && ctx.intentVersion !== recovery?.intentVersion) return { decision: "held", reason: "live_intent_changed" };
   if (!input.command && recovery?.needsFreshIntent) return { decision: "held", reason: "historical_command_context" };
+  if (!t && ctx.topLevel) return { decision: "recover", reason: "missed_top_level" };
   if (!t?.historyCursorTs && !recovery?.trustedAfterTs) return { decision: "held", reason: "legacy_without_boundary" };
   return { decision: "recover", reason: "missed_after_boundary" };
 }

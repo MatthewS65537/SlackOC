@@ -2,7 +2,7 @@ import type { OcPermission } from "../opencode/api.js";
 import { permissionResultText, validPermissionId, type PermButtonValue } from "./blocks.js";
 import { permissionKey, type PermissionChoice, type PermissionDeliveryStore, type PermissionIdentity, type PermissionRecord } from "./permissions-store.js";
 
-export { PermissionDeliveryStore, permissionKey, permissionDeliveryMarker, PERMISSION_STORE_PATH } from "./permissions-store.js";
+export { PermissionDeliveryStore, permissionDeliveryMarker, PERMISSION_STORE_PATH } from "./permissions-store.js";
 export type { PermissionChoice, PermissionDelivery, PermissionIdentity, PermissionRecord } from "./permissions-store.js";
 
 function isChoice(choice: unknown): choice is PermissionChoice {
@@ -14,9 +14,8 @@ export function parsePermissionButton(actionId: string, raw: unknown): PermButto
   try {
     const v = JSON.parse(raw) as PermButtonValue;
     if (!v || !validPermissionId(v.s) || !validPermissionId(v.p) || !isChoice(v.r) ||
-        (v.g !== undefined && (!Number.isSafeInteger(v.g) || v.g < 0)) ||
-        (actionId !== "perm" && actionId !== `perm_${v.r}`)) return;
-    return { s: v.s, p: v.p, r: v.r, ...(v.g === undefined ? {} : { g: v.g }) };
+        !Number.isSafeInteger(v.g) || v.g < 0 || actionId !== `perm_${v.r}`) return;
+    return { s: v.s, p: v.p, r: v.r, g: v.g };
   } catch { return; }
 }
 
@@ -59,8 +58,6 @@ export interface PermissionResponderDeps<Server extends object> {
   resolved(record: PermissionRecord, text: string): Promise<void> | void;
   /** Optional extra synchronous lifecycle gate; checked again after every await. */
   eligible?(record: PermissionRecord): boolean;
-  /** Default: all reply errors are uncertain. Only explicit no-effect failures qualify. */
-  definitelyRejected?(error: unknown): boolean;
 }
 export interface PermissionResponseResult {
   status: "resolved" | "busy" | "forbidden" | "invalid" | "missing" | "ambiguous" | "stale" | "unavailable" | "uncertain" | "retry";
@@ -110,7 +107,7 @@ export class PermissionResponder<Server extends object> {
     if (!validPermissionId(input.requestId) || !isChoice(input.response) ||
         (input.sessionId !== undefined && !validPermissionId(input.sessionId)) ||
         (input.generation !== undefined && (!Number.isSafeInteger(input.generation) || input.generation < 0)) ||
-        (input.actionId !== undefined && input.actionId !== "perm" && input.actionId !== `perm_${input.response}`) ||
+        (input.actionId !== undefined && input.actionId !== `perm_${input.response}`) ||
         !input.context || (!("threadKey" in input.context && typeof input.context.threadKey === "string") && !("dm" in input.context && input.context.dm === true))) {
       return { status: "invalid", text: "Invalid permission response. Use \\permission <request-id> once|deny|always." };
     }
@@ -156,13 +153,11 @@ export class PermissionResponder<Server extends object> {
       this.deps.store.put(record);
       try { await this.deps.respond(server, permission, input.response); }
       catch (err) {
+        // Every reply error is uncertain: the reply may have landed before the failure.
         record = this.deps.store.get(record)!;
-        const rejected = this.deps.definitelyRejected?.(err) === true;
-        record.response = { ...record.response, status: rejected ? "pending" : "uncertain", error: String(err).slice(0, 1000) };
+        record.response = { ...record.response, status: "uncertain", error: String(err).slice(0, 1000) };
         this.deps.store.put(record);
-        return { status: rejected ? "retry" : "uncertain", text: rejected
-          ? "OpenCode rejected the reply. The permission remains pending; you may retry."
-          : "Reply not confirmed. Check the permission again to reconcile before retrying.", record };
+        return { status: "uncertain", text: "Reply not confirmed. Check the permission again to reconcile before retrying.", record };
       }
       // The accepted response belongs to this exact old request even if binding changed meanwhile.
       return await this.finish(record, permissionResultText(input.response, input.actor), true);

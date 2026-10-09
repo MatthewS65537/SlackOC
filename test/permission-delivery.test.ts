@@ -320,8 +320,8 @@ describe("permission delivery", () => {
     vi.spyOn(h.store, "update").mockImplementation(() => { throw new Error("disk full"); });
     await expect(h.manager.deliver(record())).rejects.toThrow("state/callback failure");
     expect(h.post).not.toHaveBeenCalled();
-    expect(h.manager.error).toContain("state/callback failure");
-    expect(h.manager.error).toContain("disk full");
+    expect(recentLogs().join("\n")).toContain("state/callback failure");
+    expect(recentLogs().join("\n")).toContain("disk full");
     expect(h.latest().thread.status).toBe("new");
   });
 
@@ -350,6 +350,6 @@ describe("permission delivery", () => {
     await h.manager.deliver(record(), { force: true });
     expect(h.post).toHaveBeenCalledTimes(2);
     expect(recentLogs().join("\n")).toContain("diagnostics failed");
-    expect(h.manager.error).toContain("collapse failed");
+    expect(recentLogs().join("\n")).toContain("collapse failed");
   });
 });

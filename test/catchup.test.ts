@@ -1,9 +1,9 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { createCatchupCoordinator, MAX_SNAPSHOT_CANDIDATES, sweepMissedMessages, type CatchupDeps } from "../src/slack/catchup.js";
+import { MAX_SNAPSHOT_CANDIDATES, sweepMissedMessages, sweepTopLevelMessages, type CatchupDeps, type RepliesPage, type TopLevelCatchupDeps } from "../src/slack/catchup.js";
 import { StateStore, type ThreadState } from "../src/state.js";
-import { MAX_REPLAY_AGE_MS, replayFloor, timestampFromMs } from "../src/slack/recovery-policy.js";
+import { MAX_REPLAY_AGE_MS, classifyRecovery, replayFloor, timestampFromMs } from "../src/slack/recovery-policy.js";
 import type { SlackMsg } from "../src/slack/router.js";
 
 const FIXTURES = join(import.meta.dirname, ".fixtures", "catchup");
@@ -16,7 +16,7 @@ function fixture(name: string) {
   state.setThread(key, { sessionId: name, projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW,
     lastSeenTs: ts(1), historyCursorTs: ts(1) });
   const dispatched: SlackMsg[] = [];
-  const deps: CatchupDeps = { state, ownerSlackUserId: "U1", fetchReplies: async () => [], dispatch: async (m) => {
+  const deps: CatchupDeps = { state, ownerSlackUserId: "U1", fetchReplies: async () => page([]), dispatch: async (m) => {
     dispatched.push(m);
     state.claimMessage(key, m.ts, { source: "history" });
     state.settleMessage(key, m.ts, "accepted");
@@ -25,12 +25,14 @@ function fixture(name: string) {
   return { state, deps, dispatched };
 }
 const msg = (seconds: number, text = "work"): SlackMsg => ({ channel: "C", thread_ts: ts(0), ts: ts(seconds), user: "U1", text });
+/** One complete page of replies. */
+const page = (messages: SlackMsg[]): RepliesPage => ({ messages, hasMore: false, pagesUsed: 1 });
 
 describe("bounded classified history", () => {
   it("filters parent, bots, subtypes and other users, stamping channel-less owner rows", async () => {
     const { state, deps, dispatched } = fixture("filter");
-    deps.fetchReplies = async () => [msg(0), msg(2), { ...msg(3), user: "other" }, { ...msg(4), bot_id: "B" },
-      { ...msg(5), subtype: "message_changed" }].map(({ channel, ...row }) => row as SlackMsg);
+    deps.fetchReplies = async () => page([msg(0), msg(2), { ...msg(3), user: "other" }, { ...msg(4), bot_id: "B" },
+      { ...msg(5), subtype: "message_changed" }].map(({ channel, ...row }) => row as SlackMsg));
     expect(await sweepMissedMessages(deps)).toBe(1);
     expect(dispatched).toEqual([msg(2)]);
     expect(state.getThread(key)?.recovery?.ownerActivityTs).toBe(ts(2));
@@ -58,7 +60,7 @@ describe("bounded classified history", () => {
 
   it("holds an overflow instead of truncating it into executable work", async () => {
     const { state, deps, dispatched } = fixture("overflow");
-    deps.fetchReplies = async () => Array.from({ length: MAX_SNAPSHOT_CANDIDATES + 1 }, (_, i) => ({ ...msg(2), ts: `${ts(2).split(".")[0]}.${String(i).padStart(6, "0")}` }));
+    deps.fetchReplies = async () => page(Array.from({ length: MAX_SNAPSHOT_CANDIDATES + 1 }, (_, i) => ({ ...msg(2), ts: `${ts(2).split(".")[0]}.${String(i).padStart(6, "0")}` })));
     expect(await sweepMissedMessages(deps)).toBe(0);
     expect(dispatched).toEqual([]);
     expect(state.recoveryStatus().threads[0]?.reason).toBe("backlog_overflow");
@@ -67,7 +69,7 @@ describe("bounded classified history", () => {
 
   it("waits for the previous classified task to finish, then sends the next in order", async () => {
     const { state, deps, dispatched } = fixture("sequential");
-    deps.fetchReplies = async () => [msg(2), msg(3)];
+    deps.fetchReplies = async () => page([msg(2), msg(3)]);
     const dispatch = deps.dispatch;
     deps.dispatch = async (m, context) => {
       const result = await dispatch(m, context);
@@ -87,7 +89,7 @@ describe("bounded classified history", () => {
     const { state, deps, dispatched } = fixture("invalidated");
     deps.fetchReplies = vi.fn<CatchupDeps["fetchReplies"]>()
       .mockResolvedValueOnce({ messages: [msg(2)], hasMore: true, pagesUsed: 2, nextCursor: "next" })
-      .mockResolvedValue([]);
+      .mockResolvedValue(page([]));
     await sweepMissedMessages(deps);
     state.noteLiveIntent(key);
     await sweepMissedMessages(deps);
@@ -97,7 +99,7 @@ describe("bounded classified history", () => {
 
   it("a missed project/hush command holds later prompts until fresh live intent", async () => {
     const { state, deps, dispatched } = fixture("context-barrier");
-    deps.fetchReplies = async () => [msg(2, "\\cd /elsewhere"), msg(3, "run here")];
+    deps.fetchReplies = async () => page([msg(2, "\\cd /elsewhere"), msg(3, "run here")]);
     expect(await sweepMissedMessages(deps)).toBe(0);
     expect(dispatched).toEqual([]);
     expect(state.getThread(key)?.recovery?.needsFreshIntent).toBe(true);
@@ -108,7 +110,7 @@ describe("bounded classified history", () => {
 
   it("never blindly replays mutating commands or historical permission answers", async () => {
     const { deps, dispatched } = fixture("commands");
-    deps.fetchReplies = async () => [msg(2, "\\permission per_old always"), msg(3, "\\cmd deploy"), msg(4, "\\help")];
+    deps.fetchReplies = async () => page([msg(2, "\\permission per_old always"), msg(3, "\\cmd deploy"), msg(4, "\\help")]);
     expect(await sweepMissedMessages(deps)).toBe(0); // diagnostic replies aren't ghost replays
     expect(dispatched.map((m) => m.text)).toEqual(["\\help"]);
   });
@@ -117,7 +119,7 @@ describe("bounded classified history", () => {
     const { state, deps, dispatched } = fixture("uncertain");
     state.claimMessage(key, ts(2));
     state.settleMessage(key, ts(2), "uncertain");
-    deps.fetchReplies = async () => [msg(2), msg(3, "\\help")];
+    deps.fetchReplies = async () => page([msg(2), msg(3, "\\help")]);
     await sweepMissedMessages(deps);
     expect(dispatched.map((m) => m.ts)).toEqual([ts(3)]);
     expect(state.getReceipt(key, ts(2))?.disposition).toBe("uncertain");
@@ -127,7 +129,7 @@ describe("bounded classified history", () => {
 
   it("retries a definite pre-submission failure and never consumes a void observer", async () => {
     const { state, deps } = fixture("retry");
-    deps.fetchReplies = async () => [msg(2)];
+    deps.fetchReplies = async () => page([msg(2)]);
     deps.dispatch = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(undefined).mockImplementationOnce(async (m: SlackMsg) => {
       state.claimMessage(key, m.ts); state.settleMessage(key, m.ts, "accepted"); return "accepted";
     });
@@ -147,7 +149,7 @@ describe("recent eligibility and fair read-only discovery", () => {
     writeFileSync(path, JSON.stringify({ threads: { [key]: { ...state.getThread(key), recovery: undefined,
       historyCursorTs: old, lastSeenTs: old, lastUsedAt: NOW } }, projects: {} }));
     deps.state = new StateStore(path, () => NOW);
-    const fetch = vi.fn<CatchupDeps["fetchReplies"]>().mockResolvedValue([msg(2), { ...msg(3), bot_id: "bot" }]);
+    const fetch = vi.fn<CatchupDeps["fetchReplies"]>().mockResolvedValue(page([msg(2), { ...msg(3), bot_id: "bot" }]));
     deps.fetchReplies = fetch;
     expect(await sweepMissedMessages(deps)).toBe(1);
     expect(fetch.mock.calls[0]![2]).toBe(replayFloor(NOW));
@@ -160,9 +162,8 @@ describe("recent eligibility and fair read-only discovery", () => {
     const path = join(FIXTURES, "no-boundary", "state.json");
     writeFileSync(path, JSON.stringify({ threads: { [key]: { sessionId: "legacy", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW } }, projects: {} }));
     deps.state = new StateStore(path, () => NOW);
-    deps.state.seedMissingWatermarks();
     expect(deps.state.getThread(key)?.lastSeenTs).toBeUndefined();
-    deps.fetchReplies = async () => [msg(2)];
+    deps.fetchReplies = async () => page([msg(2)]);
     expect(await sweepMissedMessages(deps)).toBe(0);
     expect(dispatched).toEqual([]);
     expect(deps.state.getThread(key)?.lastSeenTs).toBe(ts(2)); // a real history observation, not migration
@@ -193,13 +194,79 @@ describe("recent eligibility and fair read-only discovery", () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let calls = 0;
-    deps.fetchReplies = async () => { calls++; await gate; return []; };
-    const coordinator = createCatchupCoordinator(deps);
-    const first = coordinator.request();
+    deps.fetchReplies = async () => { calls++; await gate; return page([]); };
+    const first = sweepMissedMessages(deps);
     await vi.waitFor(() => expect(calls).toBe(1));
-    expect(coordinator.request()).toBe(first);
+    expect(sweepMissedMessages(deps)).toBe(first);
     release();
     await first;
     expect(calls).toBe(2);
+  });
+});
+
+describe("top-level sweep (\\listen channels + owner DM)", () => {
+  const top = (seconds: number, extra: Partial<SlackMsg> = {}): SlackMsg => ({ channel: "L", ts: ts(seconds), user: "U1", text: "work", ...extra });
+  function topFixture(name: string, messages: SlackMsg[] = []) {
+    const state = new StateStore(join(FIXTURES, name, "state.json"), () => NOW);
+    const dispatched: SlackMsg[] = [];
+    const deps: TopLevelCatchupDeps = { state, ownerSlackUserId: "U1", channels: ["L"],
+      fetchHistory: vi.fn(async () => ({ messages, hasMore: false })),
+      dispatch: async (m) => {
+        dispatched.push(m);
+        state.claimMessage(`L:${m.ts}`, m.ts, { source: "history" });
+        state.settleMessage(`L:${m.ts}`, m.ts, "accepted");
+        return "accepted";
+      } };
+    return { state, deps, dispatched };
+  }
+
+  it("seeds a missing watermark at now instead of replaying old history", async () => {
+    const { state, deps, dispatched } = topFixture("top-seed", [top(-30)]);
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(deps.fetchHistory).not.toHaveBeenCalled();
+    expect(dispatched).toEqual([]);
+    expect(state.topLevelWatermark("L")).toBe(timestampFromMs(NOW));
+  });
+
+  it("replays only unseen owner top-level prompts after the watermark, once", async () => {
+    const live = top(3);
+    const { state, deps, dispatched } = topFixture("top-replay", [top(1), top(2), live, top(4, { user: "other" }),
+      top(5, { bot_id: "B" }), top(6, { thread_ts: ts(1) }), top(7, { subtype: "channel_join" })]);
+    state.setTopLevelWatermark("L", ts(1));
+    state.claimMessage(`L:${live.ts}`, live.ts, { source: "live" }); // delivered live
+    state.settleMessage(`L:${live.ts}`, live.ts, "accepted");
+    expect(await sweepTopLevelMessages(deps)).toBe(1);
+    expect(dispatched).toEqual([top(2)]);
+    expect(state.topLevelWatermark("L")).toBe(ts(7));
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(deps.fetchHistory).toHaveBeenLastCalledWith("L", ts(7));
+  });
+
+  it("stops at a retry so the next sweep tries it again", async () => {
+    const { state, deps } = topFixture("top-retry", [top(2), top(3)]);
+    state.setTopLevelWatermark("L", ts(1));
+    deps.dispatch = async () => "retry";
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(state.topLevelWatermark("L")).toBe(ts(1));
+  });
+
+  it("holds an over-budget backlog instead of replaying a partial window", async () => {
+    const { state, deps, dispatched } = topFixture("top-backlog");
+    state.setTopLevelWatermark("L", ts(1));
+    deps.fetchHistory = async () => ({ messages: [top(5), top(6)], hasMore: true });
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(state.topLevelWatermark("L")).toBe(ts(6));
+  });
+
+  it("policy: only the top-level sweep may recover an unbound message; \\listen on restarts the watermark", () => {
+    const now = NOW;
+    expect(classifyRecovery({ ts: ts(2), thread: null, now, context: { source: "history", topLevel: true } }).decision).toBe("recover");
+    expect(classifyRecovery({ ts: ts(2), thread: null, now, context: { source: "history" } }).decision).toBe("held");
+    const { state } = topFixture("top-toggle");
+    state.setAlwaysOn("L", true);
+    expect(state.topLevelWatermark("L")).toBe(timestampFromMs(NOW));
+    state.setAlwaysOn("L", false);
+    expect(state.topLevelWatermark("L")).toBeUndefined();
   });
 });

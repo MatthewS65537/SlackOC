@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { Jimp, JimpMime } from "jimp";
-import { claimEvent, hushAction, handleIncomingMessage, type BridgeDeps, type SlackMsg } from "../src/slack/router.js";
+import { claimEvent, hushAction, handleIncomingMessage, runPickedCommand, shouldRouteMessage, type BridgeDeps, type SlackMsg } from "../src/slack/router.js";
 import type { RenderDeps } from "../src/slack/render.js";
 import type { ServerPool } from "../src/opencode/server.js";
 import type { SlackocConfig } from "../src/config.js";
@@ -94,10 +94,10 @@ function fakePool(client: Record<string, unknown>): ServerPool {
     client,
     status: "ready",
     ready: Promise.resolve(),
-    sseAbort: null,
-    proc: null,
   };
-  return { ensure: async () => entry, list: () => [], killOne: async () => {} } as unknown as ServerPool;
+  const pool = { ensure: async (_dir: string) => entry, list: () => [], killOne: async () => {},
+    acquire: async (dir: string) => ({ entry: await pool.ensure(dir), release: () => {} }) };
+  return pool as unknown as ServerPool;
 }
 
 function makeDeps(name: string, pool: ServerPool, render: RenderDeps): BridgeDeps & { state: StateStore } {
@@ -235,7 +235,7 @@ describe("real-router recovery receipts", () => {
     d.state.setThread(`C:${root}`, { sessionId: name, projectDir: "/p", verbose: "on", createdAt: 1,
       lastUsedAt: 1, lastSeenTs: baseline, notify: true });
     const catchup = (messages: SlackMsg[]) => sweepMissedMessages({ state: d.state, ownerSlackUserId: "U1",
-      fetchReplies: async () => messages, dispatch: (m, context) => handleIncomingMessage(m, d, context) });
+      fetchReplies: async () => ({ messages, hasMore: false, pagesUsed: 1 }), dispatch: (m, context) => handleIncomingMessage(m, d, context) });
     return { d, log, client, catchup };
   }
 
@@ -688,7 +688,7 @@ describe("eyes liveness ack", () => {
     const log = { posted: [] as string[], deleted: [] as string[], reacted: [] as Array<[string, string]>, dms: [] as string[], unreacted: [] as Array<[string, string]> };
     const base = fakeRender(log);
     const render: RenderDeps = { ...base, unreact: async (_c, ts, name) => void log.unreacted.push([ts, name]) };
-    const pool = { ensure: async () => { throw new Error("spawn blew up"); }, list: () => [], killOne: async () => {} } as unknown as ServerPool;
+    const pool = { acquire: async () => { throw new Error("spawn blew up"); }, list: () => [], killOne: async () => {} } as unknown as ServerPool;
     const d = makeDeps("router-eyes-fail", pool, render);
 
     await handleIncomingMessage(ownerMsg("C11", "911.010", undefined, "run something"), d);
@@ -701,7 +701,7 @@ describe("eyes liveness ack", () => {
 });
 
 // ---------------------------------------------------------------------------
-// \watch gate: a watchOnly thread rejects plain replies (RESUME_SESSIONS phase 3)
+// \watch gate: a watchOnly thread rejects plain replies
 
 describe("watchOnly gate", () => {
   it("rejects plain replies with the takeover hint — no 👀, no prompt, no session create", async () => {
@@ -789,6 +789,19 @@ describe("original age and cancellation at effect boundaries", () => {
       expect(prompt).toHaveBeenCalledOnce();
       expect(d.state.getThread(key)?.recovery?.ownerActivityTs).toBe(timestampFromMs(NOW - 1000));
     } finally { deleteView("fresh-old-thread"); }
+  });
+
+  it("a missed top-level \\listen/DM prompt starts its session only via the top-level sweep", async () => {
+    const { d, prompt, create } = gated("top-level-replay");
+    try {
+      const held = ownerMsg("L", timestampFromMs(NOW - 2000), undefined, "missed prompt");
+      expect(await handleIncomingMessage(held, d, { source: "history" })).toBe("held");
+      const missed = ownerMsg("L", timestampFromMs(NOW - 1000), undefined, "missed prompt");
+      expect(await handleIncomingMessage(missed, d, { source: "history", topLevel: true })).toBe("accepted");
+      expect(create).toHaveBeenCalledOnce();
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(d.state.getThread(`L:${missed.ts}`)?.sessionId).toBe("top-level-replay");
+    } finally { deleteView("top-level-replay"); }
   });
 
   it("rechecks expiration after server acquisition, immediately before a model submission", async () => {
@@ -906,5 +919,42 @@ describe("original age and cancellation at effect boundaries", () => {
     expect(await running).toBe("canceled");
     expect(create).not.toHaveBeenCalled();
     expect(prompt).not.toHaveBeenCalled();
+  });
+});
+
+describe("runPickedCommand (C1 dropdowns)", () => {
+  it("runs the chosen command in the card's thread, and defers to a running report", async () => {
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps("picked", fakePool({}), fakeRender(log));
+    d.state.setThread("C1:T1", { sessionId: "ses_1", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 });
+    await runPickedCommand(d, "C1", "T1", "CARD", "\\verbose full");
+    expect(d.state.getThread("C1:T1")?.verbose).toBe("full");
+    d.schedules = { busy: () => true, run: async () => {}, cancelThread: async () => {} };
+    await runPickedCommand(d, "C1", "T1", "CARD", "\\verbose off");
+    expect(d.state.getThread("C1:T1")?.verbose).toBe("full");
+    expect(log.posted.at(-1)).toContain("report is still running");
+  });
+});
+
+describe("shortcut project choice (C3)", () => {
+  it("creates a brand-new thread's session in the chosen project", async () => {
+    const client = { session: { promptAsync: async () => ({ data: {} }), create: async () => ({ data: { id: "sess-sc" } }),
+      messages: async () => ({ data: [] }), get: async () => { throw new Error("no summary"); } } };
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps("shortcut-project", fakePool(client), fakeRender(log));
+    d.state.setCurrentProject("/p");
+    expect(await handleIncomingMessage(ownerMsg("C7", "950.002", "950.001", "fix it"), d, { source: "live", projectDir: "/elsewhere" })).toBe("accepted");
+    expect(d.state.getThread(`C7:${ts("950.001")}`)?.projectDir).toBe("/elsewhere");
+  });
+});
+
+describe("shouldRouteMessage (which raw message events reach the router)", () => {
+  const listening = (c: string) => c === "CLISTEN";
+  it("routes DMs, thread replies, and top-level messages only in \\listen channels", () => {
+    expect(shouldRouteMessage({ channel: "D1", channel_type: "im" }, listening)).toBe(true);
+    expect(shouldRouteMessage({ channel: "C1", channel_type: "channel", thread_ts: "1.0" }, listening)).toBe(true);
+    expect(shouldRouteMessage({ channel: "CLISTEN", channel_type: "channel" }, listening)).toBe(true);
+    expect(shouldRouteMessage({ channel: "G1", channel_type: "group" }, listening)).toBe(false);
+    expect(shouldRouteMessage({ channel: "C1", channel_type: "channel" }, listening)).toBe(false);
   });
 });

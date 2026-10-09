@@ -7,7 +7,6 @@ import { parseFlags } from "./args.js";
 import { rotatingLog } from "./service-log.js";
 
 export const SERVICE_LABEL = "com.slackoc.bridge";
-export const SERVICE_LOG_PATH = join(CONFIG_DIR, "logs", "bridge.log");
 const ENV_KEYS = ["HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "SLACKOC_HOME"] as const;
 const USAGE = "slackoc service install [--dir /absolute/project] [--keep-awake true|false] | start | stop | status | uninstall";
 
@@ -30,16 +29,24 @@ export interface ServiceContext {
   alive: (pid: number) => boolean;
 }
 
-function alive(pid: number): boolean {
+/** EPERM (or an unexpected probe failure) is not proof that the process died. */
+export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (err) { return (err as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+
+/** Strict pidfile contents: a bare integer > 1, else null (empty/partial/garbage). */
+export function parsePid(text: string): number | null {
+  const trimmed = text.trim();
+  const pid = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+  return Number.isSafeInteger(pid) && pid > 1 ? pid : null;
 }
 
 export function serviceContext(): ServiceContext {
   return {
     platform: process.platform, home: homedir(), configDir: resolve(CONFIG_DIR),
     cwd: process.cwd(), node: process.execPath, cli: resolve(process.argv[1] ?? ""),
-    uid: process.getuid?.() ?? 0, env: process.env, run, alive,
+    uid: process.getuid?.() ?? 0, env: process.env, run, alive: pidAlive,
   };
 }
 
@@ -124,9 +131,8 @@ function loadedJob(ctx: ServiceContext): { loaded: boolean; pid: number | null; 
 
 function readPid(path: string, allowStalePartial = false): number | null {
   if (!existsSync(path)) return null;
-  const text = readFileSync(path, "utf8").trim();
-  const pid = /^\d+$/.test(text) ? Number(text) : NaN;
-  if (!Number.isSafeInteger(pid) || pid <= 1) {
+  const pid = parsePid(readFileSync(path, "utf8"));
+  if (pid === null) {
     // Match claimPidfile's legacy-partial grace. The bridge still owns recovery
     // under its claim lock; service preflight never edits a shared pidfile.
     if (allowStalePartial && Date.now() - statSync(path).mtimeMs >= 30_000) return null;

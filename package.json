@@ -12,36 +12,26 @@
   "files": [
     "dist",
     "manifest",
-    "docs",
     "skills",
     "README.md"
   ],
   "scripts": {
     "build": "tsup",
-    "prepublishOnly": "npm run build",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "smoke": "tsx test/integration/smoke.ts",
     "check": "tsc --noEmit"
   },
-  "keywords": [
-    "opencode",
-    "slack",
-    "bot",
-    "coding-agent"
-  ],
   "license": "MIT",
   "dependencies": {
     "@opencode/client": "^2.0.12",
     "@slack/bolt": "^5.0.0",
     "@slack/web-api": "8.1.1",
     "cron-parser": "^5.10.1",
-    "diff": "^9.0.0",
     "jimp": "^1.6.1"
   },
   "devDependencies": {
     "@opencode/plugin": "2.0.12",
-    "@types/diff": "^7.0.2",
     "@types/node": "^24",
     "tsup": "^8",
     "tsx": "^4",

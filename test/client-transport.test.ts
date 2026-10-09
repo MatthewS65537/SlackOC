@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeClient, pendingQuestions, promptAsync, sessionCommand, sessionList, sessionStatus, sseEvents } from "../src/opencode/client.js";
+import { makeClient, pendingQuestions, promptAsync, sessionCommand, sessionList, sessionStatus } from "../src/opencode/client.js";
 import { COMMAND_TIMEOUT_MS, HTTP_TIMEOUT_MS } from "../src/http.js";
 
 describe("OpenCode request deadlines", () => {
@@ -52,11 +52,13 @@ describe("OpenCode request deadlines", () => {
 
   it("bounds raw calls and refuses a pre-canceled request before fetch", async () => {
     const signals = hang();
-    const result = expect(pendingQuestions("http://localhost:4096", { timeoutMs: 50 })).rejects.toThrow("timed out");
+    const bounded = { timeoutMs: 50 };
+    const result = expect(pendingQuestions(makeClient("http://localhost:4096", bounded), bounded)).rejects.toThrow("timed out");
     await vi.advanceTimersByTimeAsync(50);
     await result;
     expect(signals[0]!.aborted).toBe(true);
-    await expect(pendingQuestions("http://localhost:4096", { signal: AbortSignal.abort(new Error("canceled")) }))
+    const canceled = { signal: AbortSignal.abort(new Error("canceled")) };
+    await expect(pendingQuestions(makeClient("http://localhost:4096", canceled), canceled))
       .rejects.toThrow("canceled");
     expect(signals).toHaveLength(1);
   });
@@ -91,57 +93,4 @@ it("a real SDK fetch aborts a stalled response body and closes its socket", asyn
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
-});
-
-describe("SSE idle watchdog", () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
-
-  function stream() {
-    let input!: ReadableStreamDefaultController<Uint8Array>;
-    const canceled = vi.fn();
-    const body = new ReadableStream<Uint8Array>({ start(c) { input = c; }, cancel: canceled });
-    let signal!: AbortSignal;
-    vi.stubGlobal("fetch", vi.fn(async (_url, init: RequestInit) => { signal = init.signal!; return new Response(body); }));
-    return { body, canceled, input, signal: () => signal };
-  }
-
-  it("cancels a silent reader, aborts fetch, and releases its lock", async () => {
-    const s = stream();
-    const events = sseEvents("http://localhost:4096", new AbortController().signal, 60_000);
-    const result = expect(events.next()).rejects.toThrow("SSE idle timeout");
-    await vi.advanceTimersByTimeAsync(60_000);
-    await result;
-    expect(s.signal().aborted).toBe(true);
-    expect(s.canceled).toHaveBeenCalled();
-    expect(s.body.locked).toBe(false);
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("10s heartbeats keep a stream alive beyond its idle budget; early return cleans up", async () => {
-    const s = stream();
-    const events = sseEvents("http://localhost:4096", new AbortController().signal);
-    for (let i = 0; i < 12; i++) {
-      const event = events.next();
-      await vi.advanceTimersByTimeAsync(10_000);
-      s.input.enqueue(new TextEncoder().encode('data: {"type":"server.heartbeat"}\r\n\r\n'));
-      expect((await event).value?.type).toBe("server.heartbeat");
-    }
-    expect(s.signal().aborted).toBe(false);
-    await events.return(undefined);
-    expect(s.canceled).toHaveBeenCalled();
-    expect(s.body.locked).toBe(false);
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("caller abort wakes a pending read immediately", async () => {
-    const s = stream();
-    const controller = new AbortController();
-    const result = expect(sseEvents("http://localhost:4096", controller.signal).next()).rejects.toThrow("stop");
-    await vi.advanceTimersByTimeAsync(0);
-    controller.abort(new Error("stop"));
-    await result;
-    expect(s.body.locked).toBe(false);
-    expect(vi.getTimerCount()).toBe(0);
-  });
 });

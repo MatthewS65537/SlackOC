@@ -13,5 +13,3 @@ export function isSupportedOpencodeVersion(version: string): boolean {
   return [major, minor, patch].every(Number.isSafeInteger) && major === MIN_OPENCODE[0]
     && (minor! > MIN_OPENCODE[1] || (minor === MIN_OPENCODE[1] && patch! >= MIN_OPENCODE[2]));
 }
-
-export const CONFIG_DIR_NAME = "slackoc";

@@ -3,7 +3,7 @@ import { open, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, sep } from "node:path";
 import { LogLevel, WebClient } from "@slack/web-api";
-import { CONFIG_DIR, CONFIG_PATH, STATE_PATH } from "./config.js";
+import { CONFIG_DIR, CONFIG_PATH, OWNER_ID_RE, STATE_PATH } from "./config.js";
 import { withDeadline, type RequestOptions } from "./http.js";
 import { slackWebClientOptions, SLACK_UPLOAD_TIMEOUT_MS, withSlackOperation } from "./slack/transport.js";
 import { safePayload } from "./slack/tool-format.js";
@@ -61,6 +61,7 @@ async function jsonFile(path: string, message: string): Promise<unknown> {
 
 async function bindingFor(path: string, session: string): Promise<Binding> {
   const state = await jsonFile(path, "SlackOC state is missing or unreadable; no thread destination can be confirmed");
+  if (record(state) && state.version !== undefined && state.version !== 1) throw new FileSendError(`SlackOC state version ${String(state.version)} is not supported; update SlackOC`);
   if (!record(state) || !record(state.threads)) throw new FileSendError("SlackOC state has invalid thread bindings");
   const matches = Object.entries(state.threads).filter(([, value]) => record(value) && value.sessionId === session);
   if (matches.length !== 1) throw new FileSendError(matches.length ? "Session has ambiguous Slack thread bindings; refusing to send" : "Current session is not bound to a Slack thread; refusing to send (no DM fallback)");
@@ -176,7 +177,7 @@ export async function sendFile(opts: SendFileOptions, deps: SendFileDeps = {}): 
   const data = await fileBytes(opts.file, deps.signal);
   const config = await jsonFile(deps.configPath ?? CONFIG_PATH, "SlackOC config is missing or unreadable; run slackoc init first");
   if (!record(config) || typeof config.slackBotToken !== "string" || !config.slackBotToken.startsWith("xoxb-") ||
-      typeof config.ownerSlackUserId !== "string" || !/^U[A-Z0-9]+$/.test(config.ownerSlackUserId)) {
+      typeof config.ownerSlackUserId !== "string" || !OWNER_ID_RE.test(config.ownerSlackUserId)) {
     throw new FileSendError("SlackOC configuration is invalid; run slackoc init first");
   }
   const filename = basename(opts.file);

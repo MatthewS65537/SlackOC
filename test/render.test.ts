@@ -4,6 +4,8 @@ import {
   deleteView,
   describeActiveRuns,
   errorMessage,
+  laneText,
+  retryActivity,
   finalizeViewsForProject,
   getView,
   hasActiveViewForProject,
@@ -557,12 +559,73 @@ describe("SessionView status line", () => {
     const log = blank();
     const v = makeView(log, "sess-status-a", { verbose: "on" });
     await v.beginPrompt("111.700");
-    await v.handle({ type: "message.part.updated", properties: { part: { id: "s1", messageID: "m1", type: "step-start" } } } as never);
+    await v.handle({ type: "session.status", properties: { sessionID: "sess-status-a", status: { type: "busy" } } } as never);
     await new Promise((r) => setTimeout(r, 1300)); // let the 1s status ticker fire
     expect(log.updates.at(-1)).toMatch(/[⏳⌛]/);
-    expect(log.updates.at(-1)).toContain("thinking…");
+    expect(log.updates.at(-1)).toContain("working…");
     expect(log.updates.at(-1)).not.toContain("Tools");
     deleteView("sess-status-a");
+  });
+});
+
+describe("SessionView pauses (compaction, retry)", () => {
+  it("leaves one quiet line for a finished compaction", async () => {
+    const log = blank();
+    const v = makeView(log, "sess-compact-a", { verbose: "on" });
+    await v.handle({ type: "session.compaction", properties: { sessionID: "sess-compact-a", phase: "started" } } as never);
+    await v.handle({ type: "session.compaction", properties: { sessionID: "sess-compact-a", phase: "ended" } } as never);
+    await v.finalize();
+    expect(log.posted.join("\n")).toContain("🗜 context compacted");
+    deleteView("sess-compact-a");
+  });
+
+  it("shows the retry countdown when the next attempt time is known", () => {
+    expect(retryActivity({ attempt: 2, message: "overloaded", next: 8_000 }, 0)).toBe("↻ retrying in 8s: overloaded (attempt 2)");
+    expect(retryActivity({}, 0)).toBe("↻ retrying (attempt ?)");
+  });
+});
+
+describe("SessionView live cards (plan, subagent lanes)", () => {
+  const todo = (id: string, todos: Array<{ content: string; status: string }>) => ({ type: "message.part.updated",
+    properties: { part: { id, callID: "plan", type: "tool", tool: "todowrite", state: { status: "running", input: { todos } } } } }) as never;
+
+  it("posts the plan once, then coalesces changes into one in-place edit", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      const v = makeView(log, "sess-plan-a");
+      await v.handle(todo("p1", [{ content: "read", status: "in_progress" }, { content: "fix", status: "pending" }]));
+      await v.handle(todo("p2", [{ content: "read", status: "completed" }, { content: "fix", status: "in_progress" }]));
+      await v.handle(todo("p3", [{ content: "read", status: "completed" }, { content: "fix", status: "completed" }]));
+      expect(log.posted.filter(t => t.startsWith("📋"))).toHaveLength(1);
+      expect(log.updates).toEqual([]);
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(log.updates).toHaveLength(1);
+      expect(log.updates[0]).toContain("2 of 2 done");
+      deleteView("sess-plan-a");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rolls child events into one lane line and counts them as liveness", async () => {
+    const log = blank();
+    const v = makeView(log, "sess-lane-a");
+    const tool = (id: string) => ({ type: "message.part.updated",
+      properties: { part: { id, callID: id, type: "tool", tool: "bash", state: { status: "running", input: { command: "ls" } } } } }) as never;
+    await v.handleChild("child-1", "Explore repo (@explore subagent)", tool("t1"));
+    expect(log.posted.filter(t => t.startsWith("🤖"))).toHaveLength(1);
+    await v.handleChild("child-1", "Explore repo (@explore subagent)", { type: "message.part.updated",
+      properties: { part: { id: "x", type: "text", text: "Found 3 files" } } } as never);
+    await v.handleChild("child-1", "Explore repo (@explore subagent)", { type: "session.idle", properties: { sessionID: "child-1" } } as never);
+    expect(log.updates.at(-1)).toMatch(/1 tool · .* · done\n> Found 3 files$/);
+    expect(log.posted.filter(t => t.startsWith("🤖"))).toHaveLength(1);
+    deleteView("sess-lane-a");
+  });
+
+  it("lane text reports errors in place of a result", () => {
+    expect(laneText({ title: "t", startedAt: 0, tools: new Set(), lastText: "", done: true, error: "boom" }, 5_000))
+      .toBe("🤖 *t* · 0 tools · 5s · ⚠️ boom");
   });
 });
 
@@ -1272,7 +1335,7 @@ describe("completion DM diff button (RF1)", () => {
     const blocks = on.dmBlocks[0];
     expect(JSON.stringify(blocks)).toContain('"view_diff"');
     expect(JSON.stringify(blocks)).toContain('"sess-rf1"');
-    expect(JSON.stringify(blocks)).toContain("View diff");
+    expect(JSON.stringify(blocks)).toContain("View changes");
     deleteView("sess-rf1");
   });
 });
@@ -1490,7 +1553,7 @@ describe("SessionView strict-bottom progress message (#6)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// \watch mode: SessionView.attach() (docs/RESUME_SESSIONS.md phase 3)
+// \watch mode: SessionView.attach()
 
 import { join } from "node:path";
 

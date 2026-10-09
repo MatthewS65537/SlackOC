@@ -1,15 +1,14 @@
 import { createInterface } from "node:readline/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { loadConfig, saveConfig, CONFIG_PATH, maskToken } from "./config.js";
+import { existsSync, readFileSync } from "node:fs";
+import { loadConfig, saveConfig, CONFIG_PATH, maskToken, OWNER_ID_RE } from "./config.js";
 import { VERSION } from "./version.js";
 
 export interface InitOptions {
   botToken?: string;
   appToken?: string;
   ownerId?: string;
-  defaultDir?: string;
 }
 
 function entryDir(): string {
@@ -23,12 +22,14 @@ function manifestPath(): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Slack API validation helpers (also unit-tested with a stubbed fetch)
+// Slack API validation helpers (also used by doctor; unit-tested with a stubbed fetch)
 
-async function slackApi<T>(method: string, token: string): Promise<T> {
+/** POST a Web API method; `payload` is sent as a JSON body. */
+export async function slackApi<T>(method: string, token: string, payload?: object): Promise<T> {
   const res = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
-    headers: { authorization: `Bearer ${token}` },
+    headers: { authorization: `Bearer ${token}`, ...(payload ? { "content-type": "application/json" } : {}) },
+    ...(payload ? { body: JSON.stringify(payload) } : {}),
   });
   return res.json() as Promise<T>;
 }
@@ -42,7 +43,7 @@ export function assertAppTokenShape(t: string): void {
 }
 
 export function assertOwnerIdShape(id: string): void {
-  if (!/^U[A-Z0-9]{8,}$/.test(id)) throw new Error("that doesn't look like a Slack user id (expected U…)");
+  if (!OWNER_ID_RE.test(id)) throw new Error("that doesn't look like a Slack user id (expected U…)");
 }
 
 /** Validates a bot token against slack.com and returns workspace/bot info. */
@@ -129,19 +130,10 @@ export async function runInit(opts: InitOptions = {}): Promise<void> {
     const owner = await verifyOwnerId(botToken, ownerId);
     console.log(owner?.name ? `  ✓ paired owner: ${owner.name}` : `  ✓ paired owner: ${ownerId} (name check skipped — app lacks users:read)`);
 
-    const defaultDirInput = opts.defaultDir ?? (interactive ? await ask("Default project dir (blank = use SlackOC start cwd): ") : "");
-    let defaultDir: string | undefined;
-    if (defaultDirInput) {
-      const abs = resolve(defaultDirInput);
-      if (!statSync(abs, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${abs} is not a directory`);
-      defaultDir = abs;
-    }
-
     saveConfig({
       slackBotToken: botToken,
       slackAppToken: appToken,
       ownerSlackUserId: ownerId,
-      ...(defaultDir ? { defaultProjectDir: defaultDir } : {}),
       createdAt: new Date().toISOString(),
     });
 

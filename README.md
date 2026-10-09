@@ -38,16 +38,20 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 ## Features
 
 - **Remote prompting** from Slack DM or mention, with answers streamed into threads
-- **Always-on channels** — `\listen on` in a channel makes every top-level message of yours start a session without an @ (off by default; DMs always listen)
+- **Always-on channels** — `\listen` (toggle, or `on|off`) in a channel makes every top-level message of yours start a session without an @ (off by default; DMs always listen)
 - **Proactive threads with a mute** — once a thread has a session, replies are answered with no @ mention needed; `\hush` quiets the thread (an @ always wakes it)
 - **Tool visibility by default** — `\verbose full|on|off`; compact tool batches flush after 1.5 seconds or at a size threshold, and before answers. Paths, commands, and search patterns use inline code; shell descriptions stay concise. `full` adds output snippets. Slack queueing or rate limits may delay delivery
 - **Clear progress** — literal ⏳/⌛ characters, elapsed time, waiting-for-answer/permission and connection states; the indicator moves below new content, with bounded retry backoff when Slack is unavailable
 - **Paragraph streaming** — each paragraph of a reply posts as soon as the model finishes it (never split inside a code block, no in-place edits). `\stream off` reverts a thread to posting each part once complete
+- **Live plan and subagent lanes** — when the agent writes a todo list, one 📋 plan card (☐ / ◐ / ☑, "3 of 5 done") is edited in place; each subagent gets one 🤖 lane line (tools, elapsed, then its result) instead of silence. Context compaction and provider retries show in the status line
+- **Review changes on a phone** — a run that edited files ends with a 📄 View changes button; it opens a modal with a file dropdown and one file's diff at a time (oversized files offer a snippet download)
+- **Home tab** — opening the app's Home shows what's running, what's waiting on you, scheduled reports and today's usage, each linked to its thread. It's a snapshot taken when you open it; nothing is pushed
+- **Send to OpenCode** — the ⋯ menu on any message starts a run from it: pick a project, add instructions, and run in that message's thread (or your DM when the bot isn't in that conversation)
 - **Markdown answers render properly** — GFM → Slack mrkdwn conversion (bold, lists, links, headings); fenced code stays code
 - **Image support, both ways** — attach a screenshot (or any text/PDF/JSON file ≤8MB) to your message and the model sees it; images over ~1MB are auto-compressed to stay under provider request-size limits; images the model produces are posted back into the thread
 - **Agent file delivery** — the global `slackoc_send_file` tool sends PDFs, screenshots, reports and other local files (≤50 MiB) to the agent's current Slack thread. Its session comes from OpenCode, not a guessed destination; there is no separate DM fallback. [Setup](docs/SETUP.md#agent-file-delivery)
 - **Approval buttons with text backup** — ✓ Approve once / Always allow / ✕ Deny, independently delivered to the thread and owner DM. Rejected cards fall back to usable text commands; `\permissions` lists pending requests and `\permission <request-id> once|deny|always` answers them. Button/text races share one owner-only responder
-- **Notifications that reach you** — failures DM the owner by default; `\notify on` adds a DM when each run finishes (with a one-tap 📄 View diff button); a 3-minute stall pages you once
+- **Notifications that reach you** — failures DM the owner by default; `\notify on` adds a DM when each run finishes (with a one-tap 📄 View changes button); a 3-minute stall pages you once
 - **Scheduled reports** — `\schedule add` previews a daily/weekly report before confirmation. Each occurrence uses a fresh, restricted OpenCode session and sends the finished report to your DM or an invited channel; durable records recover work without blindly repeating prompts or posts
 - **Self-healing connections** — SlackOC owns Slack Socket Mode reconnection (jittered backoff up to 60s, wake detection), because the library abandons reconnecting after a single network error. Under the macOS service, 10 minutes without Slack exits so launchd restarts a clean process. Outbound calls retry brief network failures (posts only when the request provably never left the machine), and an offline brake pauses catch-up polling and repeated log lines while the network is down. The OpenCode event stream is resubscribed after 45s without keepalives
 - **Failure recovery** — reconnects the event stream and reconciles authoritative session, inbox, form, and permission state when events are missed. `\restart` reconnects SlackOC without stopping the shared OpenCode service or resubmitting prompts.
@@ -60,7 +64,7 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 - **Prioritized `\` commands, even mid-run** — outbound Slack calls ride a per-channel queue where interactive traffic (command answers, approval prompts, acks) jumps ahead of queued background traffic; an in-flight operation or Slack rate limit can still delay a reply
 - **Bottom progress placement** — the ⏳ indicator moves below newly emitted content; overlapping moves coalesce, and busy queues or delivery failures can temporarily delay repositioning
 - **Multi-project** — not locked to one folder: `\projects`, `\cd /path`, `\new /path`
-- **Native command passthrough** — `\cmd <opencode command>`, plus model (`\model <#>`) and agent (`\agent <#|name>`) swaps
+- **Native command passthrough** — `\cmd <opencode command>`, plus model (`\model <#>`) and agent (`\agent <#|name>`) swaps. A bare `\model` posts a searchable dropdown with your OpenCode ★ favorites (ctrl+f in the TUI) on top; a bare `\agent`, `\project` or `\sessions` posts a dropdown above its numbered list
 - **Owner-only security** — the bot obeys exactly one paired Slack user ID; everyone else is ignored
 
 Backslash commands run inside Slack but are invisible to the workspace — they never collide with Slack slash commands. Full list: send `\help` to the bot after setup.
@@ -68,12 +72,12 @@ Backslash commands run inside Slack but are invisible to the workspace — they 
 ## Setup (5–10 min)
 
 1. Install (Node ≥ 20): `curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash` — and have OpenCode V2 ≥ 2.0.12 on your box.
-2. `slackoc init` — guided: create the Slack app from the bundled manifest, install it, paste the bot token (`xoxb-`) and app-level token (`xapp-`), enter your Slack member ID. Both tokens are validated live against Slack; the member ID is verified (`users:read` scope — already in the manifest). Non-interactive flags for CI: `--bot-token --app-token --owner [--dir]`
+2. `slackoc init` — guided: create the Slack app from the bundled manifest, install it, paste the bot token (`xoxb-`) and app-level token (`xapp-`), enter your Slack member ID. Both tokens are validated live against Slack; the member ID is verified (`users:read` scope — already in the manifest). Non-interactive flags for CI: `--bot-token --app-token --owner`
 3. `slackoc doctor` — sanity check
 4. `slackoc start` — bridge online in the foreground. For managed macOS operation, choose a default project directory and use the service commands below
 5. Open Slack → DM your bot → prompt
 
-Details & troubleshooting: [docs/SETUP.md](docs/SETUP.md).
+Details & troubleshooting: [docs/SETUP.md](docs/SETUP.md). OpenCode V2 integration notes: [docs/V2.md](docs/V2.md).
 
 ### macOS service
 
@@ -103,13 +107,15 @@ in SlackOC's config file. See [service setup details](docs/SETUP.md#macos-backgr
 
 Each thread answers proactively once it has a session — invite the bot to any channel where you want that (`/invite @SlackOC`); DMs always work. `\hush` toggles quiet mode per thread.
 
+Plural/singular forms work as aliases (`\session`, `\models`, `\log`, `\schedules`, `\commands`, …); `\help` lists each command's aliases.
+
 | command | effect |
 |---|---|
 | `\help` `\status` | grouped cheat sheet / project, binding, pool health |
 | `\hush` | toggle quiet mode in this thread (@ mention wakes it) |
 | `\verbose on\|off\|full` | tool-call visibility — `on` by default, `full` adds output snippets |
-| `\model` | numbered `provider/model` list; `\model <#>`, `\model provider/model`, or a filter (`\model sonnet`) to set |
-| `\stop` `\abort` | cancel the running task in this thread |
+| `\model` | searchable picker, ★ OpenCode favorites first; `\model provider/model` or a filter (`\model sonnet`) to set |
+| `\stop` `\abort` `\cancel` | cancel the running task in this thread |
 | `\permissions` | pending approvals and thread/DM delivery state |
 | `\permission <request-id> once\|deny\|always` | explicit text backup for approval buttons |
 | `\project <name\|#>` | swap projects by fuzzy name (`\project cowork`) or listing number — same fresh teardown as `\cd` |
@@ -119,9 +125,11 @@ Each thread answers proactively once it has a session — invite the bot to any 
 | `\history [n]` `\history <#\|id>` | display recent transcript turns without modifying session context; use `#N` for a picker number |
 | `\summary [#\|id]` | opt-in AI catch-up summary using a temporary session; costs a model call, leaves the target context unchanged |
 | `\agent <#\|name>` | swap OpenCode agent |
-| `\diff` `\cmd …` | diff summary (`\diff full` adds the unified diff, snippet when long) / OpenCode native command passthrough |
+| `\diff` `\cmd …` | diff summary with a View changes button (`\diff full` adds the unified diff, snippet when long) / OpenCode native command passthrough; a bare `\cmd` lists the project's native commands |
+| `\usage [today\|7d\|30d] [all]` | cost, tokens, sessions and a daily activity sparkline for this project (default 7d) or every project with `all` (also `\cost`, `\spend`, `\stats`) |
 | `\notify on\|off` | DM the owner when runs in this thread finish (failures + permission asks always DM) |
-| `\schedule` `\schedule add` | list reports/next starts or open guided creation with explicit time-zone, project, prompt and destination confirmation |
+| `\schedule` `\schedule add` | list reports with next starts and last-run outcome, or open guided creation with explicit time-zone, project, prompt and destination confirmation |
+| `\schedule edit <id>` | reopen the creation form prefilled; saving keeps the ID and history and applies to future occurrences |
 | `\schedule pause\|resume\|run\|remove <id>` | manage future occurrences or request a manual run; pause/remove do not cancel active work |
 | `\schedule history [id]` `\schedule cancel <run-id>` | inspect run outcomes or stop an owned report occurrence |
 | `\logs [filter]` | recent bridge log lines, optionally substring-filtered (`\logs error`) — remote debugging without the console |
@@ -145,10 +153,17 @@ moving beneath the answer buttons.
 
 Send `\schedule add`, click **Create report**, and select a start time, IANA time
 zone (for example `America/Los_Angeles`), days, saved project directory, report
-prompt and `dm` or a channel ID. Review the preview and confirm. Selecting every
-day makes a daily schedule; a subset makes it weekly. Invite the bot before using
-a channel destination. Creating a schedule authorizes future model calls; no job
-exists until confirmation.
+prompt and destination (**Your DM**, or **A channel** chosen from the channel
+picker). Review the preview and confirm. Selecting every day makes a daily
+schedule; a subset makes it weekly. Invite the bot before using a channel
+destination; the form rejects channels it cannot see. Creating a schedule
+authorizes future model calls; no job exists until confirmation.
+
+`\schedule edit <id>` (or `change`/`update`) reopens the same form prefilled and
+previews the changes before saving. The report keeps its ID and run history, the
+next start is recomputed, and a run already in progress keeps its original
+settings. `\schedule` shows each report's latest outcome, such as
+`✓ delivered 8:02 AM` or `⚠ skipped Tue 9:00 AM`, in the report's time zone.
 
 The scheduled time is when generation **starts**, not a delivery deadline. Your
 Mac and bridge must be awake and online. After sleep/restart, only the latest

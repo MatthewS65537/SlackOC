@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { writeFileAtomic } from "../util.js";
 import { nextOccurrence, validateSchedule, type ScheduleSpec } from "./recurrence.js";
 
 export interface ScheduleJob {
@@ -49,9 +50,10 @@ export const MAX_SCHEDULE_OUTPUT_BYTES = 64 * 1024;
 export const SCHEDULE_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_STORE_BYTES = 64 * 1024 * 1024;
 const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-const TERMINAL = new Set<ScheduleRun["status"]>(["delivered", "failed", "canceled", "skipped"]);
+/** Statuses no worker advances further (see isTerminalRun for the notify/binding nuance). */
+export const TERMINAL_RUN_STATUSES: ReadonlySet<ScheduleRun["status"]> = new Set<ScheduleRun["status"]>(["delivered", "failed", "canceled", "skipped"]);
 const GENERATING = new Set<ScheduleRun["status"]>(["claimed", "creating", "submitting", "running", "waiting", "uncertain"]);
-const STATUSES = new Set<ScheduleRun["status"]>([...TERMINAL, ...GENERATING, "ready", "delivering"]);
+const STATUSES = new Set<ScheduleRun["status"]>([...TERMINAL_RUN_STATUSES, ...GENERATING, "ready", "delivering"]);
 const JOB_FIELDS = ["id", "name", "projectDir", "prompt", "schedule", "destination", "timeoutMs", "agent", "model", "enabled", "createdAt", "updatedAt", "nextRunAt"];
 const RUN_FIELDS = ["id", "jobId", "scheduledAt", "startedAt", "deadlineAt", "manual", "snapshot", "status", "sessionId", "messageId", "output", "error", "context", "contextAttemptedAt", "delivery", "deliveryBindingPending", "notified"];
 const NEW_JOB_FIELDS = JOB_FIELDS.filter(key => !["id", "enabled", "createdAt", "updatedAt", "nextRunAt"].includes(key));
@@ -59,7 +61,7 @@ const NEW_JOB_FIELDS = JOB_FIELDS.filter(key => !["id", "enabled", "createdAt", 
 export function isTerminalRun(run: ScheduleRun): boolean {
   if (run.status === "delivered" && run.deliveryBindingPending) return false;
   if (run.status === "failed" && run.error && !run.notified) return false;
-  return TERMINAL.has(run.status);
+  return TERMINAL_RUN_STATUSES.has(run.status);
 }
 export function isGenerationActive(run: ScheduleRun, now: number = Date.now()): boolean {
   // Saved output proves generation ended; uncertain delivery must not block
@@ -292,20 +294,9 @@ export class ScheduleStore {
       throw new Error("Schedule store changed outside this writer; refusing to overwrite");
     }
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const temporary = `${this.path}.${randomUUID()}.tmp`;
-    let fd: number | undefined;
-    try {
-      fd = openSync(temporary, "wx", 0o600);
-      writeFileSync(fd, raw);
-      fsyncSync(fd);
-      closeSync(fd); fd = undefined;
-      renameSync(temporary, this.path);
-      this.definitions = jobs;
-      this.records = runs;
-      this.persisted = raw;
-    } finally {
-      if (fd !== undefined) closeSync(fd);
-      if (existsSync(temporary)) unlinkSync(temporary);
-    }
+    writeFileAtomic(this.path, raw);
+    this.definitions = jobs;
+    this.records = runs;
+    this.persisted = raw;
   }
 }

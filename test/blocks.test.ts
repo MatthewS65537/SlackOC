@@ -1,67 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { appendSectionSuffix, boundedSection, permissionBlocks, permissionFallbackText, permissionResultText, QUESTION_ACTION_PATTERN, questionBlocks, type QuestionActionValue, type QuestionButtonValue } from "../src/slack/blocks.js";
+import { appendSectionSuffix, boundedSection, pickerBlocks, planText, planTodos, permissionBlocks, permissionFallbackText, permissionResultText, QUESTION_ACTION_PATTERN, questionBlocks, type QuestionActionValue, type QuestionButtonValue } from "../src/slack/blocks.js";
 import { normalizePermission, type OcPermission, type OcQuestionRequest } from "../src/opencode/api.js";
 
 // ─── normalizePermission (PA) ────────────────────────────────────────────────
 
 describe("normalizePermission", () => {
-  it("maps the new permission.asked shape onto legacy OcPermission", () => {
-    const out = normalizePermission({
-      id: "perm-1",
-      sessionID: "sess-1",
-      permission: "bash",
-      patterns: ["npm test", "npm run build"],
-      metadata: { title: "Run npm test", command: "npm test" },
-      always: ["npm test"],
-      tool: { messageID: "msg-1", callID: "call-1" },
-    });
-    expect(out.id).toBe("perm-1");
-    expect(out.sessionID).toBe("sess-1");
-    expect(out.type).toBe("bash");
-    expect(out.pattern).toEqual(["npm test", "npm run build"]);
-    expect(out.title).toBe("Run npm test");
-    expect(out.messageID).toBe("msg-1");
-    expect(out.callID).toBe("call-1");
-    expect(out.metadata).toEqual({ title: "Run npm test", command: "npm test" });
-  });
-
-  it("falls back to the permission name as title when metadata.title is absent", () => {
-    const out = normalizePermission({
-      id: "perm-2",
-      sessionID: "sess-2",
-      permission: "edit",
-      patterns: ["src/**"],
-      metadata: {},
-    });
-    expect(out.type).toBe("edit");
-    expect(out.title).toBe("edit");
-    expect(out.pattern).toEqual(["src/**"]);
+  it("uses the V2 message as title, falling back to the action", () => {
+    const base = { id: "perm-1", sessionID: "sess-1", action: "edit", resources: ["src/**"] };
+    expect(normalizePermission({ ...base, message: "Edit sources" }).title).toBe("Edit sources");
+    const out = normalizePermission(base);
+    expect(out).toMatchObject({ type: "edit", title: "edit", pattern: ["src/**"] });
     expect(out.messageID).toBeUndefined();
-    expect(out.callID).toBeUndefined();
-  });
-
-  it("handles missing patterns (non-array) as undefined", () => {
-    const out = normalizePermission({
-      id: "perm-3",
-      sessionID: "sess-3",
-      permission: "webfetch",
-      metadata: { title: "Fetch URL" },
-    });
-    expect(out.pattern).toBeUndefined();
-  });
-
-  it("passes legacy permission.updated payloads through untouched", () => {
-    const legacy = {
-      id: "perm-4",
-      sessionID: "sess-4",
-      messageID: "msg-4",
-      callID: "call-4",
-      type: "bash",
-      pattern: "ls -la",
-      title: "Run ls",
-      metadata: { command: "ls -la" },
-    };
-    expect(normalizePermission(legacy)).toBe(legacy);
   });
 });
 
@@ -239,13 +188,13 @@ describe("permission and question Slack contract", () => {
 
   it("bounds escaped payloads and the appended DM link while retaining exact backup commands", () => {
     const p = permission({ title: "<&>".repeat(5000), type: "&".repeat(3000), metadata: { filePath: "/".repeat(8000) }, id: "p".repeat(255), sessionID: "s".repeat(255) });
-    const blocks = permissionBlocks(p);
+    const blocks = permissionBlocks(p, 0);
     const suffix = "\n<https://example.com/thread|View thread>";
     const dm = appendSectionSuffix(blocks, suffix);
     assertSlackContract(dm);
     expect((dm[0] as { text: { text: string } }).text.text.endsWith(suffix)).toBe(true);
     expect(JSON.stringify(blocks)).not.toContain("View thread"); // original thread copy unmodified
-    const fallback = permissionFallbackText(p, "https://example.com/thread");
+    const fallback = permissionFallbackText(p);
     expect(fallback.length).toBeLessThanOrEqual(3000);
     for (const verb of ["once", "deny", "always"]) expect(fallback).toContain(`\\permission ${p.id} ${verb}`);
     expect(fallback).toContain("\\permissions");
@@ -261,8 +210,8 @@ describe("permission and question Slack contract", () => {
   });
 
   it("fails card construction rather than truncating executable identities", () => {
-    expect(() => permissionBlocks(permission({ id: "bad id" }))).toThrow("identity");
-    expect(() => permissionBlocks(permission({ sessionID: "s".repeat(2000) }))).toThrow("identity");
+    expect(() => permissionBlocks(permission({ id: "bad id" }), 0)).toThrow("identity");
+    expect(() => permissionBlocks(permission({ sessionID: "s".repeat(2000) }), 0)).toThrow("identity");
     expect(permissionFallbackText(permission({ id: "bad id" }))).not.toContain("\\permission bad id");
     expect(() => questionBlocks(makeReq({ sessionID: "s".repeat(2000) }), [])).toThrow("2000");
   });
@@ -474,5 +423,29 @@ describe("questionBlocks free-text", () => {
     const done = (blocks[1] as { text: { text: string } }).text.text;
     expect(done).toContain("✅");
     expect(done).toContain("ship it");
+  });
+});
+
+describe("planText", () => {
+  it("counts done items and marks each status", () => {
+    const todos = planTodos({ todos: [{ content: "a", status: "completed" }, { content: "b", status: "in_progress" },
+      { content: "c", status: "pending" }, { content: "d", status: "cancelled" }, { bogus: true }] })!;
+    expect(planText(todos)).toBe("📋 *Plan* · 1 of 4 done\n☑ a\n◐ *b*\n☐ c\n☒ ~d~");
+    expect(planTodos({ todos: "nope" })).toBeNull();
+  });
+});
+
+describe("pickerBlocks", () => {
+  const opts = (n: number, p = "m") => Array.from({ length: n }, (_, i) => ({ text: `${p}${i}`, value: `\\model x/${p}${i}` }));
+  it("groups options by provider and preselects the current one", () => {
+    const [block] = pickerBlocks("project", "*Project*", [{ label: "a", options: opts(2, "a") }, { label: "b", options: opts(1, "b") }], "\\model x/b0")! as any[];
+    expect(block.accessory.action_id).toBe("pick_project");
+    expect(block.accessory.option_groups.map((g: any) => g.label.text)).toEqual(["a", "b"]);
+    expect(block.accessory.initial_option.value).toBe("\\model x/b0");
+  });
+  it("uses a flat list for one group and falls back to text past 100 options", () => {
+    expect((pickerBlocks("agent", "x", [{ label: "g", options: opts(3) }])![0] as any).accessory.options).toHaveLength(3);
+    expect(pickerBlocks("project", "x", [{ label: "g", options: opts(101) }])).toBeNull();
+    expect(pickerBlocks("project", "x", [{ label: "g", options: [] }])).toBeNull();
   });
 });

@@ -16,9 +16,9 @@ try {
   writeFileSync(copy, original, { mode: 0o600 });
   const now = Date.now();
   const state = new StateStore(copy, () => now);
-  state.migrateRecovery();
+  state.save();
   const first = readFileSync(copy);
-  state.migrateRecovery();
+  new StateStore(copy, () => now).save();
   assert.equal(readFileSync(copy).toString(), first.toString(), "migration must be idempotent");
   let expired = 0, recent = 0, invalid = 0, maintenanceFreshened = 0;
   for (const { thread } of state.threadsForCatchup()) {

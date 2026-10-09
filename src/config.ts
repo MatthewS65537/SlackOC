@@ -1,6 +1,7 @@
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { writeFileAtomic } from "./util.js";
 
 export interface SlackocConfig {
   /** xoxb-... */
@@ -9,11 +10,6 @@ export interface SlackocConfig {
   slackAppToken: string;
   /** The single Slack user allowed to drive this bridge. SECURITY INVARIANT. */
   ownerSlackUserId: string;
-  /**
-   * @deprecated Unused at runtime: `slackoc start` always boots with the CLI's
-   * launch cwd as the default project. init still writes this (back-compat).
-   */
-  defaultProjectDir?: string;
   createdAt: string;
 }
 
@@ -32,24 +28,14 @@ export function loadConfig(): SlackocConfig | null {
   }
 }
 
+/** Slack member IDs: U plus at least eight uppercase alphanumerics. */
+export const OWNER_ID_RE = /^U[A-Z0-9]{8,}$/;
+
 export function saveConfig(cfg: SlackocConfig): void {
   mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  // tmp + fsync + rename: a crash mid-write must not leave a truncated token file
+  // Atomic: a crash mid-write must not leave a truncated token file
   // (loadConfig would then report "not set up" with no hint why).
-  const tmp = `${CONFIG_PATH}.tmp`;
-  const fd = openSync(tmp, "w", 0o600);
-  try {
-    writeSync(fd, JSON.stringify(cfg, null, 2));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, CONFIG_PATH);
-  try {
-    chmodSync(CONFIG_PATH, 0o600);
-  } catch {
-    /* best effort */
-  }
+  writeFileAtomic(CONFIG_PATH, JSON.stringify(cfg, null, 2), 0o600);
 }
 
 export function maskToken(token: string): string {

@@ -2,9 +2,9 @@ import type { SocketHealth } from "./socket-supervisor.js";
 import type { SlackocConfig } from "../config.js";
 import { randomBytes } from "node:crypto";
 import { promptAsync, sessionCreate } from "../opencode/client.js";
-import type { ServerPool } from "../opencode/server.js";
+import type { RequestLease, ServerPool } from "../opencode/server.js";
 import type { StateStore, ThreadState } from "../state.js";
-import { execute, type CmdCtx, type PermissionCommands } from "../commands/registry.js";
+import { execute, getCommand, resolveCommandName, type CmdCtx, type PermissionCommands } from "../commands/registry.js";
 import { parseBackslash } from "../commands/parse.js";
 import "../commands/handlers.js"; // registers all commands on import
 import { SessionView, getView, reactLogged, type RenderDeps } from "./render.js";
@@ -12,7 +12,7 @@ import { slackToPlain, truncate } from "../util.js";
 import { canonicalDir } from "../paths.js";
 import { logErr, pushLog } from "../log.js";
 import { abortableFetch } from "../http.js";
-import { classifyRecovery, timestampMicros, type IncomingContext, type RecoveryDecision } from "./recovery-policy.js";
+import { classifyRecovery, prevTs, timestampMicros, type IncomingContext, type RecoveryDecision } from "./recovery-policy.js";
 import {
   MAX_ATTACHMENT_BYTES,
   MAX_IMAGE_DOWNLOAD_BYTES,
@@ -92,6 +92,17 @@ export function claimEvent(channel: string, ts: string): boolean {
   return true;
 }
 
+/**
+ * Which raw `message` events reach the router (app_mention always does).
+ * DMs: everything. Channels/groups/mpims: any THREAD reply — threads born from
+ * a bare command (e.g. \help) have no binding yet, but later prompts there
+ * should still run — plus top-level messages in \listen channels.
+ * Owner-only gating and message/app_mention dedup happen inside the router.
+ */
+export function shouldRouteMessage(e: Pick<SlackMsg, "channel" | "channel_type" | "thread_ts">, isAlwaysOn: (channel: string) => boolean): boolean {
+  return e.channel_type === "im" || !!e.thread_ts || isAlwaysOn(e.channel);
+}
+
 /** What to do with a message arriving in a (possibly hushed) thread. */
 export type HushAction = "proceed" | "ignore" | "unhush";
 
@@ -106,7 +117,7 @@ export function hushAction(
 }
 
 /** Strip <@BOT> (and other) mention tokens; returns the cleaned text. */
-export function cleanMentionText(text: string, botUserId: string): string {
+export function cleanMentionText(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, "").trim();
 }
 
@@ -136,7 +147,7 @@ function checkSubmission(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingAttemp
   const verdict = classifyRecovery({ ts: msg.ts, thread: d.state.getThread(key), receipt: d.state.getReceipt(key, msg.ts),
     now: d.state.now(), context: attempt.context, ownClaim: true,
     canceledThroughTs: d.state.cancellationThrough(key),
-    command: parseBackslash(cleanMentionText(slackToPlain(msg.text ?? ""), d.botUserId))?.name });
+    command: parseBackslash(cleanMentionText(slackToPlain(msg.text ?? "")))?.name });
   if (verdict.decision !== "recover") throw new RecoveryBlocked(verdict);
 }
 
@@ -147,10 +158,11 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps, contex
   if (!msg.user || msg.user !== d.config.ownerSlackUserId) return "ignored";
 
   const threadKey = d.state.threadKey(msg.channel, threadRootTs(msg));
-  const parsed = parseBackslash(cleanMentionText(slackToPlain(msg.text ?? ""), d.botUserId));
+  const parsed = parseBackslash(cleanMentionText(slackToPlain(msg.text ?? "")));
+  const cmd = parsed ? resolveCommandName(parsed.name) : undefined; // canonical, so aliases hit the name checks below
   const existing = d.state.getReceipt(threadKey, msg.ts);
   const verdict = classifyRecovery({ ts: msg.ts, thread: d.state.getThread(threadKey), receipt: existing, context,
-    command: parsed?.name, now: d.state.now(), canceledThroughTs: d.state.cancellationThrough(threadKey) });
+    command: cmd, now: d.state.now(), canceledThroughTs: d.state.cancellationThrough(threadKey) });
   if (verdict.decision !== "recover") {
     if (verdict.reason === "submission_uncertain" && existing?.disposition === "processing") return "processing";
     d.state.recordRecoveryDecision(threadKey, msg.ts, verdict);
@@ -159,11 +171,11 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps, contex
     if (verdict.reason === "submission_uncertain" && existing) return existing.disposition;
     return verdict.decision;
   }
-  const claim = d.state.claimMessage(threadKey, msg.ts, { recoveryCommand: parsed?.name === "restart", source: context.source });
+  const claim = d.state.claimMessage(threadKey, msg.ts, { recoveryCommand: cmd === "restart", source: context.source });
   if (claim !== "claimed") {
     // At hard capacity, status is a read-only escape hatch. Only its Slack reply
     // has best-effort (process-local) dedup; restart NEVER bypasses durable claims.
-    if (claim === "paused" && ["status", "permissions", "help"].includes(parsed?.name ?? "")) {
+    if (claim === "paused" && ["status", "permissions", "help"].includes(cmd ?? "")) {
       if (!claimEvent(msg.channel, msg.ts)) return "ignored";
       await execute(parsed!, buildCtx(msg, d, d.state.getThread(threadKey), context.source));
       return "accepted";
@@ -176,7 +188,7 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps, contex
     d.state.markThreadSeen(threadKey, msg.ts);
     if (context.source === "live" && !parsed) d.state.noteLiveIntent(threadKey);
     const outcome = await processMessage(msg, d, attempt);
-    d.state.initializeHistory(threadKey, msg.ts === threadRootTs(msg) ? previousTs(msg.ts) : threadRootTs(msg));
+    d.state.initializeHistory(threadKey, msg.ts === threadRootTs(msg) ? prevTs(msg.ts) : threadRootTs(msg));
     d.state.markThreadSeen(threadKey, msg.ts);
     if (outcome === "retry") d.state.releaseMessage(threadKey, msg.ts);
     else d.state.settleMessage(threadKey, msg.ts, outcome);
@@ -211,8 +223,9 @@ async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingA
   const explicitMention = raw.includes(`<@${d.botUserId}>`);
   // Slack encodes entities (<, >, &) and wraps links in <url|label> markup —
   // decode BEFORE anything else so prompts AND command args see clean text.
-  let text = cleanMentionText(slackToPlain(raw), d.botUserId);
+  let text = cleanMentionText(slackToPlain(raw));
   const parsed = text ? parseBackslash(text) : null;
+  const cmd = parsed ? resolveCommandName(parsed.name) : undefined; // canonical, so aliases hit the name checks below
 
   // Files attached to this message — images AND text/pdf/json. Key off the
   // files array's presence, not the subtype: newer Slack clients send image
@@ -238,12 +251,12 @@ async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingA
   if (d.schedules?.busy(threadKey)) {
     attempt.effectsStarted = true;
     const ctx = buildCtx(msg, d, thread, attempt.context.source);
-    if (parsed && ["stop", "abort"].includes(parsed.name)) {
+    if (cmd === "stop") {
       await d.schedules.cancelThread(threadKey);
       await ctx.postToThread("Scheduled report canceled. Future occurrences are unchanged.");
       return "accepted";
     }
-    if (!parsed || !["schedule", "permissions", "permission", "questions", "help", "status", "logs", "history", "summary"].includes(parsed.name)) {
+    if (!cmd || !getCommand(cmd)?.duringReport) {
       await ctx.postToThread("This report is still running. Use its approval/question controls, or `\\stop` to cancel; other replies can follow the finished report.");
       return "accepted";
     }
@@ -269,9 +282,9 @@ async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingA
 
   if (parsed) {
     checkSubmission(msg, d, attempt);
-    const replacement = ["new", "unwatch"].includes(parsed.name)
-      || (!!parsed.args && ["cd", "project", "projects", "resume", "watch"].includes(parsed.name));
-    if (replacement || ["stop", "abort"].includes(parsed.name) || (parsed.name === "hush" && !thread?.hushed))
+    const rebinds = getCommand(cmd!)?.rebinds;
+    const replacement = rebinds === "always" || (!!parsed.args && rebinds === "withArgs");
+    if (replacement || cmd === "stop" || (cmd === "hush" && !thread?.hushed))
       d.state.cancelRecovery(threadKey, msg.ts, replacement);
     const ctx = buildCtx(msg, d, thread, attempt.context.source);
     // execute reports failures instead of throwing. Observe its failure reaction
@@ -294,8 +307,27 @@ async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingA
    const fileParts = await downloadAttachments(attachments, msg, d);
   // Every attachment failed to download AND there's no real caption — warnings
   // already posted; a text-only "look at this file" prompt would mislead.
-  if (attachments.length && !fileParts.length && !cleanMentionText(slackToPlain(raw), d.botUserId).trim()) return "accepted";
+  if (attachments.length && !fileParts.length && !cleanMentionText(slackToPlain(raw)).trim()) return "accepted";
   return runPrompt(text, msg, d, attempt, fileParts);
+}
+
+/**
+ * Run a command chosen from a picker card (C1) as if the owner typed it in
+ * that thread. `cardTs` stands in for the message ts (reactions land on the card).
+ */
+export async function runPickedCommand(d: BridgeDeps, channel: string, threadTs: string, cardTs: string, text: string): Promise<void> {
+  const parsed = parseBackslash(text);
+  if (!parsed) return;
+  const threadKey = d.state.threadKey(channel, threadTs);
+  const msg: SlackMsg = { channel, ts: cardTs, thread_ts: threadTs, user: d.config.ownerSlackUserId, text };
+  const ctx = buildCtx(msg, d, d.state.getThread(threadKey));
+  const def = getCommand(resolveCommandName(parsed.name));
+  if (d.schedules?.busy(threadKey) && !def?.duringReport) {
+    await ctx.postToThread("This report is still running — pick again after it finishes.");
+    return;
+  }
+  if (def?.rebinds) d.state.cancelRecovery(threadKey, cardTs, true);
+  await execute(parsed, ctx);
 }
 
 /** Download Slack file attachments and convert to OpenCode data-URI file parts.
@@ -375,10 +407,10 @@ function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = nul
     cwd: d.cwd,
     bridgeInfo: d.bridgeInfo,
     threadUrl: d.threadUrl,
-    postToThread: async (extra) => {
+    postToThread: async (extra, blocks) => {
       // Interactive: command replies are what the user is actively waiting
       // for — they jump ahead of queued background stream traffic (issue #5).
-      await d.render.post(msg.channel, threadTs, extra, undefined, { unfurl: false, lane: "interactive" });
+      await d.render.post(msg.channel, threadTs, extra, blocks, { unfurl: false, lane: "interactive" });
     },
     uploadToThread: async (filename, content) => {
       await d.render.upload({ channelId: msg.channel, threadTs, filename, content, lane: "interactive" });
@@ -408,12 +440,6 @@ function logDecision(msg: SlackMsg, d: BridgeDeps, context: IncomingContext, dec
  */
 const creatingByStore = new WeakMap<StateStore, Map<string, Promise<ThreadState>>>();
 
-/** Older test doubles have ensure only; real pools always reserve a request lease. */
-async function acquire(pool: ServerPool, dir: string) {
-  return typeof pool.acquire === "function" ? pool.acquire(dir)
-    : { entry: await pool.ensure(dir), release: () => {} };
-}
-
 /**
  * New root message → fresh OpenCode session in the current project.
  * Thread reply → continue the bound session (or bind a fresh one).
@@ -441,11 +467,6 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
     return "accepted";
   }
 
-  // 👀 liveness ack — the owner learns the bridge is up and saw their
-  // message even if the run then takes minutes (or fails quietly downstream).
-  // Removed at finalize when ✅/❌ lands (one state per message). Best-effort,
-  // fire-and-forget: it must never delay or fail the run.
-
   let thread = d.state.getThread(threadKey);
 
   if (!thread && creatingThreads.has(threadKey)) {
@@ -456,15 +477,9 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
     if (thread && attempt.context.generation === 0) attempt.context.generation = d.state.bindingGeneration(threadKey);
   }
 
-  // Ack BEFORE any OpenCode work: cold starts (pool ensure + session create)
-  // can take seconds of silence. An active view keeps its own status message;
-  // otherwise the placeholder is posted now and adopted by the new view.
-  let ackTs: string | null = null;
-  // SessionView posts its status independently. Slack latency cannot gate admission.
-
   if (!thread) {
-    // The ack above yielded: another message may have installed the creation
-    // lock while Slack was posting it. Re-check before starting any creation.
+    // Waiting on a leader above yielded: another message may have installed
+    // the creation lock meanwhile. Re-check before starting any creation.
     const creating = creatingThreads.get(threadKey);
     if (creating) {
       await creating.catch(() => null);
@@ -475,9 +490,9 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
   if (d.isStopping?.()) return "retry";
   checkSubmission(msg, d, attempt);
   if (!thread) {
-    const dir = canonicalDir(d.state.currentProjectDir ?? d.cwd);
+    const dir = canonicalDir(attempt.context.projectDir ?? d.state.currentProjectDir ?? d.cwd);
     const create = (async (): Promise<ThreadState> => {
-      const lease = await acquire(d.pool, dir);
+      const lease = await d.pool.acquire(dir);
       try {
         if (d.isStopping?.()) throw new Error("bridge stopping before session creation");
         checkSubmission(msg, d, attempt);
@@ -489,7 +504,7 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
         // Start at the thread boundary; live receipt evidence protects this
         // creating prompt while history can still discover an earlier gap.
         const fresh: ThreadState = { sessionId: sess.id, projectDir: dir, verbose: "on", lastSeenTs: msg.ts,
-          historyCursorTs: threadTs === msg.ts ? previousTs(msg.ts) : threadTs, createdAt: now, lastUsedAt: now };
+          historyCursorTs: threadTs === msg.ts ? prevTs(msg.ts) : threadTs, createdAt: now, lastUsedAt: now };
         d.state.setThread(threadKey, fresh);
         attempt.context.generation = d.state.bindingGeneration(threadKey);
         attempt.effectsStarted = false; // binding is durable; retry can reuse it
@@ -500,22 +515,18 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
     try {
       thread = await create;
     } catch (err) {
-      if (err instanceof RecoveryBlocked) {
-        if (ackTs) await d.render.delete(msg.channel, ackTs).catch(() => {});
-        throw err;
-      }
-      await failBoot(msg, d, ackTs, err);
+      if (!(err instanceof RecoveryBlocked)) await failBoot(msg, d, err);
       throw err;
     } finally {
       creatingThreads.delete(threadKey);
     }
   }
 
-  let lease: Awaited<ReturnType<typeof acquire>>;
+  let lease: RequestLease;
   try {
-    lease = await acquire(d.pool, thread.projectDir);
+    lease = await d.pool.acquire(thread.projectDir);
   } catch (err) {
-    await failBoot(msg, d, ackTs, err);
+    await failBoot(msg, d, err);
     return "retry";
   }
 
@@ -535,27 +546,20 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
         deps: d.render,
         state: d.state,
         threadState: thread,
-        statusTs: ackTs ?? undefined,
       });
-    } else if (ackTs) {
-      await d.render.delete(msg.channel, ackTs).catch(() => {});
     }
     await view.beginPrompt(msg.ts);
     if (d.isStopping?.()) return "retry";
     checkSubmission(msg, d, attempt);
     return await sendPrompt(d, thread, text, entry.client!, threadKey, msg, attempt, fileParts);
-  } catch (err) {
-    if (err instanceof RecoveryBlocked && ackTs) await d.render.delete(msg.channel, ackTs).catch(() => {});
-    throw err;
   } finally { lease.release(); }
 }
 
 /**
  * Cold-start failure (server spawn or session create) — surface it in Slack
- * (status removed, ❌, error line) instead of dying in the console handler.
+ * (👀 cleared, ❌, error line) instead of dying in the console handler.
  */
-async function failBoot(msg: SlackMsg, d: BridgeDeps, ackTs: string | null, err: unknown): Promise<void> {
-  if (ackTs) await d.render.delete(msg.channel, ackTs).catch(() => {});
+async function failBoot(msg: SlackMsg, d: BridgeDeps, err: unknown): Promise<void> {
   await reactLogged(d.render, msg.channel, msg.ts, "eyes", false);
   await reactLogged(d.render, msg.channel, msg.ts, "x");
   await d.render
@@ -598,7 +602,7 @@ async function sendPrompt(
       let reboundSessionId: string | null = null;
       try {
         const dir = thread.projectDir;
-        const lease = await acquire(d.pool, dir);
+        const lease = await d.pool.acquire(dir);
         try {
           checkSubmission(msg, d, attempt);
           const sess = await sessionCreate(lease.entry.client!, truncate(text, 60));
@@ -651,11 +655,4 @@ function newPromptMessageID(): string {
   const now = BigInt(Date.now()) * 0x1000n;
   lastPromptIDTime = now > lastPromptIDTime ? now : lastPromptIDTime + 1n;
   return `msg_${lastPromptIDTime.toString(16).padStart(12, "0")}${randomBytes(7).toString("hex")}`;
-}
-
-function previousTs(ts: string): string {
-  const [seconds, fraction = ""] = ts.split(".");
-  const micros = BigInt(seconds!) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
-  const previous = micros > 0n ? micros - 1n : 0n;
-  return `${previous / 1_000_000n}.${String(previous % 1_000_000n).padStart(6, "0")}`;
 }

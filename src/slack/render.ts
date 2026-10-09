@@ -5,9 +5,9 @@ import type { ConnectionState } from "../opencode/server.js";
 import { canonicalDir } from "../paths.js";
 import { formatTool, safeCodePayload, safePayload } from "./tool-format.js";
 import type { StateStore, ThreadState, VerboseMode } from "../state.js";
-import { viewDiffBlocks } from "./blocks.js";
+import { planText, planTodos, viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
-import { chunkText, dur, mdToMrkdwn, money, shortId, shortPath, tok, truncate } from "../util.js";
+import { chunkText, dur, mdToMrkdwn, money, shortId, tok, truncate } from "../util.js";
 import { laneDepth } from "./queue.js";
 import type { SlackLane } from "./queue.js";
 import { classifyPendingRun, replayAge } from "./recovery-policy.js";
@@ -89,6 +89,12 @@ export function errorMessage(err: unknown, fallback = "unknown session error"): 
   return fallback;
 }
 
+/** Status-line text for a provider retry; `next` (epoch ms) adds a countdown when known. */
+export function retryActivity(st: { message?: string; attempt?: number; next?: number }, now: number): string {
+  const wait = st.next && st.next > now ? ` in ${Math.ceil((st.next - now) / 1000)}s` : "";
+  return `↻ retrying${wait}${st.message ? `: ${safePayload(truncate(st.message, 60))}` : ""} (attempt ${st.attempt ?? "?"})`;
+}
+
 /** Only structured Slack errors prove a missing message; network errors don't. */
 function messageNotFound(err: unknown): boolean {
   const e = err as { data?: { error?: string }; code?: string } | undefined;
@@ -125,7 +131,7 @@ export function deleteView(sessionId: string): void {
 
 /**
  * True while a live view (finalized views leave the registry) is bound to a
- * project dir — the idle reaper spares servers with active work.
+ * project dir.
  */
 export function hasActiveViewForProject(dir: string): boolean {
   dir = canonicalDir(dir);
@@ -220,6 +226,19 @@ export interface SessionViewOpts {
  * (alternating ⏳/⌛ + ticking elapsed — Slack chat.update tolerates ~1/s);
  * finished text parts post as their own thread replies.
  */
+/** A message edited in place as its text changes (plan card, subagent lanes). */
+interface LiveCard { ts: string | null; text: string; shown: string; at: number; timer: NodeJS.Timeout | null }
+interface Lane { card: LiveCard; title: string; startedAt: number; tools: Set<string>; lastText: string; done: boolean; error?: string }
+
+/** One subagent lane line (A2): name, tool count, elapsed, then its result once done. */
+export function laneText(l: { title: string; startedAt: number; tools: { size: number }; lastText: string; done: boolean; error?: string }, now: number): string {
+  const head = `🤖 *${safePayload(truncate(l.title || "subagent", 80))}* · ${l.tools.size} tool${l.tools.size === 1 ? "" : "s"} · ${dur(now - l.startedAt)}`;
+  if (l.error) return `${head} · ⚠️ ${safePayload(truncate(l.error, 200))}`;
+  if (!l.done) return `${head} · working…`;
+  const result = l.lastText.replace(/\s+/g, " ").trim();
+  return `${head} · done${result ? `\n> ${safePayload(truncate(result, 200))}` : ""}`;
+}
+
 export class SessionView {
   sessionId: string;
   private readonly client: OCClient;
@@ -261,6 +280,8 @@ export class SessionView {
    * buffer pressure, the 1.5s deadline, or finalize.
    */
   private readonly toolBuf: string[] = [];
+  private plan: LiveCard | null = null;
+  private readonly lanes = new Map<string, Lane>();
   private toolCalls = 0;
   /**
    * Section currently being appended to (⎯ tools ⎯ / ⎯ response ⎯). Dividers
@@ -268,7 +289,6 @@ export class SessionView {
    * divider re-posts every time the stream flips sections — not once per run.
    */
   private lastSection: "tools" | "response" | null = null;
-  private readonly files = new Set<string>();
   private activity = "starting…";
   /**
    * 1s live-status ticker. The status message re-renders every second while a
@@ -413,6 +433,7 @@ export class SessionView {
     if (this.ticker) clearInterval(this.ticker);
     if (this.watchdog) clearTimeout(this.watchdog);
     this.ticker = this.watchdog = null;
+    for (const card of this.liveCards()) if (card.timer) { clearTimeout(card.timer); card.timer = null; }
   }
 
   /** Detach immediately; in-flight status posts clean themselves up on arrival. */
@@ -700,7 +721,7 @@ export class SessionView {
     if (this.finalized || this.disposed) return;
     this.generation++;
     this.attached = true;
-    this.active = true; // \status "runs in flight" + the idle reaper's busy check
+    this.active = true; // \status "runs in flight"
     this.runStartedAt = Date.now();
     this.lastEventAt = this.runStartedAt;
     this.activity = "driven on the computer…";
@@ -861,7 +882,7 @@ export class SessionView {
    * until the queue drains and emit a single idle. Correct under both:
    * decrement the count; when prompts are still outstanding, start an 8s
    * grace window that only a genuinely new run signal cancels (beginPrompt,
-   * session.status busy, step-start — trailing bookkeeping events must NOT
+   * session.status busy — trailing bookkeeping events must NOT
    * stall the grace forever). Quiet expiry means the queue really drained.
    */
   private async onIdle(): Promise<void> {
@@ -900,6 +921,42 @@ export class SessionView {
     return run;
   }
 
+  /**
+   * Events from a subagent (child session) of this run roll up into one lane
+   * line per child. Child activity counts as liveness for the stall watchdog.
+   */
+  handleChild(childId: string, title: string, ev: OcEvent): Promise<void> {
+    if (this.finalized || this.disposed) return Promise.resolve();
+    this.lastEventAt = Date.now();
+    this.stalled = false;
+    const run = this.tail.then(() => this.childInner(childId, title, ev))
+      .catch(err => logErr(`subagent lane error (${childId}): ${errorMessage(err)}`));
+    this.tail = run.then(() => {}, () => {});
+    return run;
+  }
+
+  private async childInner(childId: string, title: string, ev: OcEvent): Promise<void> {
+    if (this.finalized || this.disposed) return;
+    let lane = this.lanes.get(childId);
+    if (!lane) this.lanes.set(childId, lane = { card: newCard(), title, startedAt: Date.now(), tools: new Set(), lastText: "", done: false });
+    if (lane.done) return;
+    const props = (ev.properties ?? {}) as Record<string, unknown>;
+    const part = props.part as OcPart | undefined;
+    if (ev.type === "message.part.updated" && part?.type === "tool" && part.state?.status !== "pending") {
+      const callId = part.callID ?? part.id;
+      if (!lane.tools.has(callId)) {
+        lane.tools.add(callId);
+        const line = formatTool(part, this.projectDir);
+        this.activityUpdate(`🤖 ${truncate(lane.title, 40)}: ${line}`);
+        if (this.verbose === "full") this.bufferLine(`↳ ${line}`);
+      }
+    } else if (ev.type === "message.part.updated" && part?.type === "text" && part.text) lane.lastText = part.text;
+    else if (ev.type === "session.idle" || (ev.type === "session.status" && (props.status as { type?: string } | undefined)?.type === "idle")) lane.done = true;
+    else if (ev.type === "session.error") { lane.done = true; lane.error = errorMessage(props.error); }
+    else return;
+    await this.showCard(lane.card, laneText(lane, Date.now()), 3_000, lane.done);
+  }
+
   private async handleInner(ev: OcEvent): Promise<void> {
     if (this.finalized || this.disposed) return;
     this.lastEventAt = Date.now();
@@ -931,9 +988,6 @@ export class SessionView {
           // Reasoning streams silently: no post, no divider — the response
           // divider must only appear when real non-reasoning content shows.
           this.activityUpdate("💭 reasoning…");
-        } else if (part.type === "step-start") {
-          this.cancelIdleGrace(); // unambiguous "a queued run started" signal
-          this.activityUpdate("🧠 thinking…");
         }
         return;
       }
@@ -958,13 +1012,22 @@ export class SessionView {
         return;
       }
       case "session.status": {
-        const st = props.status as { type?: string; message?: string; attempt?: number } | undefined;
+        const st = props.status as { type?: string; message?: string; attempt?: number; next?: number } | undefined;
         if (!st?.type) return;
         if (st.type === "busy") {
           this.cancelIdleGrace(); // a queued run took over before the grace expired
           this.activityUpdate("working…");
-        } else if (st.type === "retry") this.activityUpdate(`retrying${st.message ? `: ${safePayload(truncate(st.message, 60))}` : ""} (attempt ${st.attempt ?? "?"})`);
+        } else if (st.type === "retry") this.activityUpdate(retryActivity(st, Date.now()));
         else if (st.type === "idle") await this.onIdle();
+        return;
+      }
+      case "session.compaction": {
+        if (props.phase === "started") this.activityUpdate("🗜 compacting context…");
+        else {
+          this.activityUpdate("working…");
+          this.bufferLine(props.phase === "ended" ? "🗜 context compacted"
+            : `⚠️ context compaction failed: ${safePayload(truncate(String(props.error ?? "unknown error"), 120))}`);
+        }
         return;
       }
       case "session.idle":
@@ -973,13 +1036,6 @@ export class SessionView {
       case "session.error":
         await this.finalizeInner(errorMessage(props.error)); // in-chain
         return;
-      case "file.edited": {
-        if (typeof props.file === "string") {
-          this.files.add(props.file);
-          this.activityUpdate(`edited ${safePayload(shortPath(props.file))}`);
-        }
-        return;
-      }
       default:
         return;
     }
@@ -1190,8 +1246,13 @@ export class SessionView {
     const callId = part.callID ?? part.id;
     if (this.postedToolStarts.has(callId)) return;
     this.postedToolStarts.add(callId);
+    this.bufferLine(formatTool(part, this.projectDir));
+  }
+
+  /** Queue one compact line into the tool batch (flushed after 1.5s, at size, or before answers). */
+  private bufferLine(line: string): void {
     if (this.verbose === "off") return;
-    this.toolBuf.push(formatTool(part, this.projectDir));
+    this.toolBuf.push(line);
     if (this.toolTimer) return;
     const timer = setTimeout(() => {
       // Keep the token until the serialized flush executes: new items never
@@ -1212,6 +1273,11 @@ export class SessionView {
 
   private async handleTool(part: OcPart): Promise<void> {
     const st = part.state ?? {};
+    const todos = part.tool === "todowrite" ? planTodos(st.input) : null;
+    if (todos?.length) {
+      this.activityUpdate("📋 updating plan…");
+      return this.showCard(this.plan ??= newCard(), planText(todos), 2_000);
+    }
     const callId = part.callID ?? part.id;
     const title = this.toolTitle(part);
     if (this.terminalTools.has(callId)) return;
@@ -1277,6 +1343,43 @@ export class SessionView {
       default:
         return;
     }
+  }
+
+  private liveCards(): LiveCard[] {
+    return [...(this.plan ? [this.plan] : []), ...[...this.lanes.values()].map(l => l.card)];
+  }
+
+  /** Post the card once, then edit it in place at most once per `gapMs` (or right away when `now`). */
+  private async showCard(card: LiveCard, text: string, gapMs: number, now = false): Promise<void> {
+    card.text = text;
+    if (this.disposed || text === card.shown) return;
+    if (!card.ts) {
+      await this.flushTools(); // earlier tool lines stay above the card
+      if (this.disposed) return;
+      card.shown = text;
+      card.at = Date.now();
+      card.ts = (await this.deps.post(this.channel, this.threadTs, text, undefined, { unfurl: false })).ts;
+      this.contentBelow = true;
+      this.maybeSink();
+      return;
+    }
+    if (now) return this.syncCard(card);
+    if (card.timer) return;
+    card.timer = setTimeout(() => {
+      const run = this.tail.then(() => this.syncCard(card));
+      this.tail = run.then(() => {}, () => {});
+    }, Math.max(0, card.at + gapMs - Date.now()));
+    card.timer.unref();
+  }
+
+  private async syncCard(card: LiveCard): Promise<void> {
+    if (card.timer) clearTimeout(card.timer);
+    card.timer = null;
+    if (!card.ts || this.disposed || card.text === card.shown) return;
+    card.shown = card.text;
+    card.at = Date.now();
+    await this.deps.update(this.channel, card.ts, card.text)
+      .catch(err => logErr(`live card update failed (${this.sessionId}): ${errorMessage(err)}`));
   }
 
   private extractOutput(st: { output?: unknown; metadata?: Record<string, unknown> }): unknown {
@@ -1430,6 +1533,7 @@ export class SessionView {
     }
     this.outstandingPrompts = 0;
     await this.flushTools().catch((error) => logErr(`final tool flush failed (${this.sessionId}): ${errorMessage(error)}`));
+    for (const card of this.liveCards()) await this.syncCard(card); // land throttled plan/lane edits
 
     // Delivery backstop: the SSE stream can drop the final text part (or its
     // post can be silently lost), so pull the session's messages and post any
@@ -1488,8 +1592,6 @@ export class SessionView {
     if (proj) bits.push(`*${safePayload(proj)}*`);
     if (summary && (summary.additions || summary.deletions || summary.files)) {
       bits.push(`+${summary.additions}/−${summary.deletions} across ${summary.files} file(s)`);
-    } else if (this.files.size) {
-      bits.push(`${this.files.size} file(s) touched`);
     }
     if (model) bits.push(`\`${safePayload(model)}\``);
     bits.push(dur(Date.now() - this.runStartedAt));
@@ -1518,7 +1620,9 @@ export class SessionView {
     if (this.disposed) return;
     const summaryLine = err ? `:x: ${safePayload(truncate(err, 200))}` : bits.length ? bits.join(" · ") : null;
     if (summaryLine) {
-      await this.deps.post(this.channel, this.threadTs, summaryLine, undefined, { unfurl: false }).catch(async (postErr) => {
+      // D1: a run that edited files gets an in-thread "View changes" button.
+      const blocks = !err && summary?.files ? viewDiffBlocks(summaryLine, this.sessionId) : undefined;
+      await this.deps.post(this.channel, this.threadTs, summaryLine, blocks, { unfurl: false }).catch(async (postErr) => {
         logErr(`run summary post failed (${this.sessionId}): ${String((postErr as Error)?.message ?? postErr)}`);
         await this.deps
           .dm?.(this.channel, this.threadTs, `:warning: couldn't post the run's final line in-thread (Slack error) — outcome: ${truncate(summaryLine, 300)}`)
@@ -1539,8 +1643,7 @@ export class SessionView {
             this.channel,
             this.threadTs,
             dmText,
-            // RF1: one-tap diff straight from the completion DM (handled by
-            // the "view_diff" action in start.ts).
+            // RF1: one-tap diff straight from the completion DM (diff-view.ts).
             viewDiffBlocks(dmText, this.sessionId),
           );
         }
@@ -1562,4 +1665,8 @@ export function paragraphCut(text: string): number {
     else if (!inFence) cut = m.index + m[0].length;
   }
   return cut;
+}
+
+function newCard(): LiveCard {
+  return { ts: null, text: "", shown: "", at: 0, timer: null };
 }

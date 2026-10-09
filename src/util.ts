@@ -1,3 +1,31 @@
+import { randomUUID } from "node:crypto";
+import { chmodSync, closeSync, existsSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+
+/**
+ * Unique tmp + fsync + rename: a crash mid-write can corrupt only the tmp file, never `path`.
+ * The tmp is created 0600 (`wx`); `mode`, when given, is also forced on the result.
+ */
+export function writeFileAtomic(path: string, data: string, mode?: number): void {
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmp, "wx", mode ?? 0o600);
+    writeFileSync(fd, data);
+    fsyncSync(fd);
+    closeSync(fd); fd = undefined;
+    renameSync(tmp, path);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    if (existsSync(tmp)) unlinkSync(tmp);
+  }
+  if (mode !== undefined) try { chmodSync(path, mode); } catch { /* best effort */ }
+}
+
+/** A message's text parts joined by newlines and trimmed (tool/file parts ignored). */
+export function partsText(parts: ReadonlyArray<{ type: string; text?: unknown }> | undefined): string {
+  return (parts ?? []).filter(p => p.type === "text" && typeof p.text === "string").map(p => p.text).join("\n").trim();
+}
+
 export function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, Math.max(0, n - 1)) + "…";
 }

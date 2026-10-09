@@ -3,7 +3,7 @@ import { automaticRunId, isGenerationActive, isTerminalRun, type ScheduleRun, ty
 
 export const SCHEDULE_GRACE_MS = 2 * 60 * 60 * 1000;
 
-export interface SchedulerOptions {
+interface SchedulerOptions {
   store: ScheduleStore;
   /** One bounded state-machine step, including reconciliation of ambiguous effects. */
   tickRun: (run: ScheduleRun) => Promise<void>;

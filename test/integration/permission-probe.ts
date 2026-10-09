@@ -70,13 +70,13 @@ try {
     let ask: Awaited<ReturnType<typeof pendingPermissions>>[number] | undefined;
     const until = Date.now() + 45_000;
     while (!ask && Date.now() < until) {
-      ask = (await pendingPermissions(url)).find(p => p.sessionID === session.id);
+      ask = (await pendingPermissions(client)).find(p => p.sessionID === session.id);
       if (!ask) await sleep(100);
     }
     if (!ask) throw new Error(`No permission ask: ${JSON.stringify(await sessionMessages(client, session.id))}\n${output}`);
     assert.equal(ask.type, "bash");
     await permRespond(client, session.id, ask.id, choice);
-    assert.equal((await pendingPermissions(url)).some(p => p.id === ask!.id), false);
+    assert.equal((await pendingPermissions(client)).some(p => p.id === ask!.id), false);
     let tool: { state?: { status: string; output?: string; error?: string } } | undefined;
     const doneBy = Date.now() + 10_000;
     while (Date.now() < doneBy) {

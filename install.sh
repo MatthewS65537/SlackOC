@@ -73,7 +73,10 @@ npm -C "$SRC" ci --no-audit --no-fund --loglevel=error
 npm -C "$SRC" run build --silent
 
 echo "→ installing slackoc globally"
-npm install -g "$SRC" --no-audit --no-fund --loglevel=error || \
+# Install a packed tarball: `npm install -g <folder>` symlinks the folder, which
+# the EXIT trap deletes.
+TGZ="$(npm -C "$SRC" pack --pack-destination "$WORK" --silent | tail -n 1)"
+npm install -g "$WORK/$TGZ" --no-audit --no-fund --loglevel=error || \
   fail "global install failed — if this was EACCES, fix your npm prefix: https://docs.npmjs.com/resolving-eacces-permissions-errors"
 
 command -v slackoc >/dev/null 2>&1 || \

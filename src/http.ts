@@ -1,6 +1,5 @@
 /** Deadlines cover response bodies too; abort always reaches the actual transport. */
 export const HTTP_TIMEOUT_MS = 30_000;
-export const HEALTH_TIMEOUT_MS = 5_000;
 export const COMMAND_TIMEOUT_MS = 120_000;
 
 export interface RequestOptions {

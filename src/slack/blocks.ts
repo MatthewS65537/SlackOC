@@ -3,7 +3,7 @@ import type { OcPermission, OcQuestionRequest } from "../opencode/api.js";
 import { esc, truncate } from "../util.js";
 import { unicodeEmoji } from "./emoji.js";
 
-export const SLACK_SECTION_LIMIT = 3000;
+const SLACK_SECTION_LIMIT = 3000;
 export const PERMISSION_ACTIONS = ["perm_once", "perm_always", "perm_reject"] as const;
 export const QUESTION_ACTION_PATTERN = /^(?:question|question_skip|question_\d+_\d+)$/;
 
@@ -40,10 +40,10 @@ export function validPermissionId(id: unknown): id is string {
   return typeof id === "string" && /^[A-Za-z0-9_-]{1,255}$/.test(id);
 }
 
-/** Action id for the completion-DM "View diff" button (handled in start.ts). Value = sessionId. */
+/** Action id for the "View changes" button (finalize line, \diff, completion DMs) — opens the diff modal in diff-view.ts. Value = sessionId. */
 export const VIEW_DIFF_ACTION = "view_diff";
 
-/** Completion-DM blocks: the summary section plus a one-tap diff buttons row. The plain-text arg carries the same content for notifications/fallback. */
+/** A summary section plus a one-tap "View changes" button. The plain-text arg carries the same content for notifications/fallback. */
 export function viewDiffBlocks(text: string, sessionId: string): unknown[] {
   return [
     { type: "section", text: { type: "mrkdwn", text } },
@@ -53,7 +53,7 @@ export function viewDiffBlocks(text: string, sessionId: string): unknown[] {
       elements: [
         {
           type: "button",
-          text: { type: "plain_text", text: "📄 View diff" },
+          text: { type: "plain_text", text: "📄 View changes" },
           action_id: VIEW_DIFF_ACTION,
           value: sessionId,
         },
@@ -66,7 +66,7 @@ export interface PermButtonValue {
   s: string; // sessionId
   p: string; // permissionId
   r: "once" | "always" | "reject";
-  g?: number; // binding generation, omitted only on legacy cards
+  g: number; // binding generation
 }
 
 function permissionSummary(perm: OcPermission): string {
@@ -82,27 +82,26 @@ function permissionSummary(perm: OcPermission): string {
   return boundedSection(unicodeEmoji(lines.join("\n")));
 }
 
-export function permissionCommands(id: string): string {
+function permissionCommands(id: string): string {
   if (!validPermissionId(id)) return "Use `\\permissions` to inspect this request; its ID cannot be used in a reply command.";
   return `Reply \`\\permission ${id} once\` to approve once, \`\\permission ${id} deny\` to deny, or \`\\permission ${id} always\` for persistent approval.\nUse \`\\permissions\` to list pending requests.`;
 }
 
 /** Text-only post body, including usable exact commands even if the card failed. */
-export function permissionFallbackText(perm: OcPermission, threadLink?: string): string {
-  const suffix = `\nRequest: ${esc(boundedSection(perm.id, 255))}\n${permissionCommands(perm.id)}` +
-    (threadLink ? `\n${boundedSection(threadLink, 500)}` : "");
+export function permissionFallbackText(perm: OcPermission): string {
+  const suffix = `\nRequest: ${esc(boundedSection(perm.id, 255))}\n${permissionCommands(perm.id)}`;
   return boundedSection(permissionSummary(perm), SLACK_SECTION_LIMIT - suffix.length) + suffix;
 }
 
-export function permissionBlocks(perm: OcPermission, generation?: number): unknown[] {
+export function permissionBlocks(perm: OcPermission, generation: number): unknown[] {
   if (!validPermissionId(perm.id) || !validPermissionId(perm.sessionID)) throw new Error("Invalid permission identity");
-  if (generation !== undefined && (!Number.isSafeInteger(generation) || generation < 0)) throw new Error("Invalid permission generation");
+  if (!Number.isSafeInteger(generation) || generation < 0) throw new Error("Invalid permission generation");
   const mk = (label: string, style: string | undefined, r: PermButtonValue["r"]) => ({
     type: "button",
     text: { type: "plain_text", text: label },
     ...(style ? { style } : {}),
     action_id: `perm_${r}`,
-    value: buttonValue({ s: perm.sessionID, p: perm.id, r, ...(generation === undefined ? {} : { g: generation }) } satisfies PermButtonValue),
+    value: buttonValue({ s: perm.sessionID, p: perm.id, r, g: generation } satisfies PermButtonValue),
   });
 
   return [
@@ -135,7 +134,7 @@ export interface QuestionButtonValue {
   q: string; // requestId
   i: number; // question index
   a: number; // option index, or -1 for Skip (reject)
-  g?: number; // binding generation, omitted only on legacy cards
+  g?: number; // binding generation; questionGuard rejects cards without it
   b?: string; // full binding token; generations are thread-local
   c?: number; // question-card presentation, separate from binding generation
 }
@@ -145,7 +144,7 @@ export interface QuestionActionValue {
   s: string; // sessionId
   q: string; // requestId
   i: number; // question index
-  g?: number; // binding generation, omitted only on legacy cards
+  g?: number; // binding generation; questionGuard rejects cards without it
   b?: string;
   c?: number;
 }
@@ -290,4 +289,65 @@ export function questionBlocks(req: OcQuestionRequest, answers: string[][], fina
   }
   if (blocks.length > 50) throw new Error("Question card exceeds Slack's 50-block limit");
   return blocks;
+}
+
+export interface PlanTodo { content: string; status: string }
+
+/** The todos array from a `todowrite` call's input, or null when it isn't one. */
+export function planTodos(input: unknown): PlanTodo[] | null {
+  const todos = (input as { todos?: unknown } | undefined)?.todos;
+  if (!Array.isArray(todos)) return null;
+  return todos.flatMap(t => t && typeof t === "object" && typeof (t as PlanTodo).content === "string"
+    ? [{ content: (t as PlanTodo).content, status: String((t as PlanTodo).status ?? "pending") }] : []);
+}
+
+const PLAN_GLYPH: Record<string, string> = { completed: "☑", in_progress: "◐", cancelled: "☒" };
+
+/** Live plan card (A1): a "3 of 5" header over ☐ / ◐ / ☑ rows; cancelled rows are struck through. */
+export function planText(todos: PlanTodo[], max = 30): string {
+  const done = todos.filter(t => t.status === "completed").length;
+  const rows = todos.slice(0, max).map(t => {
+    const text = esc(truncate(t.content.replace(/\s+/g, " ").trim(), 150));
+    const shown = t.status === "in_progress" ? `*${text}*` : t.status === "cancelled" ? `~${text}~` : text;
+    return `${PLAN_GLYPH[t.status] ?? "☐"} ${shown}`;
+  });
+  if (todos.length > max) rows.push(`_…and ${todos.length - max} more_`);
+  return [`📋 *Plan* · ${done} of ${todos.length} done`, ...rows].join("\n");
+}
+
+export const PICK_ACTION_PATTERN = /^pick_(model|agent|project|session)$/;
+export interface PickOption { text: string; value: string }
+
+/**
+ * Dropdown card (C1) above a command's numbered list. Each option's value is
+ * the command it runs. Null past Slack's 100-option cap: the text list stays.
+ */
+export function pickerBlocks(kind: "agent" | "project" | "session", prompt: string,
+  groups: Array<{ label: string; options: PickOption[] }>, current?: string): unknown[] | null {
+  const fit = groups.map(g => ({ label: g.label, options: g.options.filter(o => o.value.length <= 150) })).filter(g => g.options.length);
+  const total = fit.reduce((n, g) => n + g.options.length, 0);
+  if (!total || total > 100) return null;
+  const opt = (o: PickOption) => ({ text: { type: "plain_text", text: truncate(o.text, 75) }, value: o.value });
+  const initial = fit.flatMap(g => g.options).find(o => o.value === current);
+  const select = {
+    type: "static_select", action_id: `pick_${kind}`, placeholder: { type: "plain_text", text: `Choose a ${kind}` },
+    ...(fit.length > 1
+      ? { option_groups: fit.map(g => ({ label: { type: "plain_text", text: truncate(g.label, 75) }, options: g.options.map(opt) })) }
+      : { options: fit[0]!.options.map(opt) }),
+    ...(initial ? { initial_option: opt(initial) } : {}),
+  };
+  return [{ type: "section", text: { type: "mrkdwn", text: prompt }, accessory: select }];
+}
+
+/**
+ * `\model` card: a type-ahead external_select whose options come from the
+ * `pick_model` options handler (pickers.ts). Selection runs through the shared
+ * PICK_ACTION_PATTERN handler like every other picker card.
+ */
+export function modelSearchBlocks(prompt: string, initialOption?: unknown): unknown[] {
+  return [{ type: "section", text: { type: "mrkdwn", text: prompt }, accessory: {
+    type: "external_select", action_id: "pick_model", min_query_length: 0,
+    placeholder: { type: "plain_text", text: "Search models…" },
+    ...(initialOption ? { initial_option: initialOption } : {}),
+  } }];
 }

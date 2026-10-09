@@ -185,6 +185,13 @@ export class V2Events {
         if (this.idle.has(event.data.sessionID)) return [];
         this.idle.add(event.data.sessionID);
         return emit("session.idle", { sessionID: event.data.sessionID });
+      // Pauses that otherwise look like a frozen run: surface them in the status line.
+      case "session.compaction.started": return emit("session.compaction", { sessionID: event.data.sessionID, phase: "started" });
+      case "session.compaction.ended": return emit("session.compaction", { sessionID: event.data.sessionID, phase: "ended" });
+      case "session.compaction.failed":
+        return emit("session.compaction", { sessionID: event.data.sessionID, phase: "failed", error: event.data.error.message });
+      case "session.retry.scheduled": return emit("session.status", { sessionID: event.data.sessionID,
+        status: { type: "retry", attempt: event.data.attempt, message: event.data.error.message, next: event.data.at } });
       case "session.execution.failed": return emit("session.error", { sessionID: event.data.sessionID, error: event.data.error.message });
       case "session.execution.interrupted": return emit("session.error", { sessionID: event.data.sessionID, error: "Run interrupted" });
       default: return [];

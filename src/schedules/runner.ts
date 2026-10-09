@@ -4,11 +4,11 @@ import type { OCClient } from "../opencode/api.js";
 import { pendingPermissions, pendingQuestions, promptAsync, sessionAbort, sessionIdle, sessionMessages } from "../opencode/client.js";
 import type { ServerPool } from "../opencode/server.js";
 import { canonicalDir } from "../paths.js";
-import type { ScheduleJob, ScheduleRun, ScheduleStore } from "./store.js";
+import { partsText } from "../util.js";
+import { isRateLimited, retryAfterSeconds, SLACK_ACCESS_ERRORS, SLACK_PAYLOAD_ERRORS } from "../slack/transport.js";
+import { MAX_SCHEDULE_OUTPUT_BYTES, TERMINAL_RUN_STATUSES, type ScheduleJob, type ScheduleRun, type ScheduleStore } from "./store.js";
 
-export const MAX_REPORT_BYTES = 64 * 1024;
 const DEADLINE = "Report runtime deadline exceeded";
-const TERMINAL = new Set<ScheduleRun["status"]>(["delivered", "failed", "canceled", "skipped"]);
 
 /** Native V2 rules are last-match-wins. Unknown tools/MCP actions stay denied. */
 export function reportPermissions(): PermissionRuleset {
@@ -48,7 +48,7 @@ export interface ReportRunnerOptions {
   notify(run: ScheduleRun, text: string): Promise<void>;
   /** Called after durable delivered transition. Idempotent binding of the confirmed
    * report thread; do not remove unrelated bindings. Pending work survives failure. */
-  onDelivered?(run: ScheduleRun): Promise<void>;
+  onDelivered(run: ScheduleRun): Promise<void>;
 }
 
 class Stopped extends Error {}
@@ -63,25 +63,21 @@ function errorText(error: unknown): string {
 }
 
 const SLACK_REJECTIONS = new Set([
-  "invalid_blocks", "msg_too_long", "invalid_arguments", "invalid_arg_name", "invalid_auth", "not_authed",
-  "token_revoked", "account_inactive", "missing_scope", "channel_not_found", "not_in_channel", "is_archived",
-  "no_permission", "restricted_action", "org_login_required", "team_access_not_granted", "ekm_access_denied",
-  "user_not_found", "user_disabled", "method_not_supported_for_channel", "message_not_found", "cant_update_message",
-  "cannot_reply_to_message", "thread_not_found", "restricted_action_read_only_channel", "restricted_action_thread_only_channel",
+  ...SLACK_PAYLOAD_ERRORS, ...SLACK_ACCESS_ERRORS,
+  "invalid_arguments", "invalid_arg_name", "message_not_found", "cant_update_message",
 ]);
 
 /** Non-rate-limit rejections are terminal after this many delivery attempts. */
 const PERMANENT_REJECTION_ATTEMPTS = 5;
 
 function rateLimited(error: unknown): boolean {
-  const e = error as { code?: string; statusCode?: number; data?: { error?: string } } | undefined;
-  return e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 || e?.data?.error === "ratelimited";
+  return isRateLimited(error) || (error as { data?: { error?: string } } | undefined)?.data?.error === "ratelimited";
 }
 
 /** A transport error, 5xx, or unfamiliar Slack error is not proof of rejection. */
 function definiteDeliveryRejection(error: unknown): boolean {
-  const e = error as { code?: string; statusCode?: number; data?: { ok?: boolean; error?: string } } | undefined;
-  return e?.code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 ||
+  const e = error as { data?: { ok?: boolean; error?: string } } | undefined;
+  return isRateLimited(error) ||
     (e?.data?.ok === false && (e.data.error === "ratelimited" || SLACK_REJECTIONS.has(e.data.error ?? "")));
 }
 
@@ -110,12 +106,12 @@ function completedReport(messages: Transcript, run: ScheduleRun): { output?: str
     (row.info.parentID === run.messageId || (row.info.parentID === undefined && index > userIndex)))
     .flatMap(row => row.parts).filter(part => part.type === "tool");
   if (tools.some(part => part.state?.status !== "completed" && part.state?.status !== "error")) return;
-  const text = tail.parts.filter(part => part.type === "text" && typeof part.text === "string").map(part => part.text).join("\n").trim();
+  const text = partsText(tail.parts);
   if (!text) return { error: "Report completed without a final text response" };
   if (text.includes("\0")) return { error: "Report text contains an unsupported null character" };
   // Drop an incomplete UTF-8 code point rather than exceeding the byte cap.
   const bytes = Buffer.from(text);
-  let end = Math.min(bytes.length, MAX_REPORT_BYTES);
+  let end = Math.min(bytes.length, MAX_SCHEDULE_OUTPUT_BYTES);
   while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
   const output = bytes.subarray(0, end).toString("utf8").trimEnd();
   return { output };
@@ -152,7 +148,7 @@ export class ReportRunner {
         const current = this.current(run.id);
         if (current.status === "delivered" && current.deliveryBindingPending) { await this.finishBinding(current.id); return; }
         if (current.status === "failed") { await this.notifyFailure(current.id); return; }
-        if (TERMINAL.has(current.status)) return;
+        if (TERMINAL_RUN_STATUSES.has(current.status)) return;
         this.check(run.id);
         switch (current.status) {
           case "claimed": await this.withClient(run.id, client => this.create(run.id, client)); break;
@@ -176,7 +172,7 @@ export class ReportRunner {
         if (error instanceof DeadlineExceeded) await this.expire(run.id);
         else {
           const current = this.options.store.run(run.id);
-          if (!current || this.options.signal?.aborted || TERMINAL.has(current.status)) return;
+          if (!current || this.options.signal?.aborted || TERMINAL_RUN_STATUSES.has(current.status)) return;
           this.update(run.id, r => {
             if (error instanceof PolicyError) r.status = "failed";
             else if (r.status === "submitting") r.status = "uncertain";
@@ -193,7 +189,7 @@ export class ReportRunner {
   /** Cancellation is durable before interrupting, including during an awaited request. */
   async cancel(runId: string): Promise<void> {
     const run = this.options.store.run(runId);
-    if (!run || TERMINAL.has(run.status)) return;
+    if (!run || TERMINAL_RUN_STATUSES.has(run.status)) return;
     this.update(runId, r => { r.status = "canceled"; r.error = "Canceled by owner"; });
     this.controllers.get(runId)?.abort(new Stopped());
     if (!run.sessionId || this.options.signal?.aborted) return;
@@ -224,7 +220,7 @@ export class ReportRunner {
 
   private active(id: string): ScheduleRun {
     const run = this.current(id);
-    if (TERMINAL.has(run.status)) throw new Stopped();
+    if (TERMINAL_RUN_STATUSES.has(run.status)) throw new Stopped();
     return run;
   }
 
@@ -350,9 +346,7 @@ export class ReportRunner {
       }
       this.update(id, r => { r.status = rejected ? "ready" : "uncertain"; r.error = `Saved report delivery ${rejected ? "was rejected" : "is unconfirmed"}: ${errorText(error)}`; });
       if (rejected) {
-        const retry = error as { retryAfter?: number; data?: { retry_after?: number } };
-        const seconds = retry?.retryAfter ?? retry?.data?.retry_after;
-        const rateDelay = typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+        const rateDelay = (retryAfterSeconds(error) ?? 0) * 1000;
         this.retries.set(id, { attempts, at: this.now() + Math.max(rateDelay, Math.min(60_000, 2_000 * 2 ** Math.min(attempts - 1, 5))) });
       }
       return;
@@ -378,18 +372,16 @@ export class ReportRunner {
     }
     this.update(id, r => {
       r.delivery = copy; r.status = "delivered"; delete r.error;
-      if (this.options.onDelivered) r.deliveryBindingPending = true;
-      else delete r.deliveryBindingPending;
+      r.deliveryBindingPending = true;
     });
     this.retries.delete(id);
-    if (this.options.onDelivered) await this.finishBinding(id);
+    await this.finishBinding(id);
   }
 
   private async finishBinding(id: string): Promise<void> {
     const run = this.current(id);
     if (run.status !== "delivered" || !run.deliveryBindingPending || !run.delivery?.ts) return;
     try {
-      if (!this.options.onDelivered) throw new PolicyError("Pending report binding requires the onDelivered adapter");
       await this.options.onDelivered(run);
       const latest = this.current(id);
       if (latest.status !== "delivered" || latest.delivery?.channel !== run.delivery.channel || latest.delivery?.ts !== run.delivery.ts) return;
@@ -406,7 +398,7 @@ export class ReportRunner {
   private async expire(id: string): Promise<void> {
     let run: ScheduleRun;
     try { run = this.current(id); } catch { return; }
-    if (TERMINAL.has(run.status) || run.output !== undefined) return;
+    if (TERMINAL_RUN_STATUSES.has(run.status) || run.output !== undefined) return;
     const alreadyExpired = run.error?.startsWith(DEADLINE) === true;
     let admitted = run.status === "running" || run.status === "waiting";
     let lease: Awaited<ReturnType<ServerPool["acquire"]>> | undefined;

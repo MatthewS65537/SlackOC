@@ -42,7 +42,6 @@ describe("V2 shared-service ownership", () => {
     await vi.advanceTimersByTimeAsync(3600_000);
     const lease = await pool.acquire("/a");
     expect(lease.entry).toBe(entry); lease.release(); lease.release();
-    expect(pool.reapIdle(1, () => false)).toBe(0);
     expect(f.ensure).toHaveBeenCalledOnce();
   });
   it("closing or detaching SlackOC never stops the shared OpenCode service", async () => {
@@ -59,7 +58,7 @@ describe("V2 shared-service ownership", () => {
     expect((await pool.ensure("/a")).status).toBe("ready");
   });
   it("reconnects the stream, preserves clients, and reconciles after a disconnect", async () => {
-    const resume = vi.fn(); pool = new ServerPool(vi.fn(), vi.fn(), undefined, resume);
+    const resume = vi.fn(); pool = new ServerPool(vi.fn(), vi.fn(), resume);
     const entry = await pool.ensure("/a");
     const client = entry.client;
     f.ensure.mockResolvedValue({ url: "http://127.0.0.1:5678" });
@@ -81,9 +80,25 @@ describe("V2 shared-service ownership", () => {
     expect(event).toHaveBeenCalledWith("/a", "question.asked", { id: "yes" });
     expect(event).not.toHaveBeenCalledWith("/other", expect.anything(), expect.anything());
   });
+  it("routes a location-less event by its session's known dir and drops it when unknown", async () => {
+    const event = vi.fn();
+    pool = new ServerPool(event, vi.fn(), undefined, undefined, { sessionDir: sid => sid === "bound" ? "/b" : undefined });
+    f.events.mockImplementationOnce(async function* (_client, signal: AbortSignal) {
+      yield { type: "server.connected" };
+      yield { type: "message.updated", directory: "/b", properties: { info: { sessionID: "seen" } } };
+      yield { type: "session.idle", properties: { sessionID: "seen" } };
+      yield { type: "session.idle", properties: { sessionID: "bound" } };
+      yield { type: "session.idle", properties: { sessionID: "stranger" } };
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    });
+    await Promise.all([pool.ensure("/a"), pool.ensure("/b")]); await vi.advanceTimersByTimeAsync(0);
+    expect(event.mock.calls.map(([dir, type, props]) => [dir, type, props.sessionID ?? props.info?.sessionID])).toEqual([
+      ["/b", "message.updated", "seen"], ["/b", "session.idle", "seen"], ["/b", "session.idle", "bound"],
+    ]);
+  });
   it("resubscribes when the stream goes silent (no keepalives) for the idle timeout", async () => {
     const log = vi.fn(); const resume = vi.fn();
-    pool = new ServerPool(vi.fn(), log, undefined, resume);
+    pool = new ServerPool(vi.fn(), log, resume);
     f.events.mockImplementationOnce(async function* (_client, signal: AbortSignal) {
       yield { type: "server.connected" };
       await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));

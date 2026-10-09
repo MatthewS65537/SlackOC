@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { homedir } from "node:os";
-import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getCommand, allCommands, execute, registerCommand, type CmdCtx } from "../src/commands/registry.js";
+import { getCommand, allCommands, execute, registerCommand, resolveCommandName, type CmdCtx } from "../src/commands/registry.js";
 import { newThreadState, HELP_SECTIONS } from "../src/commands/handlers.js";
 import { StateStore } from "../src/state.js";
 import { canonicalDir } from "../src/paths.js";
@@ -73,10 +73,10 @@ describe("canonical project choices", () => {
       acquire: async (dir: string) => { acquired.push(dir); return { entry: { client }, release }; },
     } as never });
     await getCommand("project")!.run(ctx, "");
-    expect(out[0]).toContain(`*Current:* \`${canonicalDir(a)}\``);
-    expect(out[0]).toContain(`1) \`project\` — ${canonicalDir(b)}`);
-    expect(out[0]).toContain(`2) \`project\` — ${canonicalDir(c)}`);
-    expect(out[0]).not.toContain("3)");
+    expect(out.at(-1)).toContain(`*Current:* \`${canonicalDir(a)}\``);
+    expect(out.at(-1)).toContain(`1) \`project\` — ${canonicalDir(b)}`);
+    expect(out.at(-1)).toContain(`2) \`project\` — ${canonicalDir(c)}`);
+    expect(out.at(-1)).not.toContain("3)");
     listed = [c, a, b];
     state.setCurrentProject(b); // another thread changed the global default too
     await getCommand("project")!.run(ctx, "2");
@@ -127,8 +127,17 @@ describe("canonical project choices", () => {
 /**
  * CmdCtx wired to a stubbed OpenCode server that returns a fixture providers map.
  * `cfgModel` = the server's configured default model (GET /config); null = none.
+ * `favorites` lands in a fixture TUI state file (never the real ~/.local/state).
  */
-function modelListCtx(out: string[], threadModel?: string, cfgModel: string | null = "anthropic/claude-sonnet-4-5") {
+function modelListCtx(out: string[], threadModel?: string, cfgModel: string | null = "anthropic/claude-sonnet-4-5",
+  opts: { favorites?: string[]; blocks?: unknown[][] } = {}) {
+  const stateHome = join(import.meta.dirname, ".fixtures", "model-state");
+  mkdirSync(join(stateHome, "opencode"), { recursive: true });
+  writeFileSync(join(stateHome, "opencode", "model.json"), JSON.stringify({ favorite: (opts.favorites ?? []).map(id => {
+    const [providerID, modelID] = id.split("/");
+    return { providerID, modelID };
+  }) }));
+  vi.stubEnv("XDG_STATE_HOME", stateHome);
   const state = new StateStore(`${import.meta.dirname}/.fixtures/model/state.json`);
   state.setThread("C1:T1", newThreadState("s1", "/p"));
   const client = {
@@ -180,8 +189,9 @@ function modelListCtx(out: string[], threadModel?: string, cfgModel: string | nu
     config: null as never,
     pool: { ensure: async () => ({ client }) } as never,
     cwd: "/",
-    postToThread: async (text: string) => {
+    postToThread: async (text: string, blocks?: unknown[]) => {
       out.push(text);
+      if (blocks) opts.blocks?.push(blocks);
     },
     uploadToThread: async () => {},
   } as unknown as CmdCtx;
@@ -220,12 +230,38 @@ describe("command registry (user-mandated surface)", () => {
     expect(new Set(listed).size).toBe(listed.length); // no duplicates
   });
 
+  it("\\help lists one line per command; \\help <cmd> shows its detail", async () => {
+    const out: string[] = [];
+    const ctx = { postToThread: async (t: string) => { out.push(t); } } as unknown as CmdCtx;
+    await execute({ name: "help", args: "" }, ctx);
+    expect(out.at(-1)).not.toContain("Applies to the whole channel");
+    await execute({ name: "help", args: "\\listen" }, ctx);
+    expect(out.at(-1)).toContain("Applies to the whole channel");
+  });
+
   it("no \\server command (folded into \\status)", () => {
     expect(getCommand("server")).toBeUndefined();
   });
 
+  it("aliases resolve to one command, collide loudly, and show in \\help", async () => {
+    expect(resolveCommandName("ABORT")).toBe("stop");
+    expect(resolveCommandName("nope")).toBe("nope");
+    expect(getCommand("cancel")).toBe(getCommand("stop"));
+    expect(allCommands().some((c) => c.name === "abort")).toBe(false);
+    // Collisions throw in both directions: alias vs existing name, name vs existing alias.
+    expect(() => registerCommand({ name: "__a__", aliases: ["stop"], usage: "", summary: "", run: async () => {} })).toThrow(/collision/);
+    expect(() => registerCommand({ name: "abort", usage: "", summary: "", run: async () => {} })).toThrow(/collision/);
+    const out: string[] = [];
+    const ctx = { postToThread: async (t: string) => { out.push(t); } } as unknown as CmdCtx;
+    await execute({ name: "help", args: "" }, ctx);
+    expect(out.at(-1)).toContain("Abort the running task _(also \\abort, \\cancel)_");
+    await execute({ name: "help", args: "\\commands" }, ctx);
+    expect(out.at(-1)).toContain("_(also \\cmds, \\command, \\commands)_");
+    expect(out.at(-1)).toContain("same as typing the command");
+  });
+
   it("aliases execute their target command", async () => {
-    // \projects (aliasOf \project) with no args → the numbered listing
+    // \projects (alias of \project) with no args → the numbered listing
     const state = new StateStore(`${import.meta.dirname}/.fixtures/alias/state.json`);
     state.setCurrentProject("/code/cowork");
     state.touchProject("/code/other-app");
@@ -248,42 +284,40 @@ describe("command registry (user-mandated surface)", () => {
     expect(out.join("\n")).toContain("1) `other-app`");
   });
 
-  it("\\model bare lists compact provider/model lines, numbered with a TRAILING ★ on current", async () => {
-    const out: string[] = [];
-    const model = getCommand("model");
-    await model!.run(modelListCtx(out, "openai/gpt-5"), "");
-    const text = out.join("\n");
-    // compact: every model as `provider/model`, numbered for \model <#>;
-    // ★ trails the current row's line (never crowds the code span)
-    expect(text).toContain("*Models* — current: `openai/gpt-5`");
-    expect(text).toContain("1) `anthropic/claude-sonnet-4-5`");
-    expect(text).toContain("2) `anthropic/claude-opus-4-1`");
-    expect(text).toContain("3) `openai/gpt-5` ★");
-    // no verbose decoration
-    expect(text).not.toContain("🧠");
-    expect(text).not.toContain("∘");
-    expect(text).not.toContain("(server default)");
+  it("\\model bare posts one searchable card (no numbered list) with the current model preselected", async () => {
+    const out: string[] = [], blocks: unknown[][] = [];
+    await getCommand("model")!.run(modelListCtx(out, "openai/gpt-5", undefined, { blocks }), "");
+    expect(out).toHaveLength(1);
+    expect(out[0]).not.toContain("1)");
+    const section = blocks[0]![0] as any;
+    expect(section.text.text).toBe("*Model* — current: `openai/gpt-5`");
+    expect(section.accessory).toMatchObject({ type: "external_select", action_id: "pick_model", min_query_length: 0 });
+    expect(section.accessory.initial_option).toEqual({ text: { type: "plain_text", text: "GPT-5 · openai" }, value: "\\model openai/gpt-5" });
   });
 
-  it("\\model with no thread override resolves and stars the server's configured default", async () => {
-    const out: string[] = [];
-    await getCommand("model")!.run(modelListCtx(out), "");
-    const text = out.join("\n");
-    // "(server default)" as a placeholder is dead — resolve the real model
-    expect(text).toContain("*Models* — current: `anthropic/claude-sonnet-4-5`");
-    expect(text).toContain("1) `anthropic/claude-sonnet-4-5` ★");
-    expect(text).toContain("2) `anthropic/claude-opus-4-1`");
-    expect(text).not.toContain("(server default)");
+  it("\\model with no thread override preselects the server's configured default", async () => {
+    const out: string[] = [], blocks: unknown[][] = [];
+    await getCommand("model")!.run(modelListCtx(out, undefined, undefined, { blocks }), "");
+    const section = blocks[0]![0] as any;
+    expect(section.text.text).toBe("*Model* — current: `anthropic/claude-sonnet-4-5`");
+    expect(section.accessory.initial_option.value).toBe("\\model anthropic/claude-sonnet-4-5");
   });
 
   it("\\model does not invent a default when the server reports none", async () => {
+    const out: string[] = [], blocks: unknown[][] = [];
+    await getCommand("model")!.run(modelListCtx(out, undefined, null, { blocks }), "");
+    const section = blocks[0]![0] as any;
+    expect(section.text.text).toBe("*Model*");
+    expect(section.accessory.initial_option).toBeUndefined();
+  });
+
+  it("\\model <#> and filters number OpenCode favorites first", async () => {
     const out: string[] = [];
-    await getCommand("model")!.run(modelListCtx(out, undefined, null), "");
-    const text = out.join("\n");
-    // probe reports openai/gpt-5 (NOT providers[0]'s anthropic default) → live detection
-    expect(text).toContain("*Models*");
-    expect(text).not.toContain("★");
-    expect(text).not.toContain("(server default)");
+    await getCommand("model")!.run(modelListCtx(out, undefined, undefined, { favorites: ["openai/gpt-5", "gone/model"] }), "1");
+    expect(out.join("\n")).toContain("set to `openai/gpt-5`");
+    const listed: string[] = [];
+    await getCommand("model")!.run(modelListCtx(listed, undefined, undefined, { favorites: ["anthropic/claude-opus-4-1"] }), "claude");
+    expect(listed.join("\n")).toContain("1) `anthropic/claude-opus-4-1`\n2) `anthropic/claude-sonnet-4-5` ★");
   });
 
   it("\\model <#> selects from the same ordering the listing showed", async () => {
@@ -356,6 +390,7 @@ describe("command registry (user-mandated surface)", () => {
       },
       uploadToThread: async () => {},
       pool: {
+        async acquire(this: { ensure(dir: string): Promise<unknown> }, dir: string) { return { entry: await this.ensure(dir), release: () => {} }; },
         ensure: async (dir: string) => {
           createdIn = dir;
           return {
@@ -410,6 +445,7 @@ describe("command registry (user-mandated surface)", () => {
       uploadToThread: async () => {},
       pool: {
         list: () => [],
+        async acquire(this: { ensure(dir: string): Promise<unknown> }, dir: string) { return { entry: await this.ensure(dir), release: () => {} }; },
         ensure: async () => ({
           client: { session: { create: async () => ({ data: { id: "ses_fresh", title: "t" } }), abort: async () => ({ data: {} }), delete: async () => ({ data: {} }) } },
         }),
@@ -470,6 +506,7 @@ describe("QoL round (Sep 2026)", () => {
     const out: string[] = [];
     const ctx = baseCtx(state, out, state.getThread("C1:T1"), {
       pool: {
+        async acquire(this: { ensure(dir: string): Promise<unknown> }, dir: string) { return { entry: await this.ensure(dir), release: () => {} }; },
         ensure: async () => ({
           client: {
             session: {
@@ -525,7 +562,7 @@ describe("QoL round (Sep 2026)", () => {
           client: {
             session: {
               diff: async () => ({
-                data: [{ file: "src/x.ts", before: "a\nb\n", after: "a\nB\n", additions: 1, deletions: 1 }],
+                data: [{ file: "src/x.ts", patch: "--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n", additions: 1, deletions: 1 }],
               }),
             },
           },
@@ -556,7 +593,7 @@ describe("QoL round (Sep 2026)", () => {
           client: {
             session: {
               diff: async () => ({
-                data: [{ file: "src/big.txt", before: "a".repeat(4000), after: "b".repeat(4000), additions: 1, deletions: 1 }],
+                data: [{ file: "src/big.txt", patch: `@@ -1 +1 @@\n-${"a".repeat(4000)}\n+${"b".repeat(4000)}\n`, additions: 1, deletions: 1 }],
               }),
             },
           },
@@ -596,6 +633,7 @@ describe("remote-work round (Sep 2026)", () => {
     const out: string[] = [];
     const ctx = baseCtx(state, out, state.getThread("C1:T1"), {
       pool: {
+        async acquire(this: { ensure(dir: string): Promise<unknown> }, dir: string) { return { entry: await this.ensure(dir), release: () => {} }; },
         ensure: async (dir: string) => ({
           client: {
             session: {
@@ -626,6 +664,7 @@ describe("remote-work round (Sep 2026)", () => {
     const out: string[] = [];
     const ctx = baseCtx(state, out, state.getThread("C1:T1"), {
       pool: {
+        async acquire(this: { ensure(dir: string): Promise<unknown> }, dir: string) { return { entry: await this.ensure(dir), release: () => {} }; },
         ensure: async () => ({
           client: {
             session: {
@@ -921,7 +960,7 @@ describe("command liveness ack (👀 → ✅/❌)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Sessions: picker, summary, watch (docs/RESUME_SESSIONS.md implementation)
+// Sessions: picker, summary, watch
 
 import type { RenderDeps } from "../src/slack/render.js";
 import type { OcSession } from "../src/opencode/api.js";
@@ -937,6 +976,8 @@ function ocSess(id: string, dir: string, title: string, ageMs: number): OcSessio
 /** Stub server pool: `list` sessions are machine-global (spike 2); other session fakes configurable. */
 function poolWith(sessions: OcSession[], extra: Record<string, unknown> = {}): never {
   return {
+    // Mirrors ServerPool.acquire: a lease over ensure().
+    async acquire(this: { ensure(dir: string): Promise<unknown> }, dir: string) { return { entry: await this.ensure(dir), release: () => {} }; },
     ensure: async (dir: string) => ({
       dir,
       client: {
@@ -964,7 +1005,7 @@ function fakeViewDeps(posted: string[], deleted: string[] = []): RenderDeps {
   };
 }
 
-describe("sessions picker + resume (RESUME_SESSIONS phase 1)", () => {
+describe("sessions picker + resume", () => {
   it("\\sessions bare lists the current project with markers; `all` lists machine-wide", async () => {
     const { invalidatePickerCache } = await import("../src/commands/picker.js");
     const state = new StateStore(`${import.meta.dirname}/.fixtures/sessions-scope/state.json`);
@@ -1041,13 +1082,13 @@ describe("sessions picker + resume (RESUME_SESSIONS phase 1)", () => {
     invalidatePickerCache("C1:T1");
   });
 
-  it("\\help groups watch/unwatch/history/summary under Monitoring", () => {
+  it("\\help groups watch/unwatch/history/summary/usage under Monitoring", () => {
     const monitoring = HELP_SECTIONS.find((s) => s.title === "Monitoring");
-    expect(monitoring?.names).toEqual(["watch", "unwatch", "history", "summary"]);
+    expect(monitoring?.names).toEqual(["watch", "unwatch", "history", "summary", "usage"]);
   });
 });
 
-describe("\\history (RESUME_SESSIONS phase 2)", () => {
+describe("\\history", () => {
   const transcript = [
     { info: { id: "m1", sessionID: "s", role: "user" }, parts: [{ id: "p1", type: "text", text: "fix the login bug" }] },
     {
@@ -1102,7 +1143,7 @@ describe("\\history (RESUME_SESSIONS phase 2)", () => {
   });
 });
 
-describe("\\summary (RESUME_SESSIONS phase 2)", () => {
+describe("\\summary", () => {
   function summaryClient(opts: { summary?: string; tailIncomplete?: boolean } = {}) {
     const calls: { abort: number; delete: number; promptBody?: Record<string, unknown> } = { abort: 0, delete: 0 };
     const client = {
@@ -1164,7 +1205,7 @@ describe("\\summary (RESUME_SESSIONS phase 2)", () => {
   });
 });
 
-describe("\\watch / \\unwatch (RESUME_SESSIONS phase 3)", () => {
+describe("\\watch / \\unwatch", () => {
   it("binds the thread read-only, attaches a live view, and writes NO pendingRun tombstone", async () => {
     const { getView } = await import("../src/slack/render.js");
     const state = new StateStore(`${import.meta.dirname}/.fixtures/watch-attach/state.json`);
@@ -1227,10 +1268,13 @@ describe("\\listen", () => {
     const ctx = baseCtx(state, out);
     expect(state.isAlwaysOn("C1")).toBe(false);
     await execute({ name: "listen", args: "" }, ctx);
-    expect(out.at(-1)).toMatch(/`off`/);
-    await execute({ name: "listen", args: "on" }, ctx);
     expect(new StateStore(join(dir, "state.json")).isAlwaysOn("C1")).toBe(true);
     expect(state.isAlwaysOn("C2")).toBe(false);
+    await execute({ name: "listen", args: "" }, ctx);
+    expect(state.isAlwaysOn("C1")).toBe(false);
+    await execute({ name: "listen", args: "on" }, ctx);
+    await execute({ name: "listen", args: "on" }, ctx);
+    expect(state.isAlwaysOn("C1")).toBe(true);
     await execute({ name: "listen", args: "off" }, ctx);
     expect(new StateStore(join(dir, "state.json")).isAlwaysOn("C1")).toBe(false);
   });
@@ -1241,5 +1285,87 @@ describe("\\listen", () => {
     await execute({ name: "listen", args: "on" }, baseCtx(state, out, null, { channelId: "D1" }));
     expect(out.at(-1)).toMatch(/DMs always listen/);
     expect(state.isAlwaysOn("D1")).toBe(false);
+  });
+});
+
+describe("\\cmd", () => {
+  const leasePool = (client: unknown) => ({ acquire: async () => ({ entry: { client }, release: () => {} }) }) as never;
+
+  it("bare \\cmd lists the project's native commands", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/cmd-list/state.json`);
+    const out: string[] = [];
+    const client = { commands: async () => ({ data: [{ name: "compact", description: "Summarize context" }, { name: "init" }] }) };
+    await getCommand("commands")!.run(baseCtx(state, out, null, { cwd: "/p", pool: leasePool(client) }), "");
+    expect(out.at(-1)).toBe("*OpenCode commands in* `/p`\n• `compact` — Summarize context\n• `init`\n\nRun one with `\\cmd <command> [args]`.");
+  });
+
+  it("chunks long command output instead of posting one oversized message", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/cmd-chunk/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_c", "/p"));
+    const out: string[] = [];
+    const long = Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(40)}`).join("\n");
+    const client = { session: { command: async () => ({ data: { parts: [{ type: "text", text: long }] } }) } };
+    await getCommand("cmd")!.run(baseCtx(state, out, state.getThread("C1:T1"), { pool: leasePool(client) }), "review");
+    expect(out.length).toBeGreaterThan(1);
+    expect(out.every((m) => m.length <= 3800)).toBe(true);
+    expect(out.join("\n")).toBe(long);
+  });
+});
+
+describe("\\usage", () => {
+  const stats = (over: Record<string, unknown> = {}) => ({
+    range: { from: 0, to: 1 }, sessions: 14, subagents: 0, prompts: 30, steps: 90,
+    tokens: { input: 900_000, output: 250_000, reasoning: 50_000, cache: { read: 3_000_000, write: 400_000 } },
+    cost: 12.345, tools: {}, activeDays: 5, streak: 2, models: [],
+    activity: [{ date: "2026-10-02", steps: 4 }, { date: "2026-10-04", steps: 32 }, { date: "2026-10-08", steps: 16 }],
+    ...over,
+  }) as never;
+
+  it("parses range and scope in any order and rejects unknown words", async () => {
+    const { parseUsageArgs } = await import("../src/commands/usage.js");
+    expect(parseUsageArgs("")).toEqual({ range: "7d", all: false });
+    expect(parseUsageArgs("ALL 30d")).toEqual({ range: "30d", all: true });
+    expect(parseUsageArgs("today")).toEqual({ range: "today", all: false });
+    expect(() => parseUsageArgs("week")).toThrow(/unknown argument `week`/);
+  });
+
+  it("maps steps onto eight bar heights with '·' for idle days", async () => {
+    const { sparkline } = await import("../src/commands/usage.js");
+    expect(sparkline([0, 1, 2, 3, 4, 5, 6, 7, 8])).toBe("·▁▂▃▄▅▆▇█");
+    expect(sparkline([0, 0])).toBe("··");
+    expect(sparkline([1, 100])).toBe("▁█");
+  });
+
+  it("formats a stats fixture with today's cost and an oldest→today sparkline", async () => {
+    const { formatUsage, dayKeys } = await import("../src/commands/usage.js");
+    const days = dayKeys(new Date(2026, 9, 2), 7, Intl.DateTimeFormat().resolvedOptions().timeZone);
+    expect(days).toEqual(["2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08"]);
+    expect(formatUsage(stats(), { scope: "slackoc", range: "7d", days, todayCost: 1.819 })).toBe([
+      "*Usage · slackoc · last 7 days*",
+      "*$12.35* · today $1.82",
+      "1.2M tokens (+3.4M cached) · 14 sessions · 5 active days",
+      "▁·█···▄",
+    ].join("\n"));
+    // A single day has no sparkline and no redundant "today" figure.
+    expect(formatUsage(stats({ sessions: 1, activeDays: 1 }), { scope: "all projects", range: "today", days: ["2026-10-08"], todayCost: 9 }))
+      .toBe("*Usage · all projects · today*\n*$12.35*\n1.2M tokens (+3.4M cached) · 1 session · 1 active day");
+  });
+
+  it("queries the thread's project by ID, or every project with `all`", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/usage/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_u", "/code/slackoc"));
+    const calls: Array<Record<string, unknown>> = [];
+    const client = { projectId: async () => "prj_1", stats: async (input: Record<string, unknown>) => { calls.push(input); return stats(); } };
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), { pool: { acquire: async () => ({ entry: { client }, release: () => {} }) } as never });
+    await execute({ name: "cost", args: "" }, ctx);
+    expect(out.at(-1)).toMatch(/^\*Usage · slackoc · last 7 days\*/);
+    expect(calls).toHaveLength(2); // range + today
+    expect(calls.every((c) => c.project === "prj_1" && typeof c.timezone === "string")).toBe(true);
+    calls.length = 0;
+    await execute({ name: "usage", args: "today all" }, ctx);
+    expect(out.at(-1)).toMatch(/^\*Usage · all projects · today\*/);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.project).toBeUndefined();
   });
 });

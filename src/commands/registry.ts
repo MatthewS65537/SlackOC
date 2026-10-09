@@ -34,8 +34,8 @@ export interface CmdCtx {
   bridgeInfo?: { startedAt: number; dmAvailable: () => boolean; socket?: () => SocketHealth | undefined };
   /** Build an archives permalink for a state threadKey (`${channel}:${ts}`) — null when the team URL is unknown. */
   threadUrl?(threadKey: string): string | null;
-  /** Post into the current thread/DM. */
-  postToThread(text: string): Promise<void>;
+  /** Post into the current thread/DM; `blocks` (optional) carry interactive controls. */
+  postToThread(text: string, blocks?: unknown[]): Promise<void>;
   /** Upload a text file (snippet, diff…) into the current thread. */
   uploadToThread(filename: string, content: string): Promise<void>;
   /**
@@ -62,21 +62,43 @@ export interface CmdDef {
   name: string;
   usage: string;
   summary: string;
-  /** When set, this command just forwards to the named command. */
-  aliasOf?: string;
+  /** Extra names that run this command (e.g. \abort → \stop); shown in `\help`. */
+  aliases?: string[];
   /** Optional example/extra line shown under the summary by `\help`. */
   detail?: string;
+  /** Usable in a thread while its scheduled report runs (report controls and read-only views). */
+  duringReport?: boolean;
+  /**
+   * Replaces the thread's session binding, so recovery replay of earlier
+   * messages is canceled as superseded: always, or only when given arguments.
+   */
+  rebinds?: "always" | "withArgs";
   run(ctx: CmdCtx, args: string): Promise<void>;
 }
 
 const registry = new Map<string, CmdDef>();
+/** alias → canonical command name. */
+const aliasMap = new Map<string, string>();
 
+/** Throws if the name or any alias is already taken by a command or alias. */
 export function registerCommand(def: CmdDef): void {
+  const names = [def.name, ...(def.aliases ?? [])];
+  for (const [i, n] of names.entries()) {
+    if (registry.has(n) || aliasMap.has(n) || names.indexOf(n) !== i)
+      throw new Error(`command name collision: \\${n}`);
+  }
   registry.set(def.name, def);
+  for (const a of def.aliases ?? []) aliasMap.set(a, def.name);
+}
+
+/** Canonical command name for `name` (alias-aware), or `name` unchanged if unknown. */
+export function resolveCommandName(name: string): string {
+  return aliasMap.get(name.toLowerCase()) ?? name;
 }
 
 export function getCommand(name: string): CmdDef | undefined {
-  return registry.get(name.toLowerCase());
+  const n = name.toLowerCase();
+  return registry.get(aliasMap.get(n) ?? n);
 }
 
 export function allCommands(): CmdDef[] {
@@ -97,9 +119,9 @@ function editDistance(a: string, b: string): number {
   return prev[b.length]!;
 }
 
-/** Closest registered command name: prefix match first, then edit distance ≤2. */
+/** Closest typeable name (commands, then aliases): prefix match first, then edit distance ≤2. */
 function closestCommand(name: string): string | undefined {
-  const names = [...registry.keys()];
+  const names = [...registry.keys(), ...aliasMap.keys()];
   const prefix = names.find((n) => n.startsWith(name) || name.startsWith(n));
   if (prefix) return prefix;
   let best: string | undefined;
@@ -125,15 +147,9 @@ export async function execute(parsed: ParsedCmd, ctx: CmdCtx): Promise<void> {
     );
     return;
   }
-  // Aliases forward to their target command.
-  const target = def.aliasOf ? getCommand(def.aliasOf) : def;
-  if (!target) {
-    await ctx.postToThread(`⚠️ \`\\${parsed.name}\` is broken (alias target missing).`);
-    return;
-  }
   try {
     await ctx.react?.("eyes");
-    await target.run(ctx, parsed.args);
+    await def.run(ctx, parsed.args);
     await ctx.react?.("eyes", false);
     await ctx.react?.("white_check_mark");
   } catch (err) {

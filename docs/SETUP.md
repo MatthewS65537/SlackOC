@@ -28,6 +28,12 @@ CLI into your global npm bin.
 6. Under **Basic Information → App-Level Tokens → Generate Token and Scopes**:
    add scope **`connections:write`**, name it anything, copy the token (`xapp-…`).
 
+> **Upgrading an existing app?** When the manifest changes, open your app →
+> **App Manifest**, paste the current JSON, save, then reinstall from
+> **OAuth & Permissions**. The current manifest enables the Home tab
+> (`app_home_opened`), the **Send to OpenCode** message shortcut (`commands`
+> scope), and private channels and group DMs (`message.groups`, `message.mpim`).
+
 > Why two tokens? The bot token calls the Slack API. The app-level token opens
 > the Socket Mode connection that receives events — outbound-only, so no
 > webhook URL, no tunnels.
@@ -48,7 +54,7 @@ Non-interactive (CI / scripted setup):
 
 ```bash
 slackoc init \
-  --bot-token xoxb-… --app-token xapp-… --owner U… [--dir /abs/project]
+  --bot-token xoxb-… --app-token xapp-… --owner U…
 ```
 
 ## 5. Start
@@ -313,6 +319,7 @@ automatically retried.
 | Bot silent | `slackoc doctor` — most likely a token transposition; also confirm you're DMing as the paired owner |
 | Bot answers the first @mention but ignores thread replies in a channel | `/invite @SlackOC` in that channel — the bot only hears channel threads it's invited to (DMs always work) |
 | A thread goes quiet (outbound posts worked, then nothing inbound) | `\logs` — look for missing `in:` lines and socket warnings. History polling fairly rotates a bounded set of retained recent/older threads each pass; API failures, queueing and sleep can delay recovery. It cannot promise every message or exactly-once execution. Stop any second bridge using the same Slack app |
+| Bot ignores everything in a private channel or group DM (even `\listen`) | update the Slack app from the current manifest (Event Subscriptions needs `message.groups` + `message.mpim`, scope `mpim:history`), then reinstall |
 | No ✅/❌ reactions on your messages | reinstall the app (OAuth & Permissions → Reinstall) so the `reactions:write` scope applies |
 | Attachments you send fail with `couldn't attach … HTTP 403` | reinstall the app — inbound files need the `files:read` scope added in the current manifest |
 | A run hung at ⏳ forever | Inspect `\status` and `\logs`. `\restart` rediscovers the shared V2 service and reconnects observation without stopping sessions or resubmitting prompts. It does not cancel a stuck model/tool; use `\stop` to cancel intentionally |
@@ -331,7 +338,6 @@ automatically retried.
 
 - `~/.config/slackoc/config.json` — tokens + your user id (0600)
 - `~/.config/slackoc/state.json` — thread⇄session bindings + known projects (0600)
-- `~/.config/slackoc/state.json.pre-recovery-v1` — one-time pre-migration state backup (0600), when upgrading legacy state
 - `~/.config/slackoc/permissions.json` — durable approval delivery/response records (0600); preserves uncertain responses across restart
 - `~/.config/slackoc/questions.json` — durable question drafts, delivery/UI revisions, resume identity and uncertain submissions (0600)
 - `~/.config/slackoc/slackoc.pid` — running bridge pid

@@ -74,7 +74,9 @@ vi.mock("@slack/bolt", () => ({
     event(name: string, handler: any) { this.events.set(name, handler); }
     action(name: string | RegExp, handler: any) { this.actions.set(name, handler); }
     view(name: string, handler: any) { this.views.set(name, handler); }
-    constructor(public options: unknown) { f.app = this; }
+    shortcut() {}
+    options() {} // app.options(action_id, handler) — the \model search card
+    constructor(public appOptions: unknown) { f.app = this; }
   },
 }));
 vi.mock("../src/opencode/server.js", () => ({
@@ -88,10 +90,9 @@ vi.mock("../src/opencode/server.js", () => ({
     acquireExisting = vi.fn(() => ({ entry: this.entry, release: vi.fn() }));
     killAll = vi.fn(async () => {});
     close = vi.fn(async () => {});
-    reapIdle = vi.fn(() => 0);
     list = vi.fn((): any[] => []);
     get = vi.fn(() => this.entry);
-    constructor(public onEvent: any, _log: any, public onDeath: any, public onResume: any, public onReady: any, public hooks: any) {
+    constructor(public onEvent: any, _log: any, public onResume: any, public onReady: any, public hooks: any) {
       f.pool = this;
     }
   },
@@ -182,10 +183,10 @@ function stop() {
   handler?.();
 }
 async function boot() {
-  const migration = vi.spyOn(StateStore.prototype, "migrateRecovery");
+  const setCurrent = vi.spyOn(StateStore.prototype, "setCurrentProject");
   await startBridge({ cwd: f.root });
-  state = migration.mock.contexts.at(-1) as StateStore;
-  migration.mockRestore();
+  state = setCurrent.mock.contexts.at(-1) as StateStore;
+  setCurrent.mockRestore();
   await vi.advanceTimersByTimeAsync(0);
 }
 async function drain<T>(work: Promise<T>, milliseconds = 2_200): Promise<T> {
@@ -1362,7 +1363,7 @@ describe("startBridge reliability wiring", () => {
 
   it("cancels both bot and Socket Mode HTTP transports when shutdown begins", async () => {
     await boot();
-    const bot = f.app.options.clientOptions;
+    const bot = f.app.appOptions.clientOptions;
     const socket = f.receiver.options.installerOptions.clientOptions;
     // The socket client must NOT share the bot's retries:0 — that is what let one
     // failed apps.connections.open end Socket Mode permanently. The supervisor owns reconnects.

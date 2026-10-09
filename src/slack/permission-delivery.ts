@@ -4,6 +4,7 @@ import {
   permissionDeliveryMarker, permissionKey,
   type PermissionDeliveryStore, type PermissionIdentity, type PermissionRecord,
 } from "./permissions-store.js";
+import { retryAfterSeconds, SLACK_ACCESS_ERRORS, SLACK_PAYLOAD_ERRORS, slackErrorCode } from "./transport.js";
 
 export type PermissionDestination = "thread" | "dm";
 export interface PermissionCopy { ts: string; channel: string }
@@ -24,25 +25,17 @@ export interface PermissionDeliveryDeps {
 
 const RETRY_BASE_MS = 2_000;
 const RETRY_CAP_MS = 60_000;
-const ACCESS_ERRORS = new Set([
-  "invalid_auth", "not_authed", "token_revoked", "account_inactive", "missing_scope",
-  "channel_not_found", "not_in_channel", "is_archived", "no_permission", "restricted_action",
-  "org_login_required", "team_access_not_granted", "ekm_access_denied", "user_not_found",
-  "user_disabled", "method_not_supported_for_channel", "cannot_reply_to_message", "thread_not_found",
-  "restricted_action_read_only_channel", "restricted_action_thread_only_channel",
-]);
-
 function failure(error: unknown): { text: string; payload: boolean; rejected: boolean; retryAfterMs: number } {
-  const e = error as { code?: string; statusCode?: number; retryAfter?: number; message?: string; data?: { error?: string; retry_after?: number } } | undefined;
-  const code = e?.data?.error ?? e?.code;
-  const retry = e?.retryAfter ?? e?.data?.retry_after;
-  const retryAfterMs = typeof retry === "number" && Number.isFinite(retry) && retry >= 0 ? retry * 1000 : 0;
+  const e = error as { statusCode?: number; message?: string } | undefined;
+  const code = slackErrorCode(error);
+  const retryAfterMs = (retryAfterSeconds(error) ?? 0) * 1000;
+  // `code` (not isRateLimited's raw SDK code): a body error wins over the SDK code here.
   const limited = code === "ratelimited" || code === "slack_webapi_rate_limited_error" || e?.statusCode === 429 ||
     retryAfterMs > 0 || /^HTTP 429\b/i.test(e?.message ?? "");
-  const payload = code === "invalid_blocks" || code === "msg_too_long";
+  const payload = SLACK_PAYLOAD_ERRORS.has(code ?? "");
   return {
     text: [code, e?.message ?? (code ? undefined : String(error))].filter(Boolean).join(": ").slice(0, 1000),
-    payload, rejected: payload || limited || ACCESS_ERRORS.has(code ?? ""), retryAfterMs,
+    payload, rejected: payload || limited || SLACK_ACCESS_ERRORS.has(code ?? ""), retryAfterMs,
   };
 }
 
@@ -51,8 +44,6 @@ export class PermissionDeliveryManager {
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly retries = new Map<string, { at: number; rateUntil: number }>();
   private readonly now: () => number;
-  /** Last persistence/callback failure; delivery errors live in store.get(id)[destination].error. */
-  error?: string;
 
   constructor(private readonly deps: PermissionDeliveryDeps) {
     this.now = deps.now ?? Date.now;
@@ -91,8 +82,8 @@ export class PermissionDeliveryManager {
 
   private report(context: string, error: unknown): void {
     const detail = error instanceof AggregateError ? `${error.message}: ${error.errors.map(String).join("; ")}` : String(error);
-    this.error = `${context}: ${detail}`;
-    logErr(`permission delivery ${this.error}`);
+    // Delivery errors live in store.get(id)[destination].error; this logs persistence/callback failures.
+    logErr(`permission delivery ${context}: ${detail}`);
   }
 
   private async state(record: PermissionRecord | undefined): Promise<void> {

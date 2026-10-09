@@ -10,7 +10,6 @@ Usage:
       --bot-token <xoxb>    non-interactive: bot user OAuth token
       --app-token <xapp>    non-interactive: app-level token (connections:write)
       --owner <U…>          non-interactive: your Slack member ID
-      --dir <path>          non-interactive: default project dir
   slackoc start             start the bridge (runs in foreground)
   slackoc stop              stop the running bridge (disable its service if managed)
   slackoc service install   write a macOS LaunchAgent (does not start it)
@@ -42,13 +41,12 @@ async function main(): Promise<void> {
   const rest = process.argv.slice(3);
   switch (cmd) {
     case "init": {
-      const flags = parseFlags(rest, ["bot-token", "app-token", "owner", "dir"]);
+      const flags = parseFlags(rest, ["bot-token", "app-token", "owner"]);
       const { runInit } = await import("./init.js");
       const opts: InitOptions = {};
       if (flags["bot-token"]) opts.botToken = flags["bot-token"];
       if (flags["app-token"]) opts.appToken = flags["app-token"];
       if (flags.owner) opts.ownerId = flags.owner;
-      if (flags.dir) opts.defaultDir = flags.dir;
       await runInit(opts);
       break;
     }

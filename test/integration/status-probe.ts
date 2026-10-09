@@ -45,8 +45,8 @@ try {
   assert.equal(fetched.id, sessionID);
   const initial = await sessionStatus(client);
   const messages = await sessionMessages(client, sessionID);
-  const questions = await pendingQuestions(url);
-  const permissions = await pendingPermissions(url);
+  const questions = await pendingQuestions(client);
+  const permissions = await pendingPermissions(client);
   // Idle abort uses SessionRunState.cancel -> SessionStatus.set({type:"idle"}), no model invocation.
   await sessionAbort(client, sessionID);
   const afterIdle = await sessionStatus(client);

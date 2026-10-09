@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { OcFileDiff, OcMessageInfo, OcPart } from "../opencode/api.js";
@@ -6,6 +5,7 @@ import type { OCClient } from "../opencode/api.js";
 import type { PoolEntry } from "../opencode/server.js";
 import {
   agentsList,
+  commandList,
   configGet,
   configProviders,
   promptAsync,
@@ -16,41 +16,38 @@ import {
   sessionDiff,
   sessionGet,
   sessionMessages,
+  sessionStats,
+  projectId,
 } from "../opencode/client.js";
 import type { CmdCtx, CmdDef } from "./registry.js";
-import { allCommands, registerCommand } from "./registry.js";
+import { allCommands, getCommand, registerCommand } from "./registry.js";
 import { cacheProjectList, projectListSnapshot, invalidateProjectList, invalidatePickerCache, pickerList, pickerResolve, renderPickerList, type SessionRef } from "./picker.js";
-import { canonicalDir } from "../paths.js";
-import { chunkText, dur, esc, mdToMrkdwn, shortId, shortPath, truncate } from "../util.js";
+import { canonicalDir, expandHome } from "../paths.js";
+import { chunkText, dur, esc, mdToMrkdwn, partsText, shortId, shortPath, truncate } from "../util.js";
 import type { ThreadState, VerboseMode } from "../state.js";
 import { deleteView, getView, SessionView, describeActiveRuns, finalizeViewsForProject } from "../slack/render.js";
 import { droppedOpCount, oldestPendingAgeMs, queueDepth } from "../slack/queue.js";
 import { fileLogPath, logCount, newLogsSince, recentLogs } from "../log.js";
-import { createTwoFilesPatch } from "diff";
 import { parsePermissionCommand } from "../slack/permissions.js";
-import "./schedules.js";
+import { SCHEDULE_USAGE } from "../schedules/controls.js";
+import { modelSearchBlocks, pickerBlocks, viewDiffBlocks } from "../slack/blocks.js";
+import { modelOption, orderedModels, readFavorites } from "../opencode/favorites.js";
+import { buildUnifiedDiff, formatDiffSummary } from "../slack/diff-view.js";
+import { USAGE_RANGES, dayKeys, formatUsage, parseUsageArgs, rangeStart } from "./usage.js";
 
 function requireThread(ctx: CmdCtx): NonNullable<CmdCtx["thread"]> {
   if (!ctx.thread) throw new Error("no session bound to this thread yet — send a prompt first");
   return ctx.thread;
 }
 
-async function serverFor(ctx: CmdCtx, thread: ThreadState): Promise<PoolEntry> {
-  return ctx.pool.ensure(thread.projectDir);
-}
-
 async function withServerLease<T>(ctx: CmdCtx, dir: string, work: (entry: PoolEntry) => Promise<T>): Promise<T> {
-  const lease = typeof ctx.pool.acquire === "function" ? await ctx.pool.acquire(canonicalDir(dir))
-    : { entry: await ctx.pool.ensure(canonicalDir(dir)), release: () => {} };
+  const lease = await ctx.pool.acquire(canonicalDir(dir));
   try { return await work(lease.entry); }
   finally { lease.release(); }
 }
 
 function requireDir(ctx: CmdCtx, dir: string): string {
-  // Expand a leading ~ to the actual home dir (whatever it is on this machine).
-  if (dir === "~") dir = homedir();
-  else if (dir.startsWith("~/")) dir = `${homedir()}/${dir.slice(2)}`;
-  const abs = resolve(ctx.cwd, dir);
+  const abs = resolve(ctx.cwd, expandHome(dir));
   const st = statSync(abs, { throwIfNoEntry: false });
   if (!st?.isDirectory()) throw new Error(`${abs} is not a directory (use an absolute path)`);
   return canonicalDir(abs);
@@ -77,7 +74,7 @@ async function rebindThread(
 ): Promise<void> {
   dir = canonicalDir(dir);
   const old = ctx.thread;
-  ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs, true);
+  ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs, true);
   if (old) {
     if (opts.teardown !== false) {
       try {
@@ -109,65 +106,51 @@ async function rebindThread(
 /** Grouping + order for `\help`; every registered command must appear here. */
 export const HELP_SECTIONS: Array<{ title: string; names: string[] }> = [
   { title: "Threads & replies", names: ["hush", "listen", "verbose", "stream"] },
-  { title: "Sessions", names: ["new", "sessions", "resume", "stop", "abort", "diff"] },
-  { title: "Monitoring", names: ["watch", "unwatch", "history", "summary"] },
+  { title: "Sessions", names: ["new", "sessions", "resume", "stop", "diff"] },
+  { title: "Monitoring", names: ["watch", "unwatch", "history", "summary", "usage"] },
   { title: "Model & agent", names: ["model", "agent"] },
-  { title: "Projects", names: ["project", "projects", "cd"] },
+  { title: "Projects", names: ["project", "cd"] },
   { title: "Notifications", names: ["notify", "schedule"] },
   { title: "Approvals & questions", names: ["permissions", "permission", "questions"] },
   { title: "Raw OpenCode", names: ["cmd"] },
   { title: "Bridge", names: ["status", "logs", "restart", "help"] },
 ];
 
-/** Usage for help display: aliases merge into the primary as `\a / \alias1 / \alias2 …`. */
-function aliasUsage(name: string, cmds: Map<string, CmdDef>): string {
-  const aliases = [...cmds.values()].filter((c) => c.aliasOf === name).map((c) => `\\${c.name}`);
-  const primary = cmds.get(name)?.usage ?? `\\${name}`;
-  if (!aliases.length) return primary;
-  // Swap variants keep the tail: "\project | \project <name|#>" + " / \projects" →
-  // but simpler: replace the leading "\name" with "\name / \alias" forms.
-  const parts = primary.split(" | ");
-  parts[0] = [parts[0]!, ...aliases].join(" / ");
-  return parts.join(" | ");
+/** One `\help` line; aliases trail the summary so long usages stay readable. */
+function helpLine(def: CmdDef): string {
+  const aliases = def.aliases?.length ? ` _(also ${def.aliases.map((a) => `\\${a}`).join(", ")})_` : "";
+  return `\`${def.usage}\` — ${def.summary}${aliases}`;
 }
 
 registerCommand({
-  name: "help",
-  usage: "\\help",
-  summary: "Show this command list",
-  async run(ctx) {
+  name: "help", duringReport: true,
+  usage: "\\help [command]",
+  summary: "Show this list, or one command's details",
+  async run(ctx, args) {
+    // \help <cmd|alias>: the one place a command's multi-line detail is shown.
+    if (args) {
+      const c = getCommand(args.replace(/^\\/, ""));
+      if (!c) throw new Error(`unknown command \`${args}\``);
+      await ctx.postToThread(c.detail ? `${helpLine(c)}\n${c.detail}` : helpLine(c));
+      return;
+    }
     const cmds = new Map(allCommands().map((c) => [c.name, c]));
-    const lines = [
-      "*SlackOC* — commands start with `\\`, owner-only. I auto-reply in any thread with a session (invite me to channels: `/invite @SlackOC`; `@`-mention wakes a hushed thread).",
-    ];
-    const shown = new Set<string>();
+    const lines = ["*SlackOC* — owner-only `\\` commands. `\\help <command>` for details."];
     for (const sec of HELP_SECTIONS) {
       lines.push("", `*${sec.title}*`);
       for (const name of sec.names) {
-        if (shown.has(name)) continue;
-        shown.add(name);
         const c = cmds.get(name);
-        if (!c) continue; // alias name in sections — merged into its target's line
-        if (c.aliasOf) continue; // alias entry pointing at its target — never its own line
-        const target = c.aliasOf ?? name;
-        const primary = cmds.get(target)!;
-        lines.push(`\`${aliasUsage(target, cmds)}\` — ${primary.summary}`);
-        if (primary.detail) lines.push(`    ${primary.detail}`);
+        if (c) lines.push(helpLine(c));
       }
-    }
-    const rest = allCommands().filter((c) => !shown.has(c.name) && !c.aliasOf);
-    if (rest.length) {
-      lines.push("", "*Other*");
-      for (const c of rest) lines.push(`\`${c.usage}\` — ${c.summary}`);
     }
     await ctx.postToThread(lines.join("\n"));
   },
 });
 
 registerCommand({
-  name: "status",
+  name: "status", duringReport: true,
   usage: "\\status",
-  summary: "Current project, thread binding, server pool health",
+  summary: "Project, thread binding, server health",
   async run(ctx) {
     const pool = ctx.pool.list();
     const th = ctx.thread;
@@ -215,7 +198,7 @@ registerCommand({
 });
 
 registerCommand({
-  name: "permissions", usage: "\\permissions", summary: "Pending approvals and delivery status",
+  name: "permissions", duringReport: true, usage: "\\permissions", summary: "Pending approvals and delivery status",
   async run(ctx) {
     if (!ctx.permissions) throw new Error("permission service unavailable");
     for (const text of chunkText(await ctx.permissions.list(ctx.ownerDm ? { dm: true } : { threadKey: ctx.threadKey }, true))) await ctx.postToThread(text);
@@ -223,7 +206,7 @@ registerCommand({
 });
 
 registerCommand({
-  name: "permission", usage: "\\permission <request-id> once|deny|always", summary: "Answer an approval by text",
+  name: "permission", duringReport: true, usage: "\\permission <request-id> once|deny|always", summary: "Answer an approval by text",
   async run(ctx, args) {
     const parsed = parsePermissionCommand(args);
     if (!parsed) throw new Error("use \\permission <request-id> once|deny|always; \\permissions lists requests");
@@ -235,7 +218,7 @@ registerCommand({
 });
 
 registerCommand({
-  name: "questions", usage: "\\questions", summary: "Recover pending question cards and show delivery status",
+  name: "questions", duringReport: true, aliases: ["question"], usage: "\\questions", summary: "Recover pending question cards",
   async run(ctx) {
     if (!ctx.questions) throw new Error("question service unavailable");
     const status = await ctx.questions(ctx.ownerDm ? { dm: true } : { threadKey: ctx.threadKey }, text => ctx.postToThread(text));
@@ -251,7 +234,7 @@ registerCommand({
   async run(ctx) {
     const th = requireThread(ctx);
     const next = !th.hushed;
-    if (next) ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs);
+    if (next) ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs);
     ctx.state.setThread(ctx.threadKey, { ...th, hushed: next });
     await ctx.postToThread(
       next
@@ -264,22 +247,19 @@ registerCommand({
 registerCommand({
   name: "listen",
   usage: "\\listen [on|off]",
-  summary: "Answer every message of yours in this channel, no @ needed (off by default)",
-  detail: "Applies to the whole channel: each top-level message starts its own thread. DMs always listen.",
+  summary: "Answer every message in this channel, no @",
+  detail: "Off by default; bare `\\listen` toggles. Applies to the whole channel: each top-level message starts its own thread. DMs always listen.",
   async run(ctx, args) {
     if (ctx.channelId.startsWith("D")) {
       await ctx.postToThread("DMs always listen already — no @ needed here.");
       return;
     }
-    const arg = args.toLowerCase();
-    if (!arg) {
-      await ctx.postToThread(`Listening to every message in this channel: \`${ctx.state.isAlwaysOn(ctx.channelId) ? "on" : "off"}\``);
-      return;
-    }
-    if (arg !== "on" && arg !== "off") throw new Error("usage: \\listen on|off");
+    // Bare \listen toggles; on/off set explicitly.
+    const arg = args.toLowerCase() || (ctx.state.isAlwaysOn(ctx.channelId) ? "off" : "on");
+    if (arg !== "on" && arg !== "off") throw new Error("usage: \\listen [on|off]");
     ctx.state.setAlwaysOn(ctx.channelId, arg === "on");
     await ctx.postToThread(arg === "on"
-      ? "👂 Listening — every message you post in this channel starts a session, no @ needed. `\\listen off` to stop."
+      ? "👂 Listening — every message you post in this channel starts a session, no @ needed. `\\listen` again to stop."
       : "Back to @-only in this channel.");
   },
 });
@@ -287,7 +267,7 @@ registerCommand({
 registerCommand({
   name: "verbose",
   usage: "\\verbose [on|off|full]",
-  summary: "Tool-call visibility in this thread (on by default)",
+  summary: "Tool-call visibility in this thread",
   detail: "`on` posts a line per tool call · `full` adds output snippets · `off` silences.",
   async run(ctx, args) {
     const th = requireThread(ctx);
@@ -306,8 +286,8 @@ registerCommand({
 registerCommand({
   name: "notify",
   usage: "\\notify [on|off]",
-  summary: "DM you when runs in this thread finish (failures DM you either way)",
-  detail: "Permission asks are always mirrored to your DMs with working buttons — approve from anywhere.",
+  summary: "DM when runs here finish",
+  detail: "Failures DM you either way. Permission asks are always mirrored to your DMs with working buttons — approve from anywhere.",
   async run(ctx, args) {
     const th = requireThread(ctx);
     const arg = args.toLowerCase();
@@ -326,7 +306,7 @@ registerCommand({
 registerCommand({
   name: "stream",
   usage: "\\stream [on|off]",
-  summary: "Post answers paragraph by paragraph as they are written (on), or each part once complete (off)",
+  summary: "Stream answers by paragraph",
   async run(ctx, args) {
     const th = requireThread(ctx);
     const arg = args.toLowerCase();
@@ -355,10 +335,11 @@ registerCommand({
 });
 
 registerCommand({
-  name: "logs",
+  name: "logs", duringReport: true,
+  aliases: ["log"],
   usage: "\\logs [filter] | \\logs --follow [filter]",
-  summary: "Recent bridge log lines; `--follow` streams new lines for 30s",
-  detail: "Substrate is the in-memory ring; the persistent file (rotated) lives at the path shown with `--follow`.",
+  summary: "Recent bridge log lines",
+  detail: "`--follow` streams new lines for 30s. Substrate is the in-memory ring; the persistent file (rotated) lives at the path shown with `--follow`.",
   async run(ctx, args) {
     let follow = false;
     let rest = args.trim();
@@ -401,15 +382,16 @@ registerCommand({
 
 registerCommand({
   name: "model",
+  aliases: ["models"],
   usage: "\\model | \\model <#|provider/model|filter>",
   summary: "Show or swap the model for this thread",
-  detail: "Bare `\\model` prints a numbered list; `\\model 2` picks from it; `\\model sonnet` filters.",
+  detail: "Bare `\\model` posts a searchable picker with your OpenCode ★ favorites on top; `\\model sonnet` filters; `\\model provider/model` sets.",
   async run(ctx, args) {
     const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
     const entry = await ctx.pool.ensure(dir);
     const info = await configProviders(entry.client!);
-    const ids = () =>
-      info.providers.flatMap((p) => Object.keys(p.models).map((mid) => `${p.id}/${mid}`));
+    // Favorites first (TUI ctrl+f order); `\model <#>` numbers follow this order.
+    const models = orderedModels(info, readFavorites());
     // A thread override wins; V2 exposes the location default directly.
     const effectiveModel = async (): Promise<string | undefined> => {
       if (ctx.thread?.model) return ctx.thread.model;
@@ -422,15 +404,13 @@ registerCommand({
     const arg = args.trim();
     if (!arg || arg === "list") {
       const cur = await effectiveModel();
-      // Compact flat list — `provider/model` lines, numbered for \model <#>.
-      const lines = [cur ? `*Models* — current: \`${cur}\`` : "*Models*", ""];
-      ids().forEach((id, i) => lines.push(row(i + 1, id, cur)));
-      lines.push("", "`\\model <#>` to set.");
-      for (const chunk of chunkText(lines.join("\n"))) await ctx.postToThread(chunk);
+      const current = models.find(m => m.id === cur);
+      await ctx.postToThread(cur ? `Model — current: ${cur}` : "Choose a model",
+        modelSearchBlocks(cur ? `*Model* — current: \`${cur}\`` : "*Model*", current && modelOption(current)));
       return;
     }
     const th = requireThread(ctx);
-    const all = ids();
+    const all = models.map(m => m.id);
     const n = Number(arg);
     let model: string | undefined;
     if (Number.isInteger(n) && n >= 1 && n <= all.length) {
@@ -443,12 +423,13 @@ registerCommand({
       if (exact) {
         model = arg;
       } else {
-        // Not a list number, not an exact id → substring filter; one hit sets
-        // it directly, more print a list numbered with GLOBAL indices so
-        // `\model <#>` still resolves against the full ordering.
+        // Not a number, not an exact id → substring filter on id or name; one
+        // hit sets it directly, more print a list numbered with GLOBAL indices
+        // so `\model <#>` resolves against the favorites-first ordering.
         const q = arg.toLowerCase();
-        const hits = all.map((id, i) => ({ id, i })).filter((h) => h.id.toLowerCase().includes(q));
-        if (!hits.length) throw new Error(`no model matches \`${arg}\` — bare \`\\model\` lists all`);
+        const hits = models.map((m, i) => ({ id: m.id, i }))
+          .filter((h) => h.id.toLowerCase().includes(q) || models[h.i]!.name.toLowerCase().includes(q));
+        if (!hits.length) throw new Error(`no model matches \`${arg}\` — bare \`\\model\` to search`);
         if (hits.length === 1) {
           model = hits[0]!.id;
         } else {
@@ -468,8 +449,9 @@ registerCommand({
 
 registerCommand({
   name: "agent",
+  aliases: ["agents"],
   usage: "\\agent | \\agent <# or name>",
-  summary: "Show or swap the OpenCode agent for this thread",
+  summary: "Show or swap this thread's agent",
   async run(ctx, args) {
     const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
     const entry = await ctx.pool.ensure(dir);
@@ -477,6 +459,9 @@ registerCommand({
     const arg = args.trim();
     if (!arg || arg === "list") {
       const cur = ctx.thread?.agent ?? "(default)";
+      const picker = pickerBlocks("agent", `*Agent* — current: \`${cur}\``,
+        [{ label: "Agents", options: agents.map(a => ({ text: a.name, value: `\\agent ${a.name}` })) }], `\\agent ${cur}`);
+      if (picker) await ctx.postToThread("Choose an agent", picker);
       const lines = [`Current: \`${cur}\``, ""];
       agents.forEach((a, i) => lines.push(`${i + 1}) \`${a.name}\``));
       lines.push("", "`\\agent <#|name>` to set.");
@@ -506,9 +491,10 @@ function knownProjectDirs(ctx: CmdCtx): string[] {
 const projectName = (dir: string): string => dir.split("/").filter(Boolean).pop() ?? dir;
 
 registerCommand({
-  name: "project",
+  name: "project", rebinds: "withArgs",
+  aliases: ["projects"],
   usage: "\\project | \\project <name|#>",
-  summary: "Swap projects by name (fuzzy) — fresh session via the same teardown as \\cd",
+  summary: "Swap projects by name or #",
   detail: "`\\project cowork` or `\\project 2`; bare `\\project` lists candidates with numbers.",
   async run(ctx, args) {
     const q = args.trim();
@@ -522,8 +508,11 @@ registerCommand({
         lines.push(`${i + 1}) \`${esc(projectName(d))}\` — ${esc(d)}${pool ? ` (server ${pool.status})` : ""}`);
       });
       if (!rest.length) lines.push("(no other known projects yet — use `\\cd /abs/path` once)");
+      const picker = pickerBlocks("project", `*Project* — current: \`${esc(projectName(current))}\``,
+        [{ label: "Projects", options: rest.map(d => ({ text: `${projectName(d)} — ${d}`, value: `\\cd ${d}` })) }]);
       lines.push("`\\project <name|#>` to switch.");
       invalidateProjectList(ctx);
+      if (picker) await ctx.postToThread("Switch project", picker);
       await ctx.postToThread(lines.join("\n"));
       cacheProjectList(ctx, rest);
       return;
@@ -557,9 +546,9 @@ registerCommand({
 });
 
 registerCommand({
-  name: "cd",
+  name: "cd", rebinds: "withArgs",
   usage: "\\cd /abs/path",
-  summary: "Switch the current project dir — this thread gets a fresh session there",
+  summary: "Switch project dir (fresh session)",
   detail: "Accepts `~` paths. Old session + server are torn down so nothing leaks between projects.",
   async run(ctx, args) {
     if (!args) throw new Error("usage: \\cd /abs/path");
@@ -570,9 +559,9 @@ registerCommand({
 });
 
 registerCommand({
-  name: "new",
+  name: "new", rebinds: "always",
   usage: "\\new [/abs/path]",
-  summary: "Fresh session bound to this thread (optionally in a new project dir)",
+  summary: "Fresh session in this thread",
   detail: "`\\new /abs/path` also switches the current project. Accepts `~` paths. The previous session is kept (\\resume recovers it).",
   async run(ctx, args) {
     if (args) {
@@ -588,8 +577,9 @@ registerCommand({
 
 registerCommand({
   name: "sessions",
+  aliases: ["session"],
   usage: "\\sessions [all|<filter>]",
-  summary: "List recent sessions — this project by default, machine-wide with `all`",
+  summary: "List recent sessions",
   detail: "Running/idle markers per session; the numbers stay stable so `\\resume <#>` binds what you saw. A filter narrows machine-wide.",
   async run(ctx, args) {
     const arg = args.trim();
@@ -600,27 +590,36 @@ registerCommand({
         await ctx.postToThread(`No sessions yet in \`${dir}\` — \`\\sessions all\` lists the whole machine.`);
         return;
       }
+      await postSessionPicker(ctx, refs);
       await ctx.postToThread(renderPickerList(refs, { heading: `*Sessions in* \`${dir}\``, total }));
       return;
     }
     const { refs, total } = await pickerList(ctx, { scope: "all", filter: arg.toLowerCase() === "all" ? undefined : arg });
+    await postSessionPicker(ctx, refs);
     await ctx.postToThread(renderPickerList(refs, { heading: arg.toLowerCase() === "all" ? "*Sessions — machine-wide*" : `*Sessions matching* \`${arg}\``, total }));
   },
 });
 
+/** Dropdown over a \sessions list; choosing one runs `\resume <id>` in this thread. */
+async function postSessionPicker(ctx: CmdCtx, refs: SessionRef[]): Promise<void> {
+  const picker = pickerBlocks("session", "*Resume a session*", [{ label: "Sessions",
+    options: refs.map(r => ({ text: `${r.running ? "▶ " : ""}${r.title || shortId(r.sessionId)} · ${shortPath(r.projectDir)}`, value: `\\resume ${r.sessionId}` })) }]);
+  if (picker) await ctx.postToThread("Resume a session", picker);
+}
+
 registerCommand({
-  name: "resume",
+  name: "resume", rebinds: "withArgs",
   usage: "\\resume <# or session id>",
-  summary: "Bind this thread to an existing session — `#` from the last \\sessions list",
+  summary: "Bind this thread to an existing session",
   detail: "Machine-wide: any session on this computer, including TUI-started ones; the thread follows the session's project.",
   async run(ctx, args) {
     if (!args) throw new Error("usage: \\resume <# or session id>");
-    ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs, true);
+    ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs, true);
     const pick = await pickerResolve(ctx, args);
     if (pick.kind === "stale") {
       // The list the user picked from has expired — showing a fresh one beats
       // guessing that their number still means the same session.
-      await ctx.postToThread(`That list has expired — here's the current one; pick again with \`\\resume <#>\`:\n\n${renderPickerList(pick.list, { heading: "*Sessions*", total: pick.total })}`);
+      await ctx.postToThread(staleListReply(pick, "resume"));
       return;
     }
     const target = pick.ref.sessionId;
@@ -680,13 +679,13 @@ function staleListReply(stale: { list: SessionRef[]; total: number }, cmd: strin
 }
 
 registerCommand({
-  name: "watch",
+  name: "watch", rebinds: "withArgs",
   usage: "\\watch <#|id>",
-  summary: "Live read-only mirror of a session driven on the computer",
+  summary: "Read-only live mirror of a session",
   detail: "Streams a TUI/IDE session's run into this thread (3s transcript poll). Replies stay read-only; `\\resume` takes the session over, `\\unwatch` stops.",
   async run(ctx, args) {
     if (!args) throw new Error("usage: \\watch <# or session id>");
-    ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs, true);
+    ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs, true);
     const pick = await pickerResolve(ctx, args);
     if (pick.kind === "stale") {
       await ctx.postToThread(staleListReply(pick, "watch"));
@@ -745,9 +744,9 @@ registerCommand({
 });
 
 registerCommand({
-  name: "unwatch",
+  name: "unwatch", rebinds: "always",
   usage: "\\unwatch",
-  summary: "Stop mirroring a watched session in this thread",
+  summary: "Stop mirroring",
   async run(ctx) {
     const th = ctx.thread;
     if (!th?.watchOnly) {
@@ -762,9 +761,9 @@ registerCommand({
 });
 
 registerCommand({
-  name: "history",
+  name: "history", duringReport: true,
   usage: "\\history [n] | \\history <#|id>",
-  summary: "Transcript digest of this thread's session (or a picker target)",
+  summary: "Transcript digest of a session",
   detail: "Display-only — reading history never touches the session's context. Bare `n` = tail turns (default 10); `#N`/id picks another session.",
   async run(ctx, args) {
     const arg = args.trim();
@@ -812,11 +811,7 @@ export function renderHistoryDigest(
   const turnsAll: Turn[] = [];
   for (const m of msgs) {
     const role = m.info?.role;
-    const text = (m.parts ?? [])
-      .filter((p) => p.type === "text")
-      .map((p) => (p as { text?: string }).text ?? "")
-      .join("\n")
-      .trim();
+    const text = partsText(m.parts);
     const toolCount = (m.parts ?? []).filter((p) => p.type === "tool").length;
     if (role === "user") {
       turnsAll.push({ user: text ? firstLine(text, 120) : null, agent: [], tools: 0 });
@@ -855,7 +850,7 @@ const SUMMARY_POLL_STEPS = 60;
  * Snapshot the transcript for `\summary`: user + assistant TEXT parts only,
  * clipped to the newest `budget` chars (whole earlier turns dropped first).
  */
-export function transcriptForSummary(
+function transcriptForSummary(
   msgs: Array<{ info: OcMessageInfo; parts: OcPart[] }>,
   budget = SUMMARY_BUDGET_CHARS,
 ): string {
@@ -863,11 +858,7 @@ export function transcriptForSummary(
   for (const m of msgs) {
     const role = m.info?.role;
     if (role !== "user" && role !== "assistant") continue;
-    const text = (m.parts ?? [])
-      .filter((p) => p.type === "text")
-      .map((p) => (p as { text?: string }).text ?? "")
-      .join("\n")
-      .trim();
+    const text = partsText(m.parts);
     if (!text) continue;
     blocks.push(`${role === "user" ? "User" : "Assistant"}: ${text}`);
   }
@@ -886,11 +877,11 @@ export function transcriptForSummary(
 
 /**
  * The `\summary` engine: a THROWAWAY session on the same server gets the
- * transcript + a fixed summarizer prompt, the run is polled to completion
- * (same probe pattern as detectDefaultModel), then aborted + deleted. The
+ * transcript + a fixed summarizer prompt, the run is polled to completion,
+ * then aborted + deleted. The
  * target session never sees any of it — its context stays exactly as it was.
  */
-export async function runSummaryProbe(client: OCClient, transcript: string, model?: string): Promise<string> {
+async function runSummaryProbe(client: OCClient, transcript: string, model?: string): Promise<string> {
   const sess = await sessionCreate(client, "SlackOC summary probe");
   try {
     await promptAsync(client, sess.id, SUMMARY_PROMPT + transcript, model ? { model } : {});
@@ -898,11 +889,7 @@ export async function runSummaryProbe(client: OCClient, transcript: string, mode
       const msgs = await sessionMessages(client, sess.id);
       const last = [...msgs].reverse().find((m) => m.info?.role === "assistant");
       if (last?.info?.time?.completed) {
-        const text = (last.parts ?? [])
-          .filter((p) => p.type === "text")
-          .map((p) => (p as { text?: string }).text ?? "")
-          .join("\n")
-          .trim();
+        const text = partsText(last.parts);
         if (text) return text;
       }
       await new Promise((r) => setTimeout(r, 3_000));
@@ -920,9 +907,10 @@ const SUMMARY_PROMPT =
   "and anything left unfinished. Be concise — under 250 words. Transcript:\n\n";
 
 registerCommand({
-  name: "summary",
+  name: "summary", duringReport: true,
+  aliases: ["summarize"],
   usage: "\\summary [#|id]",
-  summary: "AI catch-up summary of a session, posted here only (one extra model call)",
+  summary: "AI catch-up summary of a session",
   detail: "Runs in a throwaway session — the target's context stays clean. Refuses while the target is mid-run (snapshot semantics).",
   async run(ctx, args) {
     const t = await resolveTarget(ctx, args);
@@ -951,71 +939,64 @@ registerCommand({
 });
 
 registerCommand({
+  name: "usage",
+  aliases: ["cost", "costs", "spend", "stats"],
+  usage: "\\usage [today|7d|30d] [all]",
+  summary: "Cost, tokens and daily activity",
+  detail: "Defaults to the last 7 days for this thread's project (or the current project); `all` covers every project. Days follow the bridge machine's time zone.",
+  async run(ctx, args) {
+    const { range, all } = parseUsageArgs(args);
+    const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const days = USAGE_RANGES[range];
+    const now = new Date();
+    const from = rangeStart(days, now);
+    const text = await withServerLease(ctx, dir, async (entry) => {
+      const client = entry.client!;
+      const project = all ? undefined : await projectId(client);
+      const query = (start: Date) => sessionStats(client, { from: start.getTime(), to: now.getTime(), project, timezone, tools: "none" });
+      const [stats, today] = await Promise.all([query(from), days > 1 ? query(rangeStart(1, now)) : undefined]);
+      return formatUsage(stats, { scope: all ? "all projects" : projectName(dir), range, days: dayKeys(from, days, timezone), todayCost: today?.cost });
+    });
+    await ctx.postToThread(text);
+  },
+});
+
+registerCommand({
   name: "stop",
+  aliases: ["abort", "cancel"],
   usage: "\\stop",
-  summary: "Abort the running task in this thread",
+  summary: "Abort the running task",
   async run(ctx) {
     const th = requireThread(ctx);
-    ctx.state.cancelRecovery(ctx.threadKey, (ctx as CmdCtx & { messageTs?: string }).messageTs);
+    ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs);
     // Finalized views leave the registry, so an absent view = nothing in flight.
     if (!getView(th.sessionId)) {
       await ctx.postToThread("Nothing running in this thread.");
       return;
     }
-    const entry = await serverFor(ctx, th);
+    const entry = await ctx.pool.ensure(th.projectDir);
     await sessionAbort(entry.client!, th.sessionId);
     await ctx.postToThread("🛑 Aborted.");
   },
 });
 
-registerCommand({
-  name: "projects",
-  usage: "\\projects",
-  summary: "Alias for \\project",
-  aliasOf: "project",
-  async run() {},
-});
-
-registerCommand({
-  name: "abort",
-  usage: "\\abort",
-  summary: "Alias for \\stop",
-  aliasOf: "stop",
-  async run() {},
-});
-
 /** Per-file diffstat lines + a totals header — shared by `\diff` and the DM "View diff" button (RF1). */
-export function formatDiffSummary(diffs: OcFileDiff[]): string {
-  const totals = diffs.reduce(
-    (a, d) => ({ add: a.add + d.additions, del: a.del + d.deletions }),
-    { add: 0, del: 0 },
-  );
-  const lines = diffs.map((d) => `  \`+${d.additions}/−${d.deletions}\` ${shortPath(d.file)}`);
-  return [`*Diff:* +${totals.add}/−${totals.del} across ${diffs.length} file(s)`, ...lines].join("\n");
-}
-
-/** Unified diff across files with real changes — shared by `\diff full` and the RF1 button. Empty when nothing changed. */
-export function buildUnifiedDiff(diffs: OcFileDiff[]): string {
-  return diffs
-    .filter((d) => d.patch || d.before !== d.after)
-    .map((d) => d.patch ?? createTwoFilesPatch(`a/${d.file}`, `b/${d.file}`, d.before, d.after, undefined, undefined, { context: 3 }))
-    .join("\n")
-    .trim();
-}
-
 registerCommand({
   name: "diff",
+  aliases: ["diffs"],
   usage: "\\diff | \\diff full",
-  summary: "Diff summary for this thread's session; `full` adds the unified diff",
+  summary: "Diff of this thread's session",
   async run(ctx, args) {
     const th = requireThread(ctx);
-    const entry = await serverFor(ctx, th);
+    const entry = await ctx.pool.ensure(th.projectDir);
     const diffs = await sessionDiff(entry.client!, th.sessionId);
     if (!diffs.length) {
       await ctx.postToThread("(no tracked edits in this session yet)");
       return;
     }
-    await ctx.postToThread(formatDiffSummary(diffs));
+    const summary = formatDiffSummary(diffs);
+    await ctx.postToThread(summary, viewDiffBlocks(summary, th.sessionId));
     if (args.trim().toLowerCase() !== "full") return;
     // Unified diff from the per-file before/after snapshots — inline when it
     // fits in one message, snippet upload otherwise.
@@ -1031,11 +1012,20 @@ registerCommand({
 
 registerCommand({
   name: "cmd",
-  usage: "\\cmd <opencode command> [args]",
-  summary: "Run an OpenCode native command in this session (passthrough)",
-  detail: "e.g. `\\cmd compact` — same as typing the command in the OpenCode TUI.",
+  aliases: ["cmds", "command", "commands"],
+  usage: "\\cmd [<opencode command> [args]]",
+  summary: "Run a native OpenCode command; bare lists them",
+  detail: "e.g. `\\cmd compact` — same as typing the command in the OpenCode TUI. A bare `\\cmd` lists the commands available in this project.",
   async run(ctx, args) {
-    if (!args) throw new Error("usage: \\cmd <command> [args]");
+    if (!args) {
+      const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+      const commands = await withServerLease(ctx, dir, (entry) => commandList(entry.client!));
+      const lines = commands.length
+        ? [`*OpenCode commands in* \`${dir}\``, ...commands.map((c) => `• \`${c.name}\`${c.description ? ` — ${c.description}` : ""}`), "", "Run one with `\\cmd <command> [args]`."]
+        : [`No OpenCode commands found in \`${dir}\`.`];
+      for (const chunk of chunkText(lines.join("\n"))) await ctx.postToThread(chunk);
+      return;
+    }
     const th = requireThread(ctx);
     const space = args.indexOf(" ");
     const command = space < 0 ? args : args.slice(0, space);
@@ -1044,7 +1034,20 @@ registerCommand({
       parts?: Array<{ type: string; text?: string }>;
     };
     const texts = (result?.parts ?? []).filter((p) => p.type === "text" && p.text).map((p) => p.text!);
-    await ctx.postToThread(texts.length ? texts.join("\n\n") : `Command \`${command}\` executed (no text output).`);
+    if (!texts.length) { await ctx.postToThread(`Command \`${command}\` executed (no text output).`); return; }
+    for (const chunk of chunkText(texts.join("\n\n"))) await ctx.postToThread(chunk);
+  },
+});
+
+registerCommand({
+  name: "schedule", duringReport: true,
+  aliases: ["schedules"],
+  usage: SCHEDULE_USAGE,
+  summary: "Manage daily/weekly reports",
+  detail: "Creation previews the project, prompt, destination and time zone before confirmation; `\\schedule edit <id>` reopens the form.",
+  async run(ctx, args) {
+    if (!ctx.schedules) throw new Error("scheduled reports are unavailable — check bridge logs");
+    await ctx.schedules.run(ctx, args);
   },
 });
 

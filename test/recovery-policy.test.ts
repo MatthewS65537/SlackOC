@@ -5,7 +5,7 @@ const NOW = Date.parse("2026-09-22T00:00:00Z");
 const recent = timestampFromMs(NOW - 1000);
 function thread(): ThreadState {
   return { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW,
-    historyCursorTs: timestampFromMs(NOW - 5000), recovery: { version: 1, ownerActivityTs: recent,
+    historyCursorTs: timestampFromMs(NOW - 5000), recovery: { ownerActivityTs: recent,
       replayFloorTs: timestampFromMs(NOW - MAX_REPLAY_AGE_MS), bindingGeneration: 3, intentVersion: 1 } };
 }
 describe("hard original-message age", () => {

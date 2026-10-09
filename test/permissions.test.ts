@@ -40,10 +40,9 @@ function setup(r = record()) {
 }
 
 describe("permission input validation", () => {
-  it.each(["once", "always", "reject"] as const)("validates %s and matching new/legacy action IDs", r => {
+  it.each(["once", "always", "reject"] as const)("validates %s and its matching action ID", r => {
     const value = { s: "ses_1", p: "per_1", r, g: 2 };
     expect(parsePermissionButton(`perm_${r}`, JSON.stringify(value))).toEqual(value);
-    expect(parsePermissionButton("perm", JSON.stringify(value))).toEqual(value);
     expect(parsePermissionButton("perm_bogus", JSON.stringify(value))).toBeUndefined();
   });
   it.each([null, "{", "null", "{}", JSON.stringify({ s: "ses_1", p: "per_1", r: "yes" }),

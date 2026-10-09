@@ -7,12 +7,14 @@ import { enqueue } from "../slack/queue.js";
 import { esc, mdToMrkdwn, truncate } from "../util.js";
 import { installScheduleControls } from "./controls.js";
 import { ReportRunner } from "./runner.js";
-import { ScheduleStore, type ScheduleRun } from "./store.js";
+import { ScheduleStore, TERMINAL_RUN_STATUSES, type ScheduleJob, type ScheduleRun } from "./store.js";
 import { Scheduler } from "./scheduler.js";
 
 export interface ScheduledReports {
   commands: ScheduleCommands;
   eligible(threadKey: string, sessionId: string): boolean;
+  /** Current job definitions (read-only copies) for the Home tab. */
+  jobs(): ScheduleJob[];
   poll(): Promise<void>;
   close(): void;
 }
@@ -152,21 +154,24 @@ export function createScheduledReports(opts: Options): ScheduledReports {
   });
   const scheduler = new Scheduler({ store, tickRun: run => runner.tick(run), onError: opts.onError });
   const poll = () => opts.stopping() ? Promise.resolve() : scheduler.poll();
-  const commands = installScheduleControls({ app: opts.app, owner: opts.owner, store, poll, stopping: opts.stopping,
-    busy: key => {
-      const thread = opts.state.getThread(key);
-      return !!thread?.scheduledRunId && eligible(key, thread.sessionId);
-    },
+  const controls = installScheduleControls({ app: opts.app, owner: opts.owner, store, poll, stopping: opts.stopping,
     cancel: async id => {
       const run = store.run(id);
       if (!run) throw new Error("unknown report run ID — use \\schedule history");
-      if (["delivered", "failed", "canceled", "skipped"].includes(run.status)) throw new Error(`Report run is already ${run.status}.`);
+      if (TERMINAL_RUN_STATUSES.has(run.status)) throw new Error(`Report run is already ${run.status}.`);
       await runner.cancel(id);
+    },
+  });
+  const commands: ScheduleCommands = {
+    ...controls,
+    busy: key => {
+      const thread = opts.state.getThread(key);
+      return !!thread?.scheduledRunId && eligible(key, thread.sessionId);
     },
     cancelThread: async key => {
       const id = opts.state.getThread(key)?.scheduledRunId;
       if (id) await runner.cancel(id);
     },
-  });
-  return { commands, eligible, poll, close: () => scheduler.close() };
+  };
+  return { commands, eligible, jobs: () => store.jobs(), poll, close: () => scheduler.close() };
 }

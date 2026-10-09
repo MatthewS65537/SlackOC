@@ -1,8 +1,9 @@
 /** Single bridge writer; deliberately separate from prompt/receipt state. */
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "../config.js";
+import { writeFileAtomic } from "../util.js";
 import type { OcPermission } from "../opencode/api.js";
 import { validPermissionId, type PermButtonValue } from "./blocks.js";
 
@@ -148,18 +149,7 @@ export class PermissionDeliveryStore {
     // Pending/uncertain decisions are never evicted to make room for another ask.
     if (next.size > this.maxRecords) throw new Error("Permission store full; unresolved requests retained");
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const temporary = `${this.path}.${randomUUID()}.tmp`;
-    let fd: number | undefined;
-    try {
-      fd = openSync(temporary, "wx", 0o600);
-      writeFileSync(fd, JSON.stringify({ version: 1, records: [...next.values()] }));
-      fsyncSync(fd);
-      closeSync(fd); fd = undefined;
-      renameSync(temporary, this.path);
-      this.records = next;
-    } finally {
-      if (fd !== undefined) closeSync(fd);
-      if (existsSync(temporary)) unlinkSync(temporary);
-    }
+    writeFileAtomic(this.path, JSON.stringify({ version: 1, records: [...next.values()] }));
+    this.records = next;
   }
 }

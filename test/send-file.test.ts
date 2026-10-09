@@ -16,7 +16,7 @@ const call = (opts = {}, deps = {}) => sendFile({ file: path, session: "ses_curr
 beforeEach(() => {
   mkdirSync(root, { recursive: true });
   writeFileSync(path, binary);
-  writeFileSync(configPath, JSON.stringify({ slackBotToken: "xoxb-secret-fixture", ownerSlackUserId: "U123" }));
+  writeFileSync(configPath, JSON.stringify({ slackBotToken: "xoxb-secret-fixture", ownerSlackUserId: "U12345678" }));
   save();
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); rmSync(root, { recursive: true, force: true }); });
@@ -92,6 +92,8 @@ describe("active-thread file delivery through the installed Slack SDK", () => {
     const { fetch } = transport();
     writeFileSync(statePath, "not JSON");
     await expect(call()).rejects.toThrow(/state/);
+    writeFileSync(statePath, JSON.stringify({ version: 2, threads: { "C123:1791000000.123456": thread() }, projects: {} }));
+    await expect(call()).rejects.toThrow(/state version 2 is not supported/);
     save();
     rmSync(configPath);
     await expect(call()).rejects.toThrow(/slackoc init/);
