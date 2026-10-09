@@ -1707,7 +1707,16 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   // Only enable intake after cleaning the previous process's tombstones. A
   // fresh prompt delivered during app.start must never join the interrupt sweep.
   if (stopping) return;
-  await app.start();
+  // The first websocket can close before Slack's hello (e.g. a pong timeout);
+  // the library then rejects with `undefined`. Hand that to the supervisor's
+  // retry loop instead of failing startup.
+  let socketUp = true;
+  try {
+    await app.start();
+  } catch (err) {
+    socketUp = false;
+    pushLog(`slack socket: initial connect failed (${String((err as Error)?.message ?? err ?? "closed before hello")}) — retrying`);
+  }
   if (stopping) return;
   const onConnected = () => {
     if (stopping) return;
@@ -1725,7 +1734,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     fatalAfterMs: process.env.SLACKOC_SERVICE === "bridge" ? SOCKET_FATAL_MS : Infinity,
     onFatal: () => { void shutdown(1); },
   });
-  socketSupervisor.start();
+  socketSupervisor.start(socketUp);
   // Stop supervising BEFORE app.stop() disconnects, or the disconnect would schedule a reconnect.
   cleanup.unshift(() => socketSupervisor?.stop());
   // Every tick requests recovery, including the first tick after sleep.

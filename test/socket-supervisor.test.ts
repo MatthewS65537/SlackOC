@@ -47,6 +47,18 @@ describe("SocketSupervisor", () => {
     sup.stop();
   });
 
+  it("takes over a failed initial connect instead of leaving the socket down", async () => {
+    const onRecovered = vi.fn();
+    const sup = new SocketSupervisor(socket, { log: l => logs.push(l), random: () => 0.5, onRecovered });
+    sup.start(false);
+    expect(sup.health().connected).toBe(false);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(socket.starts).toBe(1);
+    expect(sup.health().connected).toBe(true);
+    expect(onRecovered).toHaveBeenCalledOnce();
+    sup.stop();
+  });
+
   it("keeps retrying with backoff where the library would give up (fetch failed)", async () => {
     const sup = make();
     socket.failNext = 3;

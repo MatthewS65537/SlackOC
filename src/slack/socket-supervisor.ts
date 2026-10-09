@@ -85,9 +85,10 @@ export class SocketSupervisor {
     this.downSince = this.lastTick = this.now();
   }
 
-  /** Begin supervising. Call after the initial app.start() resolved (the socket is connected). */
-  start(): void {
-    this.markConnected();
+  /** Begin supervising after the initial app.start(). If that failed (`connected` false), the supervisor retries it. */
+  start(connected = true): void {
+    if (connected) this.markConnected();
+    else this.markDown("initial connect failed");
     this.listen("connected", () => this.markConnected());
     // With auto-reconnect off, the library emits `disconnected` after every close.
     this.listen("disconnected", () => this.markDown("disconnected"));
