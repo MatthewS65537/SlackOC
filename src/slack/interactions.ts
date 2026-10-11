@@ -86,8 +86,11 @@ export function createInteractions(deps: InteractionDeps) {
    * Live question asks. `req` is the full stored ask (options resolved from
    * here, not from the button value); `answers` accumulates one label-array
    * per question; `finalized` marks which questions are locked in (a
-   * multi-select's toggles don't count until submitted). When every question
-   * is finalized, we reply.
+   * multi-select's toggles don't count until submitted). `cursor` is the
+   * question the owner navigated to with Back/Next (undefined = the first
+   * unfinished one; see shownQuestion). When every visible question is
+   * finalized, single-question asks reply at once; longer forms show a review
+   * step and reply on "Submit answers".
    */
   type QuestionAsk = InteractionAsk & {
     req: OcQuestionRequest;
@@ -96,6 +99,7 @@ export function createInteractions(deps: InteractionDeps) {
     generation: number;
     response: "pending" | "answering" | "uncertain" | "resolved";
     page?: number;
+    cursor?: number;
     ui: NonNullable<QuestionSnapshot["ui"]>;
     draftRevision: number;
     resumeOwnerTs?: string;
@@ -130,7 +134,7 @@ export function createInteractions(deps: InteractionDeps) {
     questionStore.put({ id: ask.id, sessionId: ask.sessionId, projectDir: ask.projectDir, generation: ask.generation,
       channel: ask.channel, threadTs: ask.threadTs, req: ask.req, answers: ask.answers, finalized: ask.finalized,
       askTs: ask.askTs, dmTs: ask.dmTs, response: ask.response, updatedAt: Date.now(),
-      threadDelivery: ask.threadDelivery, dmDelivery: ask.dmDelivery, ui: ask.ui, page: ask.page,
+      threadDelivery: ask.threadDelivery, dmDelivery: ask.dmDelivery, ui: ask.ui, page: ask.page, cursor: ask.cursor,
       draftRevision: ask.draftRevision, resumeOwnerTs: ask.resumeOwnerTs, resolvedText: ask.resolvedText,
       retiredCopies: saved?.retiredCopies, presentation: ask.presentation,
       threadPresentation: samePlacement ? saved.threadPresentation ?? 0 : ask.presentation,
@@ -141,17 +145,25 @@ export function createInteractions(deps: InteractionDeps) {
     const visible = visibleQuestions(ask.req, ask.answers);
     return ask.req.questions.findIndex((_, i) => visible[i] && !ask.finalized[i]);
   }
-  function changedQuestion(ask: QuestionAsk, draft = true): void {
+  /** The question on screen: the Back/Next cursor when it is still visible, else the first unfinished one (-1 = review step). */
+  function shownQuestion(ask: Pick<QuestionSnapshot, "req" | "answers" | "finalized" | "cursor">): number {
+    const c = ask.cursor;
+    return c !== undefined && visibleQuestions(ask.req, ask.answers)[c] ? c : activeQuestion(ask);
+  }
+  /** Single-question asks submit on the answering tap; longer forms wait for the review step's "Submit answers". */
+  const oneTap = (ask: QuestionAsk): boolean => visibleQuestions(ask.req, ask.answers).filter(Boolean).length === 1;
+  /** Persist a draft/UI change. Moving to another question posts a fresh bottom card (presentation++) unless `inPlace` (Back/Next). */
+  function changedQuestion(ask: QuestionAsk, draft = true, inPlace = false): void {
     const previous = questionStore.get(ask.id);
     try {
-      if (previous && sameQuestionBinding(previous, ask) && ask.response === "pending" &&
-        activeQuestion(ask) >= 0 && activeQuestion(previous) !== activeQuestion(ask)) ask.presentation++;
+      if (!inPlace && previous && sameQuestionBinding(previous, ask) && ask.response === "pending" &&
+        shownQuestion(ask) >= 0 && shownQuestion(previous) !== shownQuestion(ask)) ask.presentation++;
       ask.ui.revision++;
       if (draft) ask.draftRevision++;
       saveQuestion(ask);
     } catch (err) {
       if (previous?.generation === ask.generation) Object.assign(ask, {
-        answers: previous.answers, finalized: previous.finalized, response: previous.response, page: previous.page,
+        answers: previous.answers, finalized: previous.finalized, response: previous.response, page: previous.page, cursor: previous.cursor,
         draftRevision: previous.draftRevision ?? 0, ui: previous.ui ?? { revision: 1, threadApplied: 0, dmApplied: 0 },
         resolvedText: previous.resolvedText,
         presentation: previous.presentation ?? 0,
@@ -159,10 +171,18 @@ export function createInteractions(deps: InteractionDeps) {
       throw err;
     }
   }
-  const questionCard = (ask: Pick<QuestionAsk, "req" | "answers" | "finalized" | "page" | "generation" | "response" | "id" | "sessionId" | "projectDir" | "channel" | "threadTs"> & { presentation?: number }) => {
+  const questionCard = (ask: Pick<QuestionAsk, "req" | "answers" | "finalized" | "page" | "cursor" | "generation" | "response" | "id" | "sessionId" | "projectDir" | "channel" | "threadTs"> & { presentation?: number }) => {
     const visible = visibleQuestions(ask.req, ask.answers);
     return questionBlocks(ask.req, ask.answers, ask.finalized.map((done, i) => done || !visible[i]), ask.page,
-      { generation: ask.generation, binding: questionBindingToken(ask), presentation: ask.presentation ?? 0, response: ask.response });
+      { generation: ask.generation, binding: questionBindingToken(ask), presentation: ask.presentation ?? 0, response: ask.response,
+        shown: shownQuestion(ask) });
+  };
+  /** Thread of a known question-card copy, for queue ordering; undefined (a queue barrier) when unknown. */
+  const questionCopyThread = (channel: string, ts: string): string | undefined => {
+    if (channel === dmChannelId()) return "";
+    return questionStore.list().find(r => r.channel === channel && (r.askTs === ts ||
+      r.relocation?.thread?.oldTs === ts || r.relocation?.thread?.postedTs === ts ||
+      r.retiredCopies?.some(c => c.channel === channel && c.ts === ts)))?.threadTs;
   };
   const questionUi = new QuestionUiReconciler({ store: questionStore, dmChannel: () => dmChannelId(),
     stopping: () => isStopping(), onError: logErr,
@@ -181,7 +201,7 @@ export function createInteractions(deps: InteractionDeps) {
       await enqueue(async () => {
         const card = build();
         if (card) await app.client.chat.update({ channel, ts, text: card.text, blocks: card.blocks as never });
-      }, { channel, method: "chat.update", lane: "interactive" });
+      }, { channel, method: "chat.update", lane: "interactive", thread: questionCopyThread(channel, ts) });
     },
     remove: async (channel, ts, allowed) => {
       await enqueue(async () => {
@@ -191,7 +211,7 @@ export function createInteractions(deps: InteractionDeps) {
           const e = err as { code?: string; data?: { error?: string } };
           if (e?.code !== "slack_webapi_platform_error" || e.data?.error !== "message_not_found") throw err;
         }
-      }, { channel, method: "chat.delete", lane: "interactive" });
+      }, { channel, method: "chat.delete", lane: "interactive", thread: questionCopyThread(channel, ts) });
     },
     post: (channel, threadTs, build) => enqueue(async () => {
       const card = build();
@@ -200,12 +220,12 @@ export function createInteractions(deps: InteractionDeps) {
         text: card.text, blocks: card.blocks as never, unfurl_links: false, unfurl_media: false });
       if (!result.ts) throw new Error("Slack did not confirm the question card timestamp");
       return { ts: result.ts };
-    }, { channel, lane: "interactive" }),
-    find: (channel, threadTs, marker) => enqueue(async () => {
+    }, { channel, lane: "interactive", thread: threadTs ?? "" }),
+    find: async (channel, threadTs, marker, oldest) => {
       if (isStopping()) return;
-      const { ts } = findBotPost(await historyPage(channel, threadTs), hasLine([marker]));
+      const { ts } = await findBotMarker(channel, threadTs, hasLine([marker]), { oldest, lane: "interactive" });
       return ts ? { ts } : undefined;
-    }, { channel, method: threadTs ? "conversations.replies" : "conversations.history", lane: "interactive" }),
+    },
     rejectedPost,
     onAdopt: record => {
       const ask = quesAsks.get(record.id);
@@ -256,24 +276,33 @@ export function createInteractions(deps: InteractionDeps) {
   }
 
   /** One page (100) of a thread, or of a channel when `threadTs` is unset; callers enqueue it. */
-  function historyPage(channel: string, threadTs: string | undefined, oldest?: string) {
-    const range = oldest ? { oldest, inclusive: true } : {};
+  function historyPage(channel: string, threadTs: string | undefined, oldest?: string, cursor?: string) {
+    const range = { ...(oldest ? { oldest, inclusive: true } : {}), ...(cursor ? { cursor } : {}) };
     return threadTs
       ? app.client.conversations.replies({ channel, ts: threadTs, ...range, limit: 100 })
       : app.client.conversations.history({ channel, ...range, limit: 100 });
   }
 
-  /** First bot-authored post whose text matches; `complete` means the page held the whole range (absent is proven). */
-  function findBotPost(page: Awaited<ReturnType<typeof historyPage>>, match: (text: string) => boolean): { ts?: string; complete: boolean } {
-    const copy = page.messages?.find(m => m.user === botUserId() && !!m.text && match(m.text) && m.ts);
-    return { ts: copy?.ts, complete: !page.has_more && !page.response_metadata?.next_cursor };
-  }
-
-  function findBotMarker(channel: string, threadTs: string | undefined, match: (text: string) => boolean,
+  /** Pages read per marker search; past this, absence stays unproven. */
+  const MARKER_PAGES = 5;
+  /**
+   * First bot-authored post whose text matches, following next_cursor for up to
+   * MARKER_PAGES pages (one queued request each). `complete` means every page in
+   * the range was read, so absence is proven; a missing cursor, has_more, or an
+   * exhausted budget leaves it unproven. Read-only: never posts or replies.
+   */
+  async function findBotMarker(channel: string, threadTs: string | undefined, match: (text: string) => boolean,
     opts: { oldest?: string; lane?: "interactive" } = {}): Promise<{ ts?: string; complete: boolean }> {
-    return enqueue(() => historyPage(channel, threadTs, opts.oldest),
-      { channel, method: threadTs ? "conversations.replies" : "conversations.history", ...(opts.lane ? { lane: opts.lane } : {}) })
-      .then(page => findBotPost(page, match));
+    let cursor: string | undefined;
+    for (let pages = 0; pages < MARKER_PAGES && !isStopping(); pages++) {
+      const page = await enqueue(() => historyPage(channel, threadTs, opts.oldest, cursor),
+        { channel, method: threadTs ? "conversations.replies" : "conversations.history", ...(opts.lane ? { lane: opts.lane } : {}) });
+      const copy = page.messages?.find(m => m.user === botUserId() && !!m.text && match(m.text) && m.ts);
+      if (copy?.ts) return { ts: copy.ts, complete: true };
+      cursor = page.response_metadata?.next_cursor || undefined;
+      if (!cursor) return { complete: !page.has_more };
+    }
+    return { complete: false };
   }
 
   const hasLine = (markers: string[]) => (text: string) => text.split("\n").some(line => markers.includes(line));
@@ -304,7 +333,7 @@ export function createInteractions(deps: InteractionDeps) {
           await app.client.chat.postMessage({ channel: ask.channel, thread_ts: ask.threadTs,
             text: `⏰ Still waiting on this ${kind} — ${action}.`,
             mrkdwn: true, unfurl_links: false, unfurl_media: false });
-        }, { channel: ask.channel }).catch(() => {});
+        }, { channel: ask.channel, thread: ask.threadTs }).catch(() => {});
         if (remaining > 0) nudge(remaining - 1);
       }, 180_000);
       timer.unref();
@@ -396,6 +425,11 @@ export function createInteractions(deps: InteractionDeps) {
     if (bound.thread.scheduledRunId) {
       if (!scheduledReports()?.eligible(bound.key, perm.sessionID)) return;
     } else if (retry && !isRecentRecoveryEligibleThread(bound.thread, state.now())) return;
+    // First sight: let the run's earlier output land before the card (queue.ts keeps it ordered).
+    if (!retry && !permAsks.has(perm.id)) {
+      await getView(perm.sessionID)?.settle();
+      if (isStopping() || resolvedPerms.has(perm.id)) return;
+    }
     let ask = permAsks.get(perm.id);
     if (!ask) {
       const base = newAsk(perm.id, perm.sessionID);
@@ -451,6 +485,11 @@ export function createInteractions(deps: InteractionDeps) {
       if (!bound || (!bound.thread.scheduledRunId && !isRecentRecoveryEligibleThread(bound.thread, state.now()) &&
         !(saved && resumedQuestionEligible(saved)) && !resumeOwnerTs)) return;
     }
+    // First sight: let the run's earlier output land before the card (queue.ts keeps it ordered).
+    if (!retry && !quesAsks.has(req.id) && !questionStore.get(req.id)) {
+      await getView(req.sessionID)?.settle();
+      if (isStopping() || resolvedQuestions.has(req.id)) return;
+    }
     const prior = questionStore.get(req.id);
     const [targetChannel, targetThread] = context.key.split(":") as [string, string];
     if (prior && !sameQuestionBinding(prior, { id: req.id, sessionId: req.sessionID, projectDir: context.thread.projectDir,
@@ -490,7 +529,7 @@ export function createInteractions(deps: InteractionDeps) {
         finalized: restore ? saved.finalized : req.questions.map(() => false),
         askTs: restore || sameDestination ? saved.askTs : null, dmTs: restore || carry ? saved.dmTs : null,
         ui: restore ? saved.ui ?? { revision: 1, threadApplied: 0, dmApplied: 0 } : { revision: (saved?.ui?.revision ?? 0) + 1, threadApplied: 0, dmApplied: 0 },
-        page: restore ? saved.page : 0, draftRevision: restore ? saved.draftRevision ?? 0 : (saved?.draftRevision ?? 0) + 1,
+        page: restore ? saved.page : 0, cursor: restore ? saved.cursor : undefined, draftRevision: restore ? saved.draftRevision ?? 0 : (saved?.draftRevision ?? 0) + 1,
         presentation: restore ? saved.presentation ?? 0 : 0,
         resumeOwnerTs: resumeOwnerTs ?? (restore ? saved.resumeOwnerTs : undefined) };
       if (isStopping() || state.bindingGeneration(context.key) !== generation || state.findThreadBySession(req.sessionID)?.key !== context.key) return;
@@ -600,6 +639,12 @@ export function createInteractions(deps: InteractionDeps) {
         if (permissions.status === "fulfilled") {
           const ids = new Set(permissions.value.map(p => p.id));
           for (const [id, ask] of permAsks) if (ask.projectDir === key && !ids.has(id)) work.push(onPermissionResolved(id));
+          // Saved requests never hydrated (e.g. resolved while the bridge was down): the
+          // responder resolves current ones as unconfirmed without sending any reply.
+          for (const saved of permissionStore.list()) if (saved.projectDir === key && saved.response.status !== "resolved" &&
+            !ids.has(saved.requestId) && !permAsks.has(saved.requestId)) {
+            work.push(permissionResponder.observeResolved(saved).then(() => {}));
+          }
           for (const p of permissions.value) work.push(onPermission(p, true, key));
         } else pushLog(`permission sweep failed for ${key}: ${String(permissions.reason)}`);
         await Promise.all(work);
@@ -673,7 +718,7 @@ export function createInteractions(deps: InteractionDeps) {
         return app.client.chat.postMessage({ channel, ...(destination === "thread" ? { thread_ts: rootTs } : {}),
           text: text + link, ...(blocks ? { blocks: appendSectionSuffix(blocks, link) as never } : {}),
           mrkdwn: true, unfurl_links: false, unfurl_media: false });
-      }, { channel, lane: "interactive" });
+      }, { channel, lane: "interactive", thread: destination === "thread" ? rootTs : "" });
       if (!result.ts) throw new Error("Slack did not confirm the permission message timestamp");
       return { channel, ts: result.ts };
     },
@@ -736,6 +781,16 @@ export function createInteractions(deps: InteractionDeps) {
     }));
   }
 
+  // Accepted-but-response-lost copies of resolved permissions: marker-only, a few per refresh.
+  let terminalPermissionOffset = 0;
+  async function reconcileTerminalPermissionPosts(): Promise<void> {
+    const records = permissionStore.list().filter(r => r.response.status === "resolved" && state.now() - r.updatedAt <= 7 * 86400_000 &&
+      [r.thread, r.dm].some(d => d.status === "uncertain" || d.status === "in-flight"));
+    const work = Array.from({ length: Math.min(4, records.length) }, (_, i) => records[(terminalPermissionOffset + i) % records.length]!);
+    terminalPermissionOffset += work.length;
+    await Promise.all(work.map(record => permissionDelivery.recoverTerminal(record)));
+  }
+
   async function refreshPermissions(force = false): Promise<void> {
     if (!interactionsEnabled() || isStopping()) return;
     if (!dmChannelId() && force) {
@@ -761,6 +816,7 @@ export function createInteractions(deps: InteractionDeps) {
     }
     await Promise.all(pool.list().filter(e => e.status === "ready").map(e => sweepInteractions(e.dir)));
     await reconcileTerminalQuestionPosts();
+    await reconcileTerminalPermissionPosts();
     await questionUi.refreshAll(force);
     if (force) await Promise.all([...permAsks.values()].map(a => permissionDelivery.deliver(a.record, { force: true })));
   }
@@ -800,10 +856,12 @@ export function createInteractions(deps: InteractionDeps) {
   // One recoverable writer per copy; callers never pass captured old blocks.
   const renderAskBoth = (ask: QuestionAsk): Promise<unknown>[] => [questionUi.refresh(ask.id, true)];
 
-  // If every question is finalized, send the answer matrix and resolve the ask;
-  // otherwise re-render both copies. "failed" = the reply errored (re-rendered
-  // so the owner can retry or Skip) — the caller surfaces the ephemeral notice.
-  const submitAskIfComplete = async (ask: QuestionAsk, client: NonNullable<PoolEntry["client"]>): Promise<"replied" | "incomplete" | "failed"> => {
+  // If every question is finalized and the owner `confirmed` (one-tap ask or
+  // the review step's Submit answers), send the answer matrix and resolve the
+  // ask; otherwise re-render both copies (a complete, unconfirmed form shows the
+  // review step). "failed" = the reply errored (re-rendered so the owner can
+  // retry or Skip) — the caller surfaces the ephemeral notice.
+  const submitAskIfComplete = async (ask: QuestionAsk, client: NonNullable<PoolEntry["client"]>, confirmed: boolean): Promise<"replied" | "incomplete" | "failed"> => {
     if (!isPending(ask, "question")) return "incomplete";
     if (questionLocks.has(ask.id)) return "incomplete";
     changedQuestion(ask);
@@ -818,7 +876,7 @@ export function createInteractions(deps: InteractionDeps) {
         }
         ask.response = "pending"; changedQuestion(ask, false);
         await questionUi.refresh(ask.id, true);
-        await render.post(ask.channel, ask.threadTs, "The form is still pending. Your previous submission was not confirmed; review your answers, then tap Retry submission again to send them.", undefined, { lane: "interactive" });
+        await render.post(ask.channel, ask.threadTs, "The form is still pending. Your previous submission was not confirmed; review your answers, then tap Submit answers to send them.", undefined, { lane: "interactive" });
         return "incomplete";
       } catch (err) {
         logErr(`question reconciliation failed: ${String(err)}`);
@@ -826,7 +884,7 @@ export function createInteractions(deps: InteractionDeps) {
       } finally { questionLocks.delete(ask.id); }
     }
     const visible = visibleQuestions(ask.req, ask.answers);
-    if (!ask.req.questions.every((_, qi) => ask.finalized[qi] || !visible[qi])) {
+    if (!confirmed || !ask.req.questions.every((_, qi) => ask.finalized[qi] || !visible[qi])) {
       await Promise.all(renderAskBoth(ask));
       return "incomplete";
     }
@@ -855,7 +913,7 @@ export function createInteractions(deps: InteractionDeps) {
     raw: string | undefined,
     respond: RespondFn,
     allowUncertain = false,
-  ): Promise<{ v: { s: string; q: string; i: number; a?: number; page?: number; g?: number; b?: string; c?: number }; ask: QuestionAsk; client: NonNullable<PoolEntry["client"]> } | null> => {
+  ): Promise<{ v: { s: string; q: string; i: number; a?: number; page?: number; g?: number; b?: string; c?: number; r?: number }; ask: QuestionAsk; client: NonNullable<PoolEntry["client"]> } | null> => {
     if (isStopping()) return null;
     if (body.user.id !== config.ownerSlackUserId) {
       await respond({ text: "Only the paired owner can answer OpenCode questions.", response_type: "ephemeral" }).catch(() => {});
@@ -912,6 +970,9 @@ export function createInteractions(deps: InteractionDeps) {
     changedQuestion(ask, false);
     await questionUi.refresh(ask.id, true);
   }
+  /** A question can't take an answer when it's hidden, or finalized and not the one on screen (re-answering via Back is allowed). */
+  const answerLocked = (ask: QuestionAsk, i: number): boolean =>
+    (ask.finalized[i] && i !== shownQuestion(ask)) || !visibleQuestions(ask.req, ask.answers)[i];
 
   app.action(QUESTION_ACTION_PATTERN, async ({ ack, body, action, respond }) => {
     await ack();
@@ -940,7 +1001,7 @@ export function createInteractions(deps: InteractionDeps) {
     }
 
     const q = ask.req.questions[v.i!];
-    if (ask.finalized[v.i] || !visibleQuestions(ask.req, ask.answers)[v.i]) { await alreadySaved(ask, respond); return; }
+    if (answerLocked(ask, v.i)) { await alreadySaved(ask, respond); return; }
     const label = q?.options[v.a!]?.value ?? q?.options[v.a!]?.label;
     if (!q || label == null) { await respond({ text: "That option is no longer available. Use the latest card.", response_type: "ephemeral" }); return; }
 
@@ -955,11 +1016,11 @@ export function createInteractions(deps: InteractionDeps) {
       return;
     }
 
-    // Single-select: one tap locks the answer, then submit-if-complete.
+    // Single-select: one tap locks the answer, then advance (cursor cleared) / submit-if-complete.
     ask.answers[v.i!] = [label];
     ask.finalized[v.i!] = true;
-    ask.page = 0;
-    const r = await submitAskIfComplete(ask, client);
+    ask.page = 0; ask.cursor = undefined;
+    const r = await submitAskIfComplete(ask, client, oneTap(ask));
     if (r === "failed") {
       await respond({ text: "Failed to send your answer — try again or Skip.", response_type: "ephemeral" }).catch(() => {});
     }
@@ -971,15 +1032,15 @@ export function createInteractions(deps: InteractionDeps) {
     const g = await questionGuard(body, (action as { value?: string }).value, respond);
     if (!g) return;
     const { v, ask, client } = g;
-    if (ask.finalized[v.i] || !visibleQuestions(ask.req, ask.answers)[v.i]) { await alreadySaved(ask, respond); return; }
+    if (answerLocked(ask, v.i)) { await alreadySaved(ask, respond); return; }
     const field = ask.req.questions[v.i]?.field;
     if (!ask.answers[v.i!]?.length && (!field || field.type === "external" || field.required)) {
       await respond({ text: "Pick at least one option before submitting.", response_type: "ephemeral" }).catch(() => {});
       return;
     }
     ask.finalized[v.i!] = true;
-    ask.page = 0;
-    const r = await submitAskIfComplete(ask, client);
+    ask.page = 0; ask.cursor = undefined;
+    const r = await submitAskIfComplete(ask, client, oneTap(ask));
     if (r === "failed") {
       await respond({ text: "Failed to send your answer — try again or Skip.", response_type: "ephemeral" }).catch(() => {});
     }
@@ -989,11 +1050,11 @@ export function createInteractions(deps: InteractionDeps) {
     await ack();
     const g = await questionGuard(body, (action as { value?: string }).value, respond);
     if (!g || questionLocks.has(g.ask.id)) return;
-    if (g.ask.finalized[g.v.i] || !visibleQuestions(g.ask.req, g.ask.answers)[g.v.i]) { await alreadySaved(g.ask, respond); return; }
+    if (answerLocked(g.ask, g.v.i)) { await alreadySaved(g.ask, respond); return; }
     const field = g.ask.req.questions[g.v.i]?.field;
     if (!field || field.type === "external" || field.required) return;
-    g.ask.answers[g.v.i] = []; g.ask.finalized[g.v.i] = true; g.ask.page = 0;
-    await submitAskIfComplete(g.ask, g.client);
+    g.ask.answers[g.v.i] = []; g.ask.finalized[g.v.i] = true; g.ask.page = 0; g.ask.cursor = undefined;
+    await submitAskIfComplete(g.ask, g.client, oneTap(g.ask));
   });
 
   app.action(/^qpage_(prev|next)$/, async ({ ack, body, action, respond }) => {
@@ -1004,18 +1065,38 @@ export function createInteractions(deps: InteractionDeps) {
     changedQuestion(g.ask, false);
     await Promise.all(renderAskBoth(g.ask));
   });
+  // Back/Next: move the cursor to the payload's question (`r` = leave the cursor
+  // for the first unfinished question / review step). Edits the card in place.
+  app.action(/^qnav_(prev|next)$/, async ({ ack, body, action, respond }) => {
+    await ack();
+    const g = await questionGuard(body, (action as { value?: string }).value, respond);
+    if (!g || questionLocks.has(g.ask.id) || g.ask.response !== "pending") return;
+    if (!g.v.r && !visibleQuestions(g.ask.req, g.ask.answers)[g.v.i]) { await alreadySaved(g.ask, respond); return; }
+    g.ask.cursor = g.v.r ? undefined : g.v.i;
+    g.ask.page = 0;
+    changedQuestion(g.ask, false, true);
+    await Promise.all(renderAskBoth(g.ask));
+  });
+  // Review step: the only path that submits a multi-question form.
+  app.action("qsubmit_all", async ({ ack, body, action, respond }) => {
+    await ack();
+    const g = await questionGuard(body, (action as { value?: string }).value, respond);
+    if (!g) return;
+    const r = await submitAskIfComplete(g.ask, g.client, true);
+    if (r === "failed") await respond({ text: "Failed to send your answers — try again or Skip.", response_type: "ephemeral" }).catch(() => {});
+  });
   app.action("qretry", async ({ ack, body, action, respond }) => {
     await ack();
     const g = await questionGuard(body, (action as { value?: string }).value, respond, true);
     if (!g) return;
-    const result = await submitAskIfComplete(g.ask, g.client);
+    const result = await submitAskIfComplete(g.ask, g.client, true);
     if (result === "failed") await respond({ text: "Answer not confirmed. Retry submission reconciles it before sending again.", response_type: "ephemeral" });
   });
   app.action("qedit", async ({ ack, body, action, respond }) => {
     await ack();
     const g = await questionGuard(body, (action as { value?: string }).value, respond);
     if (!g || questionLocks.has(g.ask.id)) return;
-    g.ask.finalized.fill(false); g.ask.page = 0;
+    g.ask.finalized.fill(false); g.ask.page = 0; g.ask.cursor = undefined;
     changedQuestion(g.ask);
     await Promise.all(renderAskBoth(g.ask));
   });
@@ -1028,7 +1109,7 @@ export function createInteractions(deps: InteractionDeps) {
     if (!g) return;
     const { v, ask } = g;
     const q = ask.req.questions[v.i!];
-    if (!q || !q.custom || ask.finalized[v.i] || !visibleQuestions(ask.req, ask.answers)[v.i]) { await alreadySaved(ask, respond); return; }
+    if (!q || !q.custom || answerLocked(ask, v.i)) { await alreadySaved(ask, respond); return; }
     // Open a modal; the answer comes back through the qtext_submit view.
     // (trigger_id lives on the BlockAction body, not the DialogSubmit variant.)
     const triggerId = (body as { trigger_id?: string }).trigger_id;
@@ -1089,7 +1170,7 @@ export function createInteractions(deps: InteractionDeps) {
     const ask = quesAsks.get(v.q);
     if (!bound || !ask || ask.sessionId !== v.s || !isPending(ask, "question") || !Number.isSafeInteger(v.i) ||
       v.g !== ask.generation || v.b !== questionBindingToken(ask) || (v.c ?? 0) !== ask.presentation || v.revision !== ask.draftRevision || !ask.req.questions[v.i]?.custom ||
-      ask.finalized[v.i] || !visibleQuestions(ask.req, ask.answers)[v.i] || ask.response !== "pending") {
+      answerLocked(ask, v.i) || ask.response !== "pending") {
       await ack({ response_action: "errors", errors: { qtext_input: "This question changed or was already answered. Close this form and use the latest card." } }); return;
     }
     if (questionLocks.has(ask.id)) { await ack({ response_action: "errors", errors: { qtext_input: "An answer is already being submitted." } }); return; }
@@ -1101,14 +1182,14 @@ export function createInteractions(deps: InteractionDeps) {
     catch (err) { await ack({ response_action: "errors", errors: { qtext_input: String((err as Error).message) } }); return; }
     ask.answers = answers;
     ask.finalized[v.i] = true;
-    ask.page = 0;
+    ask.page = 0; ask.cursor = undefined;
     try { changedQuestion(ask); }
     catch (err) {
       await ack({ response_action: "errors", errors: { qtext_input: "Couldn't save your answer. Please retry." } });
       logErr(`question save failed: ${String(err)}`); return;
     }
     await ack();
-    const r = await submitAskIfComplete(ask, entry.client);
+    const r = await submitAskIfComplete(ask, entry.client, oneTap(ask));
     if (r === "failed") {
       await render.post(ask.channel, ask.threadTs, "Answer not confirmed. Tap Retry submission to reconcile it before trying again.", undefined, { lane: "interactive" }).catch(() => {});
     }

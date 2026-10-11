@@ -7,9 +7,10 @@ import type { RenderDeps } from "./render.js";
 
 /**
  * The renderer's Slack adapter. All outbound calls go through the per-channel,
- * two-tier queue (slack/queue.ts): ~1/s pacing per channel lane, interactive
- * ops ahead of background stream traffic, a shared 429 brake, and a per-op
- * timeout so one stalled call can never freeze its lane.
+ * two-tier queue (slack/queue.ts): ~1/s post pacing per channel, strict order
+ * within a thread, interactive ops ahead of other threads' background stream
+ * traffic, a shared 429 brake, and a per-op timeout so one stalled call can
+ * never freeze its lane.
  */
 export function createRenderDeps(app: App, opts: {
   isStopping: () => boolean;
@@ -33,15 +34,15 @@ export function createRenderDeps(app: App, opts: {
             // no big link preview cards. Answer text keeps previews (default).
             ...(opts?.unfurl === false ? { unfurl_links: false, unfurl_media: false } : {}),
           }),
-        { channel, lane: opts?.lane },
+        { channel, lane: opts?.lane, thread: threadTs },
       );
       return { ts: r.ts as string };
     },
-    update: async (channel, ts, text) => {
-      await enqueue(() => app.client.chat.update({ channel, ts, text: unicodeEmoji(text) }), { channel, method: "chat.update" });
+    update: async (channel, ts, text, threadTs) => {
+      await enqueue(() => app.client.chat.update({ channel, ts, text: unicodeEmoji(text) }), { channel, method: "chat.update", thread: threadTs });
     },
-    delete: async (channel, ts) => {
-      await enqueue(() => app.client.chat.delete({ channel, ts }), { channel, method: "chat.delete" });
+    delete: async (channel, ts, threadTs) => {
+      await enqueue(() => app.client.chat.delete({ channel, ts }), { channel, method: "chat.delete", thread: threadTs });
     },
     // Reactions don't order with messages, so they bypass the FIFO: the 👀
     // liveness ack and the ✅/❌ outcome land instantly instead of queueing
@@ -64,7 +65,7 @@ export function createRenderDeps(app: App, opts: {
             initial_comment: comment ? unicodeEmoji(comment) : undefined,
             title: filename,
           }),
-        { channel: channelId, method: "files.upload", lane, timeoutMs: SLACK_UPLOAD_TIMEOUT_MS, retryRateLimits: false },
+        { channel: channelId, method: "files.upload", lane, thread: threadTs, timeoutMs: SLACK_UPLOAD_TIMEOUT_MS, retryRateLimits: false },
       );
     },
     dm: async (channel, threadTs, text, blocks, opts) => {
@@ -81,7 +82,7 @@ export function createRenderDeps(app: App, opts: {
             mrkdwn: true,
             ...(outBlocks ? { blocks: outBlocks } : {}),
           }),
-        { channel: dmChannelId()!, lane: opts?.lane },
+        { channel: dmChannelId()!, lane: opts?.lane, thread: "" },
       );
       return { ts: r.ts as string };
     },

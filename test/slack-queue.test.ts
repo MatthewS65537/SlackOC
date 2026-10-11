@@ -195,51 +195,85 @@ describe("Slack queue: shared history pacing", () => {
   });
 });
 
-describe("Slack queue: priority tiers in one channel lane (#5)", () => {
+describe("Slack queue: write ordering and tiers in one channel lane", () => {
   beforeEach(() => {
     _resetQueueForTests();
     vi.useFakeTimers();
   });
   afterEach(() => vi.useRealTimers());
 
-  it("interactive ops overtake queued background ops (command replies beat stream traffic)", async () => {
-    const { release } = blocker();
+  const op = (order: string[], name: string, opts: Partial<Parameters<typeof enqueue>[1]> & { method?: string }) =>
+    enqueue(() => (order.push(name), Promise.resolve()), { channel: "C1", ...opts });
+
+  it("post, update, delete in one thread run in enqueue order, one at a time", async () => {
     const order: string[] = [];
-    const bg = enqueue(() => (order.push("bg"), Promise.resolve()), { channel: "C1" });
-    const int = enqueue(() => (order.push("int"), Promise.resolve()), { channel: "C1", lane: "interactive" });
-    release();
+    let inFlight = 0;
+    const track = (name: string, method?: string) => enqueue(async () => {
+      expect(++inFlight).toBe(1);
+      await new Promise((r) => setTimeout(r, 10));
+      order.push(name); inFlight--;
+    }, { channel: "C1", thread: "T", ...(method ? { method } : {}) });
+    const all = [track("post"), track("update", "chat.update"), track("delete", "chat.delete"), track("post2")];
     await vi.advanceTimersByTimeAsync(10_000);
-    await Promise.all([bg, int]);
-    expect(order).toEqual(["int", "bg"]);
+    await Promise.all(all);
+    expect(order).toEqual(["post", "update", "delete", "post2"]);
   });
 
-  it("FIFO is preserved within a tier", async () => {
+  it("an interactive op never jumps queued ops of its own thread", async () => {
     const { release } = blocker();
-    const order: number[] = [];
-    const a = enqueue(() => (order.push(1), Promise.resolve()), { channel: "C1", lane: "interactive" });
-    const b = enqueue(() => (order.push(2), Promise.resolve()), { channel: "C1", lane: "interactive" });
-    const c = enqueue(() => (order.push(3), Promise.resolve()), { channel: "C1" });
-    const d = enqueue(() => (order.push(4), Promise.resolve()), { channel: "C1" });
+    const order: string[] = [];
+    const ops = [op(order, "para", { thread: "T" }), op(order, "card", { thread: "T", lane: "interactive" })];
     release();
     await vi.advanceTimersByTimeAsync(10_000);
-    await Promise.all([a, b, c, d]);
-    expect(order).toEqual([1, 2, 3, 4]);
+    await Promise.all(ops);
+    expect(order).toEqual(["para", "card"]);
+  });
+
+  it("an interactive op passes background ops of other threads", async () => {
+    const { release } = blocker();
+    const order: string[] = [];
+    const ops = [op(order, "bgT", { thread: "T" }), op(order, "intU", { thread: "U", lane: "interactive" })];
+    release();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.all(ops);
+    expect(order).toEqual(["intU", "bgT"]);
+  });
+
+  it("an op without a thread is a barrier both ways", async () => {
+    const { release } = blocker();
+    const order: string[] = [];
+    const ops = [op(order, "bgT", { thread: "T" }), op(order, "untagged", {}), op(order, "intU", { thread: "U", lane: "interactive" })];
+    release();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.all(ops);
+    expect(order).toEqual(["bgT", "untagged", "intU"]);
   });
 
   it(`a background op pending > PROMOTE_AFTER_MS promotes ahead of interactive traffic`, async () => {
     const { release } = blocker();
     const order: string[] = [];
-    const bg = enqueue(() => (order.push("bg"), Promise.resolve()), { channel: "C1" });
+    const bg = op(order, "bg", { thread: "T" });
     await vi.advanceTimersByTimeAsync(1); // bg queued behind the blocker
     // Age the queued op past the promotion threshold by jumping the clock —
     // setSystemTime doesn't fire timers, so the blocker's 30s op-timeout
     // stays put (a 31s advance-by-time would trip it mid-test).
     vi.setSystemTime(Date.now() + PROMOTE_AFTER_MS + 1_000);
-    const int = enqueue(() => (order.push("int"), Promise.resolve()), { channel: "C1", lane: "interactive" });
+    const int = op(order, "int", { thread: "U", lane: "interactive" });
     release();
     await vi.advanceTimersByTimeAsync(5_000);
     await Promise.all([bg, int]);
     expect(order).toEqual(["bg", "int"]);
+  });
+
+  it("reads keep their own lanes with interactive priority", async () => {
+    const block = (() => { let r!: () => void; const p = new Promise<void>((res) => (r = res));
+      void enqueue(() => p, { channel: "C1", method: "conversations.history" }); return r; })();
+    const order: string[] = [];
+    const ops = [op(order, "bg", { method: "conversations.history" }), op(order, "int", { method: "conversations.history", lane: "interactive" })];
+    block();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.all(ops);
+    expect(order).toEqual(["int", "bg"]);
   });
 });
 

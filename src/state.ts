@@ -81,6 +81,10 @@ interface SlackocState {
   unboundReceiptFloorTs?: string;
   /** \listen: channels where every top-level owner message prompts, no @ needed (default: none). */
   alwaysOnChannels?: string[];
+  /** \pin: channel id → canonical project dir; new sessions and project switches there are locked to it. */
+  channelProjects?: Record<string, string>;
+  /** \verbose: channel id → tool visibility for every thread in it (default "on"). */
+  channelVerbose?: Record<string, VerboseMode>;
   /** Top-level catch-up watermark per \listen channel / owner DM: history at or before it is never replayed. */
   topLevelSeenTs?: Record<string, string>;
 }
@@ -244,6 +248,40 @@ export class StateStore {
     return this.state.currentProjectDir;
   }
 
+  channelProject(channel: string): string | undefined {
+    return this.state.channelProjects?.[channel];
+  }
+
+  setChannelProject(channel: string, dir: string | undefined): void {
+    const pins = this.state.channelProjects ??= {};
+    if (dir) { pins[channel] = canonicalDir(dir); this.touchProject(dir); }
+    else delete pins[channel];
+    this.save();
+  }
+
+  /** Where a new session in `channel` starts: its pin, else the current project, else the launch cwd. */
+  defaultDir(channel: string, cwd: string): string {
+    return this.channelProject(channel) ?? this.state.currentProjectDir ?? cwd;
+  }
+
+  /** \verbose is channel-wide: the mode threads in `channel` use (new ones start with it). */
+  channelVerbose(channel: string): VerboseMode {
+    return this.state.channelVerbose?.[channel] ?? "on";
+  }
+
+  /** Sets the channel mode and applies it to its existing threads (scheduled reports stay silent); returns their session ids. */
+  setChannelVerbose(channel: string, mode: VerboseMode): string[] {
+    (this.state.channelVerbose ??= {})[channel] = mode;
+    const sessions: string[] = [];
+    for (const [key, thread] of Object.entries(this.state.threads)) {
+      if (!key.startsWith(`${channel}:`) || thread.scheduledRunId) continue;
+      thread.verbose = mode;
+      sessions.push(thread.sessionId);
+    }
+    this.save();
+    return sessions;
+  }
+
   threadKey(channel: string, ts: string): string {
     return `${channel}:${ts}`;
   }
@@ -374,6 +412,7 @@ export class StateStore {
     this.state.projects = projects;
     if (this.state.currentProjectDir) this.state.currentProjectDir = canonicalDir(this.state.currentProjectDir);
     for (const t of Object.values(this.state.threads)) t.projectDir = canonicalDir(t.projectDir);
+    for (const [c, dir] of Object.entries(this.state.channelProjects ?? {})) this.state.channelProjects![c] = canonicalDir(dir);
   }
 
   private receiptKey(threadKey: string, ts: string): string {

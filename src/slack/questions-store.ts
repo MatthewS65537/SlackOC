@@ -38,6 +38,8 @@ export interface QuestionSnapshot {
   dmPresentation?: number;
   relocation?: Partial<Record<"thread" | "dm", QuestionRelocation>>;
   page?: number;
+  /** Question index the user navigated to with Back/Next (undefined = first unfinished). */
+  cursor?: number;
   draftRevision?: number;
   resolvedText?: string;
   resumeOwnerTs?: string;
@@ -94,7 +96,7 @@ export class QuestionsStore {
       if (!r.id || r.req?.id !== r.id || r.req.sessionID !== r.sessionId || !Array.isArray(r.answers) || !Array.isArray(r.finalized) || !Number.isSafeInteger(r.generation)) throw new Error("Invalid stored question");
       if (r.ui && ([r.ui.revision, r.ui.threadApplied, r.ui.dmApplied].some(n => !Number.isSafeInteger(n) || n < 0) ||
         r.ui.threadApplied > r.ui.revision || r.ui.dmApplied > r.ui.revision)) throw new Error("Invalid question UI revision");
-      if ([r.page, r.draftRevision].some(n => n !== undefined && (!Number.isSafeInteger(n) || n < 0)) ||
+      if ([r.page, r.cursor, r.draftRevision].some(n => n !== undefined && (!Number.isSafeInteger(n) || n < 0)) ||
         (r.resumeOwnerTs !== undefined && !/^\d{1,12}\.\d{1,6}$/.test(r.resumeOwnerTs)) ||
         (r.retiredCopies && (!Array.isArray(r.retiredCopies) || r.retiredCopies.length > 32 || r.retiredCopies.some(c => !c.channel || !c.ts)))) throw new Error("Invalid question UI state");
       validatePlacement(r);

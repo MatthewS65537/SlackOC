@@ -1,29 +1,32 @@
 /**
- * Per-channel, two-tier FIFO for outbound Slack calls (issues #5/#6, GH
+ * Per-channel, two-tier queue for outbound Slack calls (issues #5/#6, GH
  * round 2). Two facts of Slack rate limits this exploits:
  *
  *  - chat.postMessage is limited to ~1 message/second PER CHANNEL — a busy
- *    thread must never serialize behind traffic to other channels/threads.
+ *    thread must never serialize behind traffic to other channels.
  *  - The limit tiers are app+method scoped — a 429 pauses that method across
  *    channels for Retry-After, without stopping other methods.
  *
- * Every op is keyed by method and channel (the owner-DM channel included).
- * Posting lanes have a ~1.05s pacing clock; history starts share a 1.5s clock
- * across channels. Other methods drain independently, interactive ops before
- * background ops:
+ * Writes (posts, updates, deletes, uploads, ephemerals) to one channel share
+ * ONE lane that runs a single op at a time, so an op starts only after the
+ * previous one went through. Within a thread (`EnqueueOpts.thread`) writes are
+ * strictly FIFO — a question card can never land above the paragraph produced
+ * before it. Across threads the tiers still apply:
  *
  *  - interactive — things the user is actively waiting on: command replies,
  *    permission/question asks, cold-start acks, button-answer updates.
  *  - background (default) — run streams: ticker re-renders, sink re-homes,
  *    tool flushes, answer chunks, uploads, summaries, DMs, catch-up fetches.
  *
- * A background op pending longer than PROMOTE_AFTER_MS is served ahead of
- * younger interactive ops (anti-starvation). Without this the round-1 blast
- * radius repeats: a 10-thread catch-up sweep (~10 ops at ~1.05s) used to park
- * the single global queue for 10–16s every minute — a `\help` landing behind
- * it felt broken.
+ * An op is eligible only when no older op of its thread is pending; an op
+ * without a thread is a barrier (nothing passes it, it passes nothing). Among
+ * eligible ops a background op pending longer than PROMOTE_AFTER_MS goes
+ * first (anti-starvation), then interactive, then background FIFO.
+ * Reads (conversations.*) keep their own per-method lanes with the same tiers
+ * and no thread ordering. Only posts use the ~1.05s channel pacing clock;
+ * history starts share a 1.5s clock across channels.
  *
- * Two failure guards (unchanged from the single-queue design):
+ * Failure guards:
  *
  *  - Rate limits (HTTP 429 / Retry-After) back off 2s→4s→8s and then give up.
  *  - Transient network errors (DNS, refused, reset — e.g. right after wake)
@@ -55,8 +58,10 @@ export interface EnqueueOpts {
   method?: string;
   /** Every outbound Slack call is channel-bound — this drives lane pacing. */
   channel: string;
-  /** "interactive" jumps ahead of queued background work in the same channel. */
+  /** "interactive" jumps ahead of queued background work in OTHER threads of the channel. */
   lane?: SlackLane;
+  /** Thread ts ("" = top level) — writes within one thread never reorder. Omitted = barrier. */
+  thread?: string;
   /** End-to-end budget per attempt; uploads should use SLACK_UPLOAD_TIMEOUT_MS. */
   timeoutMs?: number;
   /** Multi-stage uploads should disable replay of the entire operation on 429. */
@@ -67,12 +72,15 @@ interface QueuedOp {
   run: () => Promise<void>;
   enqueuedAt: number;
   lane: SlackLane;
+  thread?: string;
 }
 
 interface ChannelLane {
-  interactive: QueuedOp[];
-  background: QueuedOp[];
-  lastCall: number;
+  /** Pending ops in enqueue order. */
+  ops: QueuedOp[];
+  /** Write lanes order by thread; read lanes don't. */
+  ordered: boolean;
+  lastPost: number;
   draining: boolean;
 }
 
@@ -132,33 +140,29 @@ export function droppedOpCount(): number {
 /** Total pending ops across every channel lane (drives the \status queue line). */
 export function queueDepth(): number {
   let n = 0;
-  for (const lane of lanes.values()) n += lane.interactive.length + lane.background.length;
+  for (const lane of lanes.values()) n += lane.ops.length;
   return n;
 }
 
 /** Pending ops in ONE channel's lane — tick-yield and the sink circuit breaker are channel-local. */
 export function laneDepth(channel: string): number {
   let n = 0;
-  for (const [key, lane] of lanes) if (key.endsWith(`:${channel}`)) n += lane.interactive.length + lane.background.length;
+  for (const [key, lane] of lanes) if (key.endsWith(`:${channel}`)) n += lane.ops.length;
   return n;
 }
 
 /** Age of the oldest pending op across all lanes — queue-health signal for \status. */
 export function oldestPendingAgeMs(now = Date.now()): number {
   let oldest = 0;
-  for (const lane of lanes.values()) {
-    for (const arr of [lane.interactive, lane.background]) {
-      for (const op of arr) oldest = Math.max(oldest, now - op.enqueuedAt);
-    }
-  }
+  for (const lane of lanes.values()) for (const op of lane.ops) oldest = Math.max(oldest, now - op.enqueuedAt);
   return oldest;
 }
 
-function getLane(channel: string): ChannelLane {
-  let lane = lanes.get(channel);
+function getLane(key: string, ordered: boolean): ChannelLane {
+  let lane = lanes.get(key);
   if (!lane) {
-    lane = { interactive: [], background: [], lastCall: 0, draining: false };
-    lanes.set(channel, lane);
+    lane = { ops: [], ordered, lastPost: 0, draining: false };
+    lanes.set(key, lane);
   }
   return lane;
 }
@@ -167,15 +171,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Next op to run: starving background first, then interactive, then background FIFO. */
+/** Next op to run among eligible ops: starving background, then interactive, then background FIFO. */
 function takeNext(lane: ChannelLane): QueuedOp | undefined {
-  const bgOldest = lane.background[0];
-  if (bgOldest && Date.now() - bgOldest.enqueuedAt > PROMOTE_AFTER_MS) {
-    lane.background.shift();
-    return bgOldest;
+  const seen = new Set<string>();
+  let interactive = -1;
+  let background = -1;
+  let pick = -1;
+  for (let i = 0; i < lane.ops.length; i++) {
+    const op = lane.ops[i]!;
+    if (lane.ordered) {
+      if (op.thread === undefined) { if (i === 0) pick = 0; break; } // barrier
+      if (seen.has(op.thread)) continue; // an older op of this thread goes first
+      seen.add(op.thread);
+    }
+    if (op.lane === "interactive") { if (interactive < 0) interactive = i; continue; }
+    if (background < 0) {
+      background = i;
+      if (Date.now() - op.enqueuedAt > PROMOTE_AFTER_MS) { pick = i; break; }
+    }
   }
-  if (lane.interactive.length) return lane.interactive.shift()!;
-  return lane.background.shift();
+  if (pick < 0) pick = interactive >= 0 ? interactive : background;
+  return pick < 0 ? undefined : lane.ops.splice(pick, 1)[0];
 }
 
 /** Methods where an ambiguous network failure may already have taken effect. */
@@ -183,26 +199,28 @@ const NON_IDEMPOTENT = new Set(["chat.postMessage", "files.upload", "filesUpload
 
 export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: EnqueueOpts): Promise<T> {
   const method = opts.method ?? "chat.postMessage";
-  const lane = getLane(`${method}:${opts.channel}`);
+  const read = method.startsWith("conversations.");
+  const lane = getLane(read ? `${method}:${opts.channel}` : `write:${opts.channel}`, !read);
   const pace = method === "chat.postMessage" ? SLACK_PACE_MS : 0;
   const laneKind = opts.lane ?? "background";
   return new Promise<T>((resolve, reject) => {
-    (laneKind === "interactive" ? lane.interactive : lane.background).push({
+    lane.ops.push({
       enqueuedAt: Date.now(),
       lane: laneKind,
+      thread: opts.thread,
       run: async () => {
         for (let attempt = 0; ; attempt++) {
           try {
             // Re-check after every wake: another lane may have extended the brake.
             for (;;) {
-              const wait = Math.max(lane.lastCall + pace, cooldowns.get(method) ?? 0, offlineUntil,
+              const wait = Math.max(pace ? lane.lastPost + pace : 0, cooldowns.get(method) ?? 0, offlineUntil,
                 method === "conversations.replies" ? nextHistoryCallAt : 0) - Date.now();
               if (wait <= 0) break;
               await sleep(wait);
             }
-            lane.lastCall = Date.now();
+            if (pace) lane.lastPost = Date.now();
             // Reserve before any await so cross-channel waiters cannot start together.
-            if (method === "conversations.replies") nextHistoryCallAt = lane.lastCall + SLACK_HISTORY_PACE_MS;
+            if (method === "conversations.replies") nextHistoryCallAt = Date.now() + SLACK_HISTORY_PACE_MS;
             const timeoutMs = opts.timeoutMs ?? SLACK_OP_TIMEOUT_MS;
             const result = await withDeadline(
               (signal) => withSlackOperation(signal, timeoutMs, () => op(signal)),

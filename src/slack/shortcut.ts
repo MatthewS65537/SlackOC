@@ -17,9 +17,9 @@ const SUBMIT = "send_to_oc_submit";
 
 interface Source { channel: string; ts: string; threadTs?: string; text: string; files?: SlackMsg["files"] }
 
-/** Current project first, then every other known project (max 100 for a static_select). */
-export function shortcutProjects(state: StateStore, cwd: string): string[] {
-  const current = canonicalDir(state.currentProjectDir ?? cwd);
+/** The source channel's pin (else the current project) first, then every other known project (max 100 for a static_select). */
+export function shortcutProjects(state: StateStore, cwd: string, channel: string): string[] {
+  const current = canonicalDir(state.defaultDir(channel, cwd));
   return [...new Set([current, ...state.listProjects().map(p => canonicalDir(p.dir))])].slice(0, 100);
 }
 
@@ -62,19 +62,33 @@ export function registerShortcut(app: App, deps: { bridge: BridgeDeps; ownerSlac
     const id = randomUUID();
     if (pending.size > 50) pending.delete(pending.keys().next().value!);
     pending.set(id, { channel: shortcut.channel.id, ts: m.ts, threadTs: m.thread_ts, text: m.text ?? "", files: m.files });
-    await app.client.views.open({ trigger_id: shortcut.trigger_id, view: shortcutModal(shortcutProjects(bridge.state, bridge.cwd), id) as never })
+    await app.client.views.open({ trigger_id: shortcut.trigger_id, view: shortcutModal(shortcutProjects(bridge.state, bridge.cwd, shortcut.channel.id), id) as never })
       .catch(err => logErr(`shortcut modal failed: ${String((err as Error)?.message ?? err)}`));
   });
 
   app.view(SUBMIT, async ({ ack, body, view }) => {
-    await ack();
     const source = pending.get(view.private_metadata);
-    pending.delete(view.private_metadata);
-    if (deps.isStopping() || body.user.id !== deps.ownerSlackUserId || !source) return;
     const values = view.state.values as Record<string, { v?: { selected_option?: { value?: string } | null; value?: string | null } }>;
     const projectDir = values.project?.v?.selected_option?.value ?? undefined;
     const instructions = values.instructions?.v?.value ?? "";
     const wantThread = values.dest?.v?.selected_option?.value !== "dm";
+    // The chosen project only places a new session: a source thread already bound
+    // elsewhere keeps the modal open with the conflict (the router rechecks later).
+    const bound = source && wantThread && body.user.id === deps.ownerSlackUserId
+      ? bridge.state.getThread(bridge.state.threadKey(source.channel, source.threadTs ?? source.ts)) : null;
+    if (bound && projectDir && canonicalDir(bound.projectDir) !== canonicalDir(projectDir)) {
+      await ack({ response_action: "errors",
+        errors: { project: `This thread already runs in ${bound.projectDir}. Pick that project, or Run in: My DM for a fresh session.` } });
+      return;
+    }
+    const pin = source && wantThread ? bridge.state.channelProject(source.channel) : undefined;
+    if (pin && projectDir && canonicalDir(projectDir) !== pin) {
+      await ack({ response_action: "errors", errors: { project: `📌 This channel is pinned to ${pin}. Pick it, or Run in: My DM.` } });
+      return;
+    }
+    await ack();
+    pending.delete(view.private_metadata);
+    if (deps.isStopping() || body.user.id !== deps.ownerSlackUserId || !source) return;
     try {
       const permalink = await app.client.chat.getPermalink({ channel: source.channel, message_ts: source.ts })
         .then(r => r.permalink, () => undefined);

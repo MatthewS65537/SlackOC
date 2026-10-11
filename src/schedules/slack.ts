@@ -125,11 +125,16 @@ export function createScheduledReports(opts: Options): ScheduledReports {
       const channel = opts.ownerDm();
       if (!channel) throw new Error("owner DM unavailable");
       const text = `⚠️ *${esc(run.snapshot.name)}* — ${esc(message)}\nRun \`${run.id}\` · use \`\\schedule history\` to inspect.`;
+      // A DM root may already hold the accepted report and its marker (lost response):
+      // once output exists, reply in its thread so reconciliation evidence survives.
+      const reply = run.context && run.snapshot.destination.kind === "dm" && run.output !== undefined;
+      const update = run.context && !reply;
       await enqueue(async () => {
         if (opts.stopping()) throw new Error("bridge stopping");
-        if (run.context) await opts.app.client.chat.update({ channel: run.context.channel, ts: run.context.ts, text, blocks: [] });
-        else await opts.app.client.chat.postMessage({ channel, text, unfurl_links: false, unfurl_media: false });
-      }, { channel, method: run.context ? "chat.update" : "chat.postMessage" });
+        if (update) await opts.app.client.chat.update({ channel: run.context!.channel, ts: run.context!.ts, text, blocks: [] });
+        else await opts.app.client.chat.postMessage({ channel: reply ? run.context!.channel : channel, text,
+          ...(reply ? { thread_ts: run.context!.ts } : {}), unfurl_links: false, unfurl_media: false });
+      }, { channel, method: update ? "chat.update" : "chat.postMessage" });
     },
     onDelivered: async snapshot => {
       const run = store.run(snapshot.id);

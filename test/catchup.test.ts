@@ -211,6 +211,7 @@ describe("top-level sweep (\\listen channels + owner DM)", () => {
     const dispatched: SlackMsg[] = [];
     const deps: TopLevelCatchupDeps = { state, ownerSlackUserId: "U1", channels: ["L"],
       fetchHistory: vi.fn(async () => ({ messages, hasMore: false })),
+      fetchReplies: vi.fn<CatchupDeps["fetchReplies"]>(async () => page([])),
       dispatch: async (m) => {
         dispatched.push(m);
         state.claimMessage(`L:${m.ts}`, m.ts, { source: "history" });
@@ -257,6 +258,45 @@ describe("top-level sweep (\\listen channels + owner DM)", () => {
     expect(await sweepTopLevelMessages(deps)).toBe(0);
     expect(dispatched).toEqual([]);
     expect(state.topLevelWatermark("L")).toBe(ts(6));
+  });
+
+  const reply = (root: SlackMsg, seconds: number, text: string, extra: Partial<SlackMsg> = {}): SlackMsg =>
+    ({ channel: "L", ts: ts(seconds), thread_ts: root.ts, user: "U1", text, ...extra });
+
+  it.each(["\\stop", "\\abort", "\\cancel", "\\cd /elsewhere", "\\model x/y"])("a missed root superseded by a later owner %s never starts", async (text) => {
+    const root = top(2);
+    const { state, deps, dispatched } = topFixture(`top-later-${text.slice(1, 4)}`, [root]);
+    state.setTopLevelWatermark("L", ts(1));
+    deps.fetchReplies = vi.fn<CatchupDeps["fetchReplies"]>(async () => page([root, reply(root, 3, text)]));
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(deps.fetchReplies).toHaveBeenCalledWith("L", root.ts, root.ts, expect.objectContaining({ maxPages: 2 }));
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(state.topLevelWatermark("L")).toBe(root.ts);
+  });
+
+  it("read-only commands, non-owner replies, and follow-up prompts do not supersede the root", async () => {
+    const root = top(2);
+    const { deps, dispatched } = topFixture("top-later-benign", [root]);
+    deps.state.setTopLevelWatermark("L", ts(1));
+    deps.fetchReplies = async () => page([root, reply(root, 3, "\\help"), reply(root, 4, "\\stop", { user: "other" }),
+      reply(root, 5, "\\stop", { bot_id: "B" }), reply(root, 6, "and also this")]);
+    expect(await sweepTopLevelMessages(deps)).toBe(1);
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([root]);
+  });
+
+  it("holds the root when its replies are unreadable or incomplete", async () => {
+    const root = top(2);
+    const { state, deps, dispatched } = topFixture("top-later-unreadable", [root]);
+    state.setTopLevelWatermark("L", ts(1));
+    deps.fetchReplies = async () => { throw new Error("offline"); };
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(state.topLevelWatermark("L")).toBe(ts(1)); // retried next sweep
+    deps.fetchReplies = async () => ({ messages: [root], hasMore: true, pagesUsed: 2 });
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(state.topLevelWatermark("L")).toBe(root.ts);
   });
 
   it("policy: only the top-level sweep may recover an unbound message; \\listen on restarts the watermark", () => {

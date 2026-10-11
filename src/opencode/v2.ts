@@ -84,15 +84,27 @@ export function normalizeMessages(messages: SessionMessageInfo[], sessionID: str
     const info: OcMessageInfo = { id: m.id, sessionID, role: m.type, time: m.time,
       ...(m.type === "assistant" ? { parentID, finish: m.finish, modelID: m.model.id, providerID: m.model.providerID,
         cost: m.cost, tokens: m.tokens, error: m.error ? { name: m.error.type, data: { message: m.error.message } } : undefined } : {}) };
+    const ordinals: Record<string, number> = {};
     const parts: OcPart[] = m.type === "user" ? [{ id: `${m.id}:text`, messageID: m.id, sessionID, type: "text", text: m.text }]
-      : m.content.flatMap((p, ordinal): OcPart[] => {
+      : m.content.flatMap((p): OcPart[] => {
         if (p.type === "tool") return [toolPart(p, sessionID, m.id), ...toolFiles("content" in p.state ? p.state.content : undefined, p.id, sessionID, m.id)];
-        return [{ id: `${m.id}:${ordinal}`, messageID: m.id, sessionID, type: p.type, text: p.text,
+        // Same id the live stream uses: OpenCode numbers each block kind separately.
+        const ordinal = ordinals[p.type] = (ordinals[p.type] ?? -1) + 1;
+        return [{ id: partId(m.id, p.type, ordinal), messageID: m.id, sessionID, type: p.type, text: p.text,
           time: { end: m.time.completed } }];
       });
     rows.push({ info, parts });
   }
   return rows;
+}
+
+/**
+ * Text/reasoning part id. OpenCode keeps a separate ordinal counter per block
+ * kind (a reply after reasoning is text 0 AND reasoning 0), so the kind is part
+ * of the identity — sharing one key merged their delta buffers (#26).
+ */
+function partId(messageID: string, kind: string, ordinal: number): string {
+  return `${messageID}:${kind}:${ordinal}`;
 }
 
 /** Synchronous translation; never block the live event reader on Slack I/O. */
@@ -137,23 +149,25 @@ export class V2Events {
       }
       case "session.text.ended": {
         const p = event.data;
-        this.text.delete(`${p.assistantMessageID}:${p.ordinal}`);
-        return emit("message.part.updated", { part: { id: `${p.assistantMessageID}:${p.ordinal}`, sessionID: p.sessionID,
+        const id = partId(p.assistantMessageID, "text", p.ordinal);
+        this.text.delete(id);
+        return emit("message.part.updated", { part: { id, sessionID: p.sessionID,
           messageID: p.assistantMessageID, type: "text", text: p.text, time: { end: event.created } } });
       }
       case "session.text.delta": case "session.reasoning.delta": {
         const p = event.data;
-        const id = `${p.assistantMessageID}:${p.ordinal}`;
+        const kind = event.type === "session.text.delta" ? "text" : "reasoning";
+        const id = partId(p.assistantMessageID, kind, p.ordinal);
         const prior = this.text.get(id) ?? { text: "", emitted: 0 };
         prior.text += p.delta;
         this.text.set(id, prior);
         if (event.created - prior.emitted < 500) return [];
         prior.emitted = event.created;
         return emit("message.part.updated", { part: { id, sessionID: p.sessionID, messageID: p.assistantMessageID,
-          type: event.type === "session.text.delta" ? "text" : "reasoning", text: prior.text } });
+          type: kind, text: prior.text } });
       }
       case "session.reasoning.ended":
-        this.text.delete(`${event.data.assistantMessageID}:${event.data.ordinal}`); return [];
+        this.text.delete(partId(event.data.assistantMessageID, "reasoning", event.data.ordinal)); return [];
       case "session.tool.input.started": {
         const p = event.data;
         this.tools.set(p.id, { id: p.id, callID: p.id, sessionID: p.sessionID, messageID: p.assistantMessageID,

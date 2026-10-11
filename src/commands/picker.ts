@@ -133,7 +133,7 @@ function toRefs(ctx: CmdCtx, sessions: OcSession[], serverDir: string): SessionR
  * local server lists every session in the shared on-disk storage (spike 2).
  */
 async function pickerRefs(ctx: CmdCtx): Promise<SessionRef[]> {
-  const serverDir = canonicalDir(ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd);
+  const serverDir = canonicalDir(ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd));
   const entry = await ctx.pool.ensure(serverDir);
   const raw = (await sessionList(entry.client!)) as OcSession[];
   return toRefs(ctx, raw, serverDir);
@@ -150,7 +150,7 @@ export async function pickerList(
   opts: { scope: "project" | "all"; filter?: string },
 ): Promise<{ refs: SessionRef[]; total: number }> {
   const all = await pickerRefs(ctx);
-  const serverDir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+  const serverDir = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
   const q = opts.filter?.trim().toLowerCase();
   const inScope = all
     .filter((r) => (opts.scope === "all" ? true : canonicalDir(r.projectDir) === canonicalDir(serverDir)))

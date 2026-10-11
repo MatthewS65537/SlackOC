@@ -44,7 +44,8 @@ export interface ReportRunnerOptions {
   deliver(run: ScheduleRun): Promise<{ channel: string; ts: string }>;
   /** Bounded, bot-authored exact-marker evidence only. Absence never permits reposting. */
   findDelivery(run: ScheduleRun): Promise<{ channel: string; ts: string } | undefined>;
-  /** Use the private queue and recheck cancellation before the external effect. */
+  /** Use the private queue and recheck cancellation before the external effect.
+   * Must not overwrite possibly-delivered report evidence (findDelivery relies on it). */
   notify(run: ScheduleRun, text: string): Promise<void>;
   /** Called after durable delivered transition. Idempotent binding of the confirmed
    * report thread; do not remove unrelated bindings. Pending work survives failure. */

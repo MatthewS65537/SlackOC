@@ -17,6 +17,8 @@ const DRAFT_TTL_MS = 15 * 60_000;
 const ACTION_ALIASES: Record<string, string> = { change: "edit", update: "edit" };
 // Slack must receive the view ack within 3s; an unanswered probe defers to delivery-time errors.
 const MEMBERSHIP_PROBE_MS = 2000;
+/** Slack caps plain_text_input max_length at 3000; the form and parser share this prompt limit. */
+export const PROMPT_MAX = 3000;
 const plain = (text: string) => ({ type: "plain_text", text });
 const field = (id: string, label: string, element: Record<string, unknown>, optional = false) =>
   ({ type: "input", block_id: id, label: plain(label), optional, element: { ...element, action_id: "value" } });
@@ -45,7 +47,7 @@ export function scheduleCreateView(token: string, defaults: Defaults, job?: NewS
       field("days", "Days (all selected = daily)", { type: "multi_static_select", options: days,
         initial_options: job ? days.filter(d => job.schedule.days.includes(Number(d.value))) : days }),
       textField("directory", "Saved project directory", job?.projectDir ?? defaults.projectDir, { max_length: 1000 }),
-      textField("prompt", "Report prompt and information sources", job?.prompt ?? "", { multiline: true, max_length: 6000 }),
+      textField("prompt", "Report prompt and information sources", job?.prompt ?? "", { multiline: true, max_length: PROMPT_MAX }),
       // Radio + picker instead of one select: conversations_select cannot offer a "Your DM" entry.
       field("destination", "Deliver to", { type: "radio_buttons", options: targets, initial_option: targets[channel ? 1 : 0] }),
       field("channel", "Channel (used with \"A channel\"; invite the bot first)", { type: "conversations_select",
@@ -77,7 +79,7 @@ export function parseScheduleFields(values: Values): NewScheduleJob {
   const directory = expandHome(value("directory"));
   if (!directory.startsWith("/") || !statSync(directory, { throwIfNoEntry: false })?.isDirectory()) fail("directory", "Use an existing absolute project directory.");
   const prompt = value("prompt");
-  if (!prompt || prompt.length > 6000) fail("prompt", "Describe the report and its sources (1–6000 characters).");
+  if (!prompt || prompt.length > PROMPT_MAX) fail("prompt", `Describe the report and its sources (1–${PROMPT_MAX} characters).`);
   const target = values.destination?.value?.selected_option?.value === "channel" ? values.channel?.value?.selected_conversation ?? "" : "dm";
   if (target !== "dm" && !/^[CG][A-Z0-9]+$/.test(target)) fail("channel", "Choose a channel, or deliver to your DM.");
   const timeout = Number(value("timeout"));
@@ -210,7 +212,7 @@ export function installScheduleControls(opts: ControlOptions): Pick<ScheduleComm
       if (extra.length) throw new Error(`usage: ${SCHEDULE_USAGE}`);
       if (action === "add") {
         if (id) throw new Error("use \\schedule add without arguments");
-        const token = newDraft({ projectDir: ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd,
+        const token = newDraft({ projectDir: ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd),
           model: ctx.thread?.model, agent: ctx.thread?.agent });
         await ctx.render?.post(ctx.channelId, ctx.threadTs, "Create a scheduled report — preview and confirmation required.", [
           { type: "section", text: { type: "mrkdwn", text: "Choose a daily/weekly schedule, project, report prompt and destination." } },
@@ -240,6 +242,8 @@ export function installScheduleControls(opts: ControlOptions): Pick<ScheduleComm
       const job = opts.store.job(id);
       if (!job) throw new Error("unknown schedule ID — use \\schedule");
       if (action === "edit") {
+        // Older releases saved prompts up to 6000 characters; never truncate one into the form.
+        if (job.prompt.length > PROMPT_MAX) throw new Error(`this report's saved prompt is longer than Slack's ${PROMPT_MAX}-character form limit, so it cannot be edited here; it still runs unchanged — remove and re-add it with a shorter prompt to change it`);
         const token = newDraft({ projectDir: job.projectDir }, id);
         await ctx.render?.post(ctx.channelId, ctx.threadTs, `Edit ${esc(job.name)} — preview and confirmation required.`, [
           { type: "section", text: { type: "mrkdwn", text: `Edit *${esc(job.name)}*. Changes apply to future occurrences; a run in progress is unaffected.` } },

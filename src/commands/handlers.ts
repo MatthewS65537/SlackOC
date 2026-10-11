@@ -53,10 +53,13 @@ function requireDir(ctx: CmdCtx, dir: string): string {
   return canonicalDir(abs);
 }
 
-function newThreadState(sessionId: string, projectDir: string): ThreadState {
+function newThreadState(sessionId: string, projectDir: string, verbose: VerboseMode = "on"): ThreadState {
   const now = Date.now();
-  return { sessionId, projectDir: canonicalDir(projectDir), verbose: "on", createdAt: now, lastUsedAt: now };
+  return { sessionId, projectDir: canonicalDir(projectDir), verbose, createdAt: now, lastUsedAt: now };
 }
+
+/** Newest in-flight rebind per thread key (see rebindThread). */
+const latestRebind = new Map<string, symbol>();
 
 /**
  * Point a thread at a fresh session in `dir`. By default (teardown) the old
@@ -65,6 +68,10 @@ function newThreadState(sessionId: string, projectDir: string): ThreadState {
  * event or finalize from the old project can leak into this thread afterwards.
  * With `teardown: false` (\new) the old session is only unbound — it stays on
  * its server, listed by \sessions and recoverable via \resume.
+ *
+ * Only the thread's newest rebind may act after an await: an older, slower one
+ * (or one whose binding changed underneath it) skips its remaining teardown and
+ * never commits, so it cannot undo newer owner intent.
  */
 async function rebindThread(
   ctx: CmdCtx,
@@ -74,33 +81,46 @@ async function rebindThread(
 ): Promise<void> {
   dir = canonicalDir(dir);
   const old = ctx.thread;
+  const token = Symbol("rebind");
+  latestRebind.set(ctx.threadKey, token);
+  const boundId = ctx.state.getThread(ctx.threadKey)?.sessionId;
+  const current = () => latestRebind.get(ctx.threadKey) === token
+    && ctx.state.getThread(ctx.threadKey)?.sessionId === boundId;
   ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs, true);
-  if (old) {
-    if (opts.teardown !== false) {
-      try {
-        await withServerLease(ctx, old.projectDir, async (oldEntry) => {
-          await sessionAbort(oldEntry.client!, old.sessionId).catch(() => {});
-          await sessionDelete(oldEntry.client!, old.sessionId).catch(() => {});
-        });
-        // Kill the server ONLY when no other thread still uses this project —
-        // opencode serve is shared per dir, and killing it would destroy
-        // other threads' in-flight runs. Sessions persist on disk anyway.
-        if (!ctx.state.anyThreadInDir(old.projectDir, ctx.threadKey)) {
-          await ctx.pool.killOne(old.projectDir).catch(() => {});
+  try {
+    if (old) {
+      if (opts.teardown !== false) {
+        try {
+          await withServerLease(ctx, old.projectDir, async (oldEntry) => {
+            await sessionAbort(oldEntry.client!, old.sessionId).catch(() => {});
+            await sessionDelete(oldEntry.client!, old.sessionId).catch(() => {});
+          });
+          // Kill the server ONLY when no other thread still uses this project —
+          // opencode serve is shared per dir, and killing it would destroy
+          // other threads' in-flight runs. Sessions persist on disk anyway.
+          if (current() && !ctx.state.anyThreadInDir(old.projectDir, ctx.threadKey)) {
+            await ctx.pool.killOne(old.projectDir).catch(() => {});
+          }
+        } catch {
+          /* old server may already be gone */
         }
-      } catch {
-        /* old server may already be gone */
       }
+      if (current()) deleteView(old.sessionId);
     }
-    deleteView(old.sessionId);
+    const sess = await withServerLease(ctx, dir, (entry) => sessionCreate(entry.client!, `SlackOC ${new Date().toISOString().slice(0, 16)}`));
+    if (!current()) {
+      await ctx.postToThread("⏭ Superseded by a newer command — this thread keeps its current session.");
+      return;
+    }
+    ctx.state.setThread(ctx.threadKey, newThreadState(sess.id, dir, ctx.state.channelVerbose(ctx.channelId)));
+    const kept =
+      opts.teardown === false && old
+        ? ` Previous session \`${shortId(old.sessionId)}\` kept — \`\\resume\` brings it back.`
+        : "";
+    await ctx.postToThread(`${note} Fresh session \`${shortId(sess.id)}\` in \`${dir}\`. Reply here to drive it.${kept}`);
+  } finally {
+    if (latestRebind.get(ctx.threadKey) === token) latestRebind.delete(ctx.threadKey);
   }
-  const sess = await withServerLease(ctx, dir, (entry) => sessionCreate(entry.client!, `SlackOC ${new Date().toISOString().slice(0, 16)}`));
-  ctx.state.setThread(ctx.threadKey, newThreadState(sess.id, dir));
-  const kept =
-    opts.teardown === false && old
-      ? ` Previous session \`${shortId(old.sessionId)}\` kept — \`\\resume\` brings it back.`
-      : "";
-  await ctx.postToThread(`${note} Fresh session \`${shortId(sess.id)}\` in \`${dir}\`. Reply here to drive it.${kept}`);
 }
 
 /** Grouping + order for `\help`; every registered command must appear here. */
@@ -109,7 +129,7 @@ export const HELP_SECTIONS: Array<{ title: string; names: string[] }> = [
   { title: "Sessions", names: ["new", "sessions", "resume", "stop", "diff"] },
   { title: "Monitoring", names: ["watch", "unwatch", "history", "summary", "usage"] },
   { title: "Model & agent", names: ["model", "agent"] },
-  { title: "Projects", names: ["project", "cd"] },
+  { title: "Projects", names: ["project", "cd", "pin", "unpin"] },
   { title: "Notifications", names: ["notify", "schedule"] },
   { title: "Approvals & questions", names: ["permissions", "permission", "questions"] },
   { title: "Raw OpenCode", names: ["cmd"] },
@@ -155,7 +175,8 @@ registerCommand({
     const pool = ctx.pool.list();
     const th = ctx.thread;
     const lines = [
-      `*Project:* \`${ctx.state.currentProjectDir ?? ctx.cwd}\``,
+      `*Project:* \`${ctx.state.defaultDir(ctx.channelId, ctx.cwd)}\``,
+      ...(ctx.state.channelProject(ctx.channelId) ? [`*Pinned:* \`${ctx.state.channelProject(ctx.channelId)}\``] : []),
       `*Thread:* ${th ? `session \`${shortId(th.sessionId)}\` in \`${th.projectDir}\` · verbose=\`${th.verbose}\`${th.model ? ` · model=\`${th.model}\`` : ""}${th.agent ? ` · agent=\`${th.agent}\`` : ""}${th.hushed ? " · :mute: hushed" : ""}` : "no session bound (next message creates one)"}`,
       `*Pool:* ${pool.length ? pool.map((s) => `\`${s.dir}\` (${s.status}${s.url ? ` ${s.url}` : ""})`).join(", ") : "no servers running yet (they spawn lazily on first use)"}`,
     ];
@@ -267,19 +288,17 @@ registerCommand({
 registerCommand({
   name: "verbose",
   usage: "\\verbose [on|off|full]",
-  summary: "Tool-call visibility in this thread",
-  detail: "`on` posts a line per tool call · `full` adds output snippets · `off` silences.",
+  summary: "Tool-call visibility in this channel",
+  detail: "Applies to every thread in the channel. `on` posts a line per tool call · `full` adds output snippets · `off` silences.",
   async run(ctx, args) {
-    const th = requireThread(ctx);
     const arg = args.toLowerCase();
     if (!arg) {
-      await ctx.postToThread(`Tool visibility here: \`${th.verbose}\` (default \`on\` · \`full\` adds output snippets · \`off\` silences)`);
+      await ctx.postToThread(`Tool visibility in this channel: \`${ctx.state.channelVerbose(ctx.channelId)}\` (default \`on\` · \`full\` adds output snippets · \`off\` silences)`);
       return;
     }
     if (!["on", "off", "full"].includes(arg)) throw new Error("usage: \\verbose on|off|full");
-    ctx.state.setThread(ctx.threadKey, { ...th, verbose: arg as VerboseMode });
-    getView(th.sessionId)?.setVerbose(arg as VerboseMode);
-    await ctx.postToThread(`🔧 Tool visibility set to \`${arg}\`.`);
+    for (const sessionId of ctx.state.setChannelVerbose(ctx.channelId, arg as VerboseMode)) getView(sessionId)?.setVerbose(arg as VerboseMode);
+    await ctx.postToThread(`🔧 Tool visibility in this channel set to \`${arg}\`.`);
   },
 });
 
@@ -327,7 +346,7 @@ registerCommand({
   summary: "Reconnect to the OpenCode V2 service",
   detail: "Re-discovers the service and resumes observation. Existing sessions and running tasks are retained.",
   async run(ctx) {
-    const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+    const dir = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
     await ctx.pool.reconnect();
     const entry = await ctx.pool.ensure(dir);
     await ctx.postToThread(`🔄 Reconnected to OpenCode for \`${dir}\` (${entry.url ?? "connecting"}). Existing work is retained; observation is being reconciled.`);
@@ -387,7 +406,7 @@ registerCommand({
   summary: "Show or swap the model for this thread",
   detail: "Bare `\\model` posts a searchable picker with your OpenCode ★ favorites on top; `\\model sonnet` filters; `\\model provider/model` sets.",
   async run(ctx, args) {
-    const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+    const dir = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
     const entry = await ctx.pool.ensure(dir);
     const info = await configProviders(entry.client!);
     // Favorites first (TUI ctrl+f order); `\model <#>` numbers follow this order.
@@ -453,7 +472,7 @@ registerCommand({
   usage: "\\agent | \\agent <# or name>",
   summary: "Show or swap this thread's agent",
   async run(ctx, args) {
-    const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+    const dir = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
     const entry = await ctx.pool.ensure(dir);
     const agents = (await agentsList(entry.client!)).filter((a) => a.mode === "primary" || a.mode === "all");
     const arg = args.trim();
@@ -483,12 +502,46 @@ registerCommand({
 
 /** All known project dirs (state list + running pool), current first. */
 function knownProjectDirs(ctx: CmdCtx): string[] {
-  const current = canonicalDir(ctx.state.currentProjectDir ?? ctx.cwd);
+  const current = canonicalDir(ctx.state.defaultDir(ctx.channelId, ctx.cwd));
   const dirs = new Set<string>([current, ...ctx.pool.list().map((s) => s.dir), ...ctx.state.listProjects().map((p) => p.dir)].map(canonicalDir));
   return [...dirs];
 }
 
 const projectName = (dir: string): string => dir.split("/").filter(Boolean).pop() ?? dir;
+
+/**
+ * `#N` (from the last \\project list) or a name/substring among `dirs`.
+ * Undefined means a reply was already posted (stale list or ambiguous name).
+ */
+async function resolveProject(ctx: CmdCtx, q: string, dirs: string[]): Promise<string | undefined> {
+  if (/^#?\d+$/.test(q)) {
+    const n = Number(q.replace(/^#/, ""));
+    const displayed = projectListSnapshot(ctx);
+    if (!displayed) {
+      await ctx.postToThread("No fresh project list in this thread — run `\\project` and pick a number from that list.");
+      return;
+    }
+    const dir = displayed[n - 1];
+    if (!dir) throw new Error(`no project #${n} in the list you saw — \\project refreshes it`);
+    return dir;
+  }
+  const ql = q.toLowerCase();
+  const hits = dirs.filter((d) => projectName(d).toLowerCase() === ql || d.toLowerCase().includes(ql));
+  if (hits.length > 1) {
+    await ctx.postToThread(`Ambiguous — ${hits.map((h) => `\`${projectName(h)}\``).join(", ")}. Use \`\\project <#>\` from the list.`);
+    return;
+  }
+  if (!hits[0]) throw new Error(`no project matches \`${q}\` — try bare \`\\project\` for the list`);
+  return hits[0];
+}
+
+/** Hard pin: a pinned channel refuses every project other than its own. */
+function assertUnpinned(ctx: CmdCtx, dir: string): void {
+  const pin = ctx.state.channelProject(ctx.channelId);
+  if (pin && pin !== canonicalDir(dir)) {
+    throw new Error(`📌 this channel is pinned to \`${projectName(pin)}\` — \`\\unpin\` first, or use another channel.`);
+  }
+}
 
 registerCommand({
   name: "project", rebinds: "withArgs",
@@ -499,7 +552,7 @@ registerCommand({
   async run(ctx, args) {
     const q = args.trim();
     if (!q) {
-      const current = canonicalDir(ctx.state.currentProjectDir ?? ctx.cwd);
+      const current = canonicalDir(ctx.state.defaultDir(ctx.channelId, ctx.cwd));
       const dirs = knownProjectDirs(ctx);
       const lines = [`*Current:* \`${current}\``];
       const rest = dirs.filter((d) => d !== current);
@@ -517,29 +570,9 @@ registerCommand({
       cacheProjectList(ctx, rest);
       return;
     }
-    const dirs = knownProjectDirs(ctx).filter((d) => d !== canonicalDir(ctx.state.currentProjectDir ?? ctx.cwd));
-    const numeric = /^#?\d+$/.test(q);
-    const n = Number(q.replace(/^#/, ""));
-    let dir: string | undefined;
-    if (numeric) {
-      const displayed = projectListSnapshot(ctx);
-      if (!displayed) {
-        await ctx.postToThread("No fresh project list in this thread — run `\\project` and pick a number from that list.");
-        return;
-      }
-      dir = displayed[n - 1];
-      if (!dir) throw new Error(`no project #${n} in the list you saw — \\project refreshes it`);
-    }
-    else {
-      const ql = q.toLowerCase();
-      const hits = dirs.filter((d) => projectName(d).toLowerCase() === ql || d.toLowerCase().includes(ql));
-      if (hits.length === 1) dir = hits[0];
-      else       if (hits.length > 1) {
-        await ctx.postToThread(`Ambiguous — ${hits.map((h) => `\`${projectName(h)}\``).join(", ")}. Use \`\\project <#>\` from the list.`);
-        return;
-      }
-    }
-    if (!dir) throw new Error(`no project matches \`${q}\` — try bare \`\\project\` for the list`);
+    const dir = await resolveProject(ctx, q, knownProjectDirs(ctx).filter((d) => d !== canonicalDir(ctx.state.defaultDir(ctx.channelId, ctx.cwd))));
+    if (!dir) return;
+    assertUnpinned(ctx, dir);
     ctx.state.setCurrentProject(dir);
     await rebindThread(ctx, dir, `↔ Switched to \`${projectName(dir)}\`.`);
   },
@@ -553,9 +586,42 @@ registerCommand({
   async run(ctx, args) {
     if (!args) throw new Error("usage: \\cd /abs/path");
     const dir = requireDir(ctx, args);
+    assertUnpinned(ctx, dir);
     ctx.state.setCurrentProject(dir);
     await rebindThread(ctx, dir, "↔ Switched project.");
   },
+});
+
+registerCommand({
+  name: "pin",
+  usage: "\\pin [path|name|#|off]",
+  summary: "Lock this channel to one project",
+  detail: "Bare `\\pin` pins this thread's project. While pinned, new sessions here start in it and `\\cd`/`\\project`/`\\new <path>`/`\\resume` to other folders are refused. Existing threads keep their folders.",
+  async run(ctx, args) {
+    const q = args.trim();
+    const pin = ctx.state.channelProject(ctx.channelId);
+    if (q.toLowerCase() === "off") {
+      ctx.state.setChannelProject(ctx.channelId, undefined);
+      await ctx.postToThread(pin ? `Unpinned from \`${projectName(pin)}\`.` : "This channel isn't pinned.");
+      return;
+    }
+    if (!q && pin) {
+      await ctx.postToThread(`📌 Pinned to \`${projectName(pin)}\` (${pin}). \`\\unpin\` to release.`);
+      return;
+    }
+    const dir = !q ? ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd)
+      : /^[~/.]/.test(q) ? requireDir(ctx, q) : await resolveProject(ctx, q, knownProjectDirs(ctx));
+    if (!dir) return;
+    ctx.state.setChannelProject(ctx.channelId, dir);
+    await ctx.postToThread(`📌 Pinned to \`${projectName(dir)}\` — new sessions here run in \`${canonicalDir(dir)}\`. \`\\unpin\` to release.`);
+  },
+});
+
+registerCommand({
+  name: "unpin",
+  usage: "\\unpin",
+  summary: "Release this channel's project pin",
+  run: (ctx) => getCommand("pin")!.run(ctx, "off"),
 });
 
 registerCommand({
@@ -566,11 +632,12 @@ registerCommand({
   async run(ctx, args) {
     if (args) {
       const dir = requireDir(ctx, args);
+      assertUnpinned(ctx, dir);
       ctx.state.setCurrentProject(dir);
       await rebindThread(ctx, dir, "✨ New project session.", { teardown: false });
       return;
     }
-    const dir = ctx.state.currentProjectDir ?? ctx.cwd;
+    const dir = ctx.state.defaultDir(ctx.channelId, ctx.cwd);
     await rebindThread(ctx, dir, "✨", { teardown: false });
   },
 });
@@ -584,7 +651,7 @@ registerCommand({
   async run(ctx, args) {
     const arg = args.trim();
     if (!arg) {
-      const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+      const dir = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
       const { refs, total } = await pickerList(ctx, { scope: "project" });
       if (!total) {
         await ctx.postToThread(`No sessions yet in \`${dir}\` — \`\\sessions all\` lists the whole machine.`);
@@ -624,6 +691,7 @@ registerCommand({
     }
     const target = pick.ref.sessionId;
     const dir = pick.ref.projectDir;
+    assertUnpinned(ctx, dir);
     const entry = await ctx.pool.ensure(dir);
     await sessionGet(entry.client!, target); // throws if gone
     // Sessions are exclusive to one thread: stealing it here would orphan the
@@ -640,7 +708,7 @@ registerCommand({
     if (old && old.sessionId !== target) await getView(old.sessionId)?.stopWatching().catch(() => {});
     if (!old || old.sessionId !== target) invalidatePickerCache(ctx.threadKey);
     ctx.state.setThread(ctx.threadKey, {
-      ...(old ?? newThreadState(target, dir)),
+      ...(old ?? newThreadState(target, dir, ctx.state.channelVerbose(ctx.channelId))),
       sessionId: target,
       projectDir: dir,
       watchOnly: false, // \resume is the takeover path — the read-only gate lifts
@@ -716,7 +784,7 @@ registerCommand({
     ctx.state.setThread(ctx.threadKey, {
       sessionId: ref.sessionId,
       projectDir: ref.projectDir,
-      verbose: old?.verbose ?? "on",
+      verbose: old?.verbose ?? ctx.state.channelVerbose(ctx.channelId),
       model: old?.model,
       agent: old?.agent,
       watchOnly: true,
@@ -946,7 +1014,7 @@ registerCommand({
   detail: "Defaults to the last 7 days for this thread's project (or the current project); `all` covers every project. Days follow the bridge machine's time zone.",
   async run(ctx, args) {
     const { range, all } = parseUsageArgs(args);
-    const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+    const dir = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const days = USAGE_RANGES[range];
     const now = new Date();
@@ -1018,7 +1086,7 @@ registerCommand({
   detail: "e.g. `\\cmd compact` — same as typing the command in the OpenCode TUI. A bare `\\cmd` lists the commands available in this project.",
   async run(ctx, args) {
     if (!args) {
-      const dir = ctx.thread?.projectDir ?? ctx.state.currentProjectDir ?? ctx.cwd;
+      const dir = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
       const commands = await withServerLease(ctx, dir, (entry) => commandList(entry.client!));
       const lines = commands.length
         ? [`*OpenCode commands in* \`${dir}\``, ...commands.map((c) => `• \`${c.name}\`${c.description ? ` — ${c.description}` : ""}`), "", "Run one with `\\cmd <command> [args]`."]

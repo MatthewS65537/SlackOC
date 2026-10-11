@@ -12,8 +12,9 @@ interface QuestionUiDeps {
   /** Check inside the Slack queue immediately before deleting the old copy. */
   remove(channel: string, ts: string, allowed: () => boolean): Promise<void>;
   post?(channel: string, threadTs: string | undefined, build: () => Card | undefined): Promise<{ ts: string } | undefined>;
-  /** The transport must restrict evidence to bot-authored messages with this exact marker. */
-  find?(channel: string, threadTs: string | undefined, marker: string): Promise<{ ts: string } | undefined>;
+  /** The transport must restrict evidence to bot-authored messages with this exact marker.
+   * `oldest` bounds the search: a replacement is always posted after the copy it replaces. */
+  find?(channel: string, threadTs: string | undefined, marker: string, oldest?: string): Promise<{ ts: string } | undefined>;
   rejectedPost?(err: unknown): boolean;
   onAdopt?(record: QuestionSnapshot): void;
   stopping(): boolean;
@@ -258,7 +259,7 @@ export class QuestionUiReconciler {
     if (intent.postedTs) { this.finish(id, destination, intent); return true; }
     if (intent.status === "uncertain" || intent.status === "in-flight") {
       const marker = `slackoc-question:${record.id}:${intent.generation}:card:${intent.epoch}:${destination}:${intent.binding}`;
-      const found = await this.deps.find?.(intent.channel, intent.threadTs, marker);
+      const found = await this.deps.find?.(intent.channel, intent.threadTs, marker, intent.oldTs);
       if (!found) throw new Error("Question placement uncertain; no matching bot-authored evidence, current card retained");
       if (found.ts === intent.oldTs) throw new Error("Question placement uncertain; evidence names the old copy, not a replacement");
       this.rememberPost(id, destination, intent, found.ts);

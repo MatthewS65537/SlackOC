@@ -6,6 +6,7 @@ import { StateStore } from "../src/state.js";
 import type { OCClient, OcEvent, OcMessageInfo, OcPart } from "../src/opencode/api.js";
 import * as logModule from "../src/log.js";
 import { timestampFromMs } from "../src/slack/recovery-policy.js";
+import { handleIncomingMessage } from "../src/slack/router.js";
 
 type Message = { info: OcMessageInfo & { finish?: string }; parts: OcPart[] };
 function deferred<T>() {
@@ -240,7 +241,7 @@ describe("status reliability and lifetime", () => {
     expect(f.posted).toHaveLength(3);
     expect(f.posted[1]).toContain("Queued");
     expect(f.posted[2]).toMatch(/[⏳⌛]/);
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1", "T");
   });
 
   it("backs off status re-homing 2/4/8/16/30 seconds while retaining the old bar", async () => {
@@ -303,7 +304,7 @@ describe("status reliability and lifetime", () => {
     update.reject({ data: { error: "message_not_found" } });
     await vi.advanceTimersByTimeAsync(1_000);
     expect(f.posted).toHaveLength(2);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String), "T");
   });
 
   it("re-homes through content and logs old-bar and final cleanup failures", async () => {
@@ -313,8 +314,8 @@ describe("status reliability and lifetime", () => {
     f.v.contentPosted();
     await vi.advanceTimersByTimeAsync(2_000);
     expect(f.posted).toHaveLength(2);
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1", "T");
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String), "T");
     expect(logModule.logErr).toHaveBeenCalledWith(expect.stringContaining("status cleanup failed"));
     await f.v.finalize();
     expect(logModule.logErr).toHaveBeenCalledWith(expect.stringContaining("status cleanup failed"));
@@ -336,7 +337,7 @@ describe("status reliability and lifetime", () => {
     expect(f.posted).toHaveLength(1);
     expect(f.deps.update).not.toHaveBeenCalled();
     expect(f.deps.dm).not.toHaveBeenCalled();
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "late-sink");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "late-sink", "T");
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -348,7 +349,7 @@ describe("status reliability and lifetime", () => {
     deleteView(f.v.sessionId);
     gate.resolve({ ts: "late-ack" });
     await start;
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "late-ack");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "late-ack", "T");
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -373,16 +374,16 @@ describe("status reliability and lifetime", () => {
     f.v.setWaiting("same", "permission", true);
     f.v.setWaiting("same", "question", false);
     await vi.advanceTimersByTimeAsync(400_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("your answer and permission"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("your answer and permission"), "T");
     expect(f.deps.dm).not.toHaveBeenCalled();
     f.v.setWaiting("second", "question", false);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for permission"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for permission"), "T");
     await f.v.handle({ type: "session.idle" });
     expect(f.v.isActive).toBe(true);
     f.v.setWaiting("same", "permission", false);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.not.stringContaining("Waiting"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.not.stringContaining("Waiting"), "T");
   });
 
   it("canonical project connection states are rendered without stall paging", async () => {
@@ -391,12 +392,12 @@ describe("status reliability and lifetime", () => {
     for (const [state, label] of [["connecting", "Connecting"], ["reconnecting", "Reconnecting"], ["disconnected", "Disconnected"]] as const) {
       setProjectConnectionState("/renderer-reliability/../renderer-reliability/", state);
       await vi.advanceTimersByTimeAsync(180_000);
-      expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining(label));
+      expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining(label), "T");
     }
     expect(f.deps.dm).not.toHaveBeenCalled();
     setProjectConnectionState("/renderer-reliability", "connected");
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("starting"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("starting"), "T");
     expect(f.posted.join("\n")).not.toContain(":hourglass");
   });
 });
@@ -413,19 +414,19 @@ describe("pending question placement precedence", () => {
     expect(f.deps.post).toHaveBeenCalledTimes(2); // initial status and content, no replacement status
     expect(f.deps.delete).not.toHaveBeenCalled();
     expect(f.deps.update).toHaveBeenCalledTimes(3);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"), "T");
 
     f.v.setWaiting("q", "question", false);
     await vi.advanceTimersByTimeAsync(0);
     expect(f.deps.post).toHaveBeenCalledTimes(3);
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1", "T");
     await vi.advanceTimersByTimeAsync(2_000);
     expect(f.deps.post).toHaveBeenCalledTimes(3); // no card/bar repositioning loop
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-3", expect.not.stringContaining("Waiting"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-3", expect.not.stringContaining("Waiting"), "T");
     f.v.contentPosted();
     await vi.advanceTimersByTimeAsync(0);
     expect(f.deps.post).toHaveBeenCalledTimes(4);
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-3");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-3", "T");
   });
 
   it("defers dirty content until the LAST question clears, independently of permission waits", async () => {
@@ -440,13 +441,13 @@ describe("pending question placement precedence", () => {
     f.v.setWaiting("same", "question", false); // duplicate resolution must not release the other question
     await vi.advanceTimersByTimeAsync(2_000);
     expect(f.deps.post).toHaveBeenCalledTimes(1);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("your answer and permission"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("your answer and permission"), "T");
 
     f.v.setWaiting("second", "question", false);
     await vi.advanceTimersByTimeAsync(0);
     expect(f.deps.post).toHaveBeenCalledTimes(2);
     expect(f.posted[1]).toContain("Waiting for permission");
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1", "T");
   });
 
   it("keeps ordinary strict-bottom sinking for permission-only waiting", async () => {
@@ -458,9 +459,9 @@ describe("pending question placement precedence", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(f.deps.post).toHaveBeenCalledTimes(2);
     expect(f.posted[1]).toContain("Waiting for permission");
-    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1");
+    expect(f.deps.delete).toHaveBeenCalledWith("C", "ts-1", "T");
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.stringContaining("Waiting for permission"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.stringContaining("Waiting for permission"), "T");
   });
 
   it("retires an in-flight sink beneath a new question without replacing or deleting the known bar", async () => {
@@ -474,20 +475,20 @@ describe("pending question placement precedence", () => {
     f.v.setWaiting("q", "question", true);
     f.v.contentPosted();
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"), "T");
     gate.resolve({ ts: "late-sink" });
     await vi.advanceTimersByTimeAsync(0);
-    expect(f.deps.delete).toHaveBeenCalledExactlyOnceWith("C", "late-sink");
+    expect(f.deps.delete).toHaveBeenCalledExactlyOnceWith("C", "late-sink", "T");
     expect(f.state.getThread("C:T")?.pendingRun?.statusTs).toBe("ts-1");
     await vi.advanceTimersByTimeAsync(2_000);
     expect(f.deps.post).toHaveBeenCalledTimes(2);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.stringContaining("Waiting for your answer"), "T");
 
     f.v.setWaiting("q", "question", false);
     await vi.advanceTimersByTimeAsync(0);
     expect(f.deps.post).toHaveBeenCalledTimes(3);
     expect(f.state.getThread("C:T")?.pendingRun?.statusTs).toBe("ts-2");
-    expect(f.deps.delete).toHaveBeenLastCalledWith("C", "ts-1");
+    expect(f.deps.delete).toHaveBeenLastCalledWith("C", "ts-1", "T");
   });
 
   it("invalidates an interrupted sink even if the question clears before that post returns", async () => {
@@ -513,7 +514,7 @@ describe("pending question placement precedence", () => {
     expect(retired).toEqual(["late-sink", "ts-1"]); // late sink discarded, then a fresh normal sink replaces old bar
     expect(f.deps.post).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String), "T");
   });
 
   it("defers an initial status while a question is already pending without spinning", async () => {
@@ -530,7 +531,7 @@ describe("pending question placement precedence", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(f.deps.post).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.any(String));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.any(String), "T");
   });
 
   it("retires a delayed initial status interrupted by a question and restores status only after release", async () => {
@@ -544,14 +545,14 @@ describe("pending question placement precedence", () => {
     gate.resolve({ ts: "late-initial" });
     await start;
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(f.deps.delete).toHaveBeenCalledExactlyOnceWith("C", "late-initial");
+    expect(f.deps.delete).toHaveBeenCalledExactlyOnceWith("C", "late-initial", "T");
     expect(f.deps.post).toHaveBeenCalledTimes(1);
     expect(f.deps.update).not.toHaveBeenCalled();
     f.v.setWaiting("q", "question", false);
     await vi.advanceTimersByTimeAsync(0);
     expect(f.deps.post).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.any(String));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-1", expect.any(String), "T");
   });
 
   it("defers deleted-bar recovery while the question owns bottom placement", async () => {
@@ -568,7 +569,7 @@ describe("pending question placement precedence", () => {
     expect(f.deps.post).toHaveBeenCalledTimes(2);
     expect(f.deps.delete).not.toHaveBeenCalled(); // the old bar was already missing
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String));
+    expect(f.deps.update).toHaveBeenLastCalledWith("C", "ts-2", expect.any(String), "T");
   });
 });
 
@@ -762,5 +763,154 @@ describe("consistent safe tool formatter", () => {
     expect(format("read", { filePath: "/p/src/foo_bar.ts" })).toBe("📄 read `src/foo_bar.ts`");
     expect(format("glob", { pattern: "**/foo_*.ts", path: "/p/src_dir" })).toBe("🔍 glob `**/foo_*.ts` in `src_dir`");
     expect(format("bash", { command: "ls ~/src_dir/*.ts" })).toBe("🔧 `ls ~/src_dir/*.ts`");
+  });
+});
+
+describe("backstop membership by prompt identity", () => {
+  const user = (f: ReturnType<typeof fixture>, id: string, created: number): Message =>
+    ({ info: { id, sessionID: f.v.sessionId, role: "user", time: { created } }, parts: [] });
+  const answer = (f: ReturnType<typeof fixture>, id: string, parentID: string | undefined, created: number, value: string): Message =>
+    ({ info: { id, sessionID: f.v.sessionId, role: "assistant", parentID, finish: "stop", time: { created, completed: created + 500 } },
+      parts: [{ id: `${id}:0`, type: "text", text: value } as OcPart] });
+  /** A Slack prompt as the router leaves it: claimed receipt correlated to its OpenCode message ID. */
+  function submit(f: ReturnType<typeof fixture>, ts: string, messageId: string): void {
+    if (!f.state.getThread("C:T")?.historyCursorTs) f.state.setThread("C:T", { sessionId: f.v.sessionId, projectDir: "/renderer-reliability",
+      verbose: "on", createdAt: Date.now(), lastUsedAt: Date.now(), historyCursorTs: timestampFromMs(Date.now() - 60_000) });
+    f.state.claimMessage("C:T", ts);
+    f.state.associatePrompt("C:T", ts, { projectDir: "/renderer-reliability", sessionId: f.v.sessionId, messageId });
+  }
+  const count = (f: ReturnType<typeof fixture>, value: string) => f.posted.filter((p) => p.includes(value)).length;
+
+  it("a fresh view never re-posts a just-completed previous turn but recovers its own and synthetic-continuation replies (#9)", async () => {
+    const f = fixture();
+    const now = Date.now();
+    const prevTs = timestampFromMs(now - 3_000);
+    const ts = timestampFromMs(now);
+    submit(f, prevTs, "msg_prev");
+    submit(f, ts, "msg_cur");
+    await f.v.beginPrompt(ts);
+    f.messages([
+      user(f, "msg_prev", now - 1_500),
+      answer(f, "asst_prev", "msg_prev", now - 1_000, "ALREADY DELIVERED PREVIOUS ANSWER"),
+      user(f, "msg_cur", now + 100),
+      // Server clock skew: the current reply is stamped before the observer started.
+      answer(f, "asst_cur", "msg_cur", now - 1_900, "CURRENT ANSWER"),
+      user(f, "msg_continue", now + 2_000), // OpenCode's synthetic post-compaction turn — no Slack receipt
+      answer(f, "asst_continue", "msg_continue", now + 2_100, "CONTINUED ANSWER"),
+    ]);
+    await f.v.finalize();
+    expect(count(f, "PREVIOUS ANSWER")).toBe(0);
+    expect(count(f, "CURRENT ANSWER")).toBe(1);
+    expect(count(f, "CONTINUED ANSWER")).toBe(1);
+  });
+
+  it("without prompt identity, the time-window fallback still excludes turns older than the run", async () => {
+    const f = fixture();
+    await f.v.beginPrompt("unsubmitted");
+    f.messages([answer(f, "asst_old", undefined, Date.now() - 5_000, "OLD"), answer(f, "asst_new", undefined, Date.now() + 1_000, "NEW")]);
+    await f.v.finalize();
+    expect([count(f, "OLD"), count(f, "NEW")]).toEqual([0, 1]);
+  });
+
+  it.each([["prompt identity", true], ["time-window fallback", false]])(
+    "a queued prompt keeps the earlier outstanding answer recoverable and the elapsed clock running (#14, %s)", async (_label, receipts) => {
+      const f = fixture();
+      const start = Date.now();
+      const aTs = timestampFromMs(start);
+      const bTs = timestampFromMs(start + 10_000);
+      if (receipts) submit(f, aTs, "msg_a");
+      await f.v.beginPrompt(aTs);
+      await vi.advanceTimersByTimeAsync(10_000);
+      if (receipts) submit(f, bTs, "msg_b");
+      await f.v.beginPrompt(bTs);
+      expect(f.v.currentRunElapsedMs).toBe(10_000);
+      // A's text events were dropped over SSE; only the transcript has them.
+      f.messages([
+        user(f, "msg_old", start - 6_000),
+        answer(f, "asst_old", receipts ? "msg_old" : undefined, start - 5_000, "OLD ANSWER"),
+        user(f, "msg_a", start),
+        answer(f, "asst_a", receipts ? "msg_a" : undefined, start + 1_000, "FIRST ANSWER"),
+        user(f, "msg_b", start + 10_000),
+        answer(f, "asst_b", receipts ? "msg_b" : undefined, start + 12_000, "SECOND ANSWER"),
+      ]);
+      await f.v.finalize();
+      expect([count(f, "OLD ANSWER"), count(f, "FIRST ANSWER"), count(f, "SECOND ANSWER")]).toEqual([0, 1, 1]);
+      expect(f.deps.react).toHaveBeenCalledWith("C", aTs, "white_check_mark");
+      expect(f.deps.react).toHaveBeenCalledWith("C", bTs, "white_check_mark");
+      if (receipts) for (const ts of [aTs, bTs]) expect(f.state.getReceipt("C:T", ts)?.disposition).toBe("accepted");
+    });
+});
+
+describe("prompt admission during finalization (#13)", () => {
+  it("a follow-up during deferred finalization gets a fresh live observer that the old cleanup cannot remove", async () => {
+    const id = `reliability-${++seq}`;
+    const dir = "/renderer-reliability";
+    const now = Date.now();
+    const root = timestampFromMs(now - 60_000);
+    const key = `C:${root}`;
+    const [firstTs, secondTs] = [timestampFromMs(now - 1_000), timestampFromMs(now)];
+    const posted: string[] = [];
+    const reactions: string[] = [];
+    const render: RenderDeps = {
+      post: vi.fn(async (_c, _t, value) => { posted.push(value); return { ts: `ts-${posted.length}` }; }),
+      update: vi.fn(async () => {}), delete: vi.fn(async () => {}), upload: vi.fn(async () => {}),
+      react: vi.fn(async (_c, ts, name) => { reactions.push(`${ts}:${name}`); }),
+      unreact: vi.fn(async (_c, ts, name) => { reactions.push(`${ts}:-${name}`); }),
+    };
+    const store = `${import.meta.dirname}/.fixtures/render-reliability/${id}`;
+    rmSync(store, { recursive: true, force: true });
+    const state = new StateStore(`${store}/state.json`);
+    state.setThread(key, { sessionId: id, projectDir: dir, verbose: "on", createdAt: now, lastUsedAt: now, historyCursorTs: root });
+    const pendingAtSubmit: unknown[] = [];
+    const client = { session: {
+      get: vi.fn(async () => ({ data: { id } })),
+      messages: vi.fn(async (): Promise<{ data: Message[] }> => ({ data: [] })),
+      promptAsync: vi.fn(async () => { pendingAtSubmit.push(state.getThread(key)?.pendingRun?.userMsgTs); return { data: {} }; }),
+    } };
+    const entry = { client, dir };
+    const d = { config: { ownerSlackUserId: "U" }, state, render, botUserId: "B", cwd: dir,
+      pool: { acquire: vi.fn(async () => ({ entry, release: () => {} })) } } as never;
+    const send = (ts: string, value: string) => handleIncomingMessage({ channel: "C", thread_ts: root, ts, user: "U", text: value }, d);
+    const messageId = (ts: string) => state.getReceipt(key, ts)!.submission!.messageId;
+    const user = (ts: string): Message => ({ info: { id: messageId(ts), sessionID: id, role: "user", time: { created: now } }, parts: [] });
+    const reply = (ts: string, value: string): Message => ({ info: { id: `asst-${value}`, sessionID: id, role: "assistant", parentID: messageId(ts),
+      finish: "stop", time: { created: now, completed: now + 1 } }, parts: [{ id: `part-${value}`, type: "text", text: value } as OcPart] });
+
+    expect(await send(firstTs, "first")).toBe("accepted");
+    const old = getView(id)!;
+    views.push(old);
+    await old.handle(text("part-FIRST ANSWER", "FIRST ANSWER"));
+    // Old finalization stalls on its transcript fetch (ordinary paced Slack/OpenCode I/O).
+    const fetch = deferred<{ data: Message[] }>();
+    client.session.messages.mockImplementationOnce(() => fetch.promise);
+    const finalizing = old.finalize();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(old.isFinalized).toBe(true);
+
+    expect(await send(secondTs, "follow-up")).toBe("accepted");
+    expect(client.session.promptAsync).toHaveBeenCalledTimes(2);
+    expect(pendingAtSubmit[1]).toEqual([secondTs]); // marker durable before native submission
+    const fresh = getView(id)!;
+    views.push(fresh);
+    expect(fresh).not.toBe(old);
+    expect(fresh.isActive).toBe(true);
+    await fresh.handle(text("part-FOLLOW-UP ANSWER", "FOLLOW-UP ANSWER"));
+
+    // The old run completes its cleanup against a transcript that already holds the follow-up.
+    fetch.resolve({ data: [user(firstTs), reply(firstTs, "FIRST ANSWER"), user(secondTs), reply(secondTs, "FOLLOW-UP ANSWER")] });
+    await finalizing;
+    expect(getView(id)).toBe(fresh);
+    expect(state.getThread(key)?.pendingRun?.userMsgTs).toEqual([secondTs]);
+    expect(reactions).toContain(`${firstTs}:white_check_mark`);
+    expect(reactions).not.toContain(`${secondTs}:white_check_mark`);
+
+    client.session.messages.mockResolvedValue({ data: [user(firstTs), reply(firstTs, "FIRST ANSWER"), user(secondTs), reply(secondTs, "FOLLOW-UP ANSWER")] });
+    await fresh.handle({ type: "session.idle", properties: { sessionID: id } });
+    expect(getView(id)).toBeUndefined();
+    expect(state.getThread(key)?.pendingRun).toBeUndefined();
+    expect(reactions).toContain(`${secondTs}:-eyes`);
+    expect(reactions).toContain(`${secondTs}:white_check_mark`);
+    expect(posted.filter((p) => p.includes("FIRST ANSWER"))).toHaveLength(1);
+    expect(posted.filter((p) => p.includes("FOLLOW-UP ANSWER"))).toHaveLength(1);
   });
 });

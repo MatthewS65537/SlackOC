@@ -5,7 +5,7 @@ import type { App } from "@slack/bolt";
 import type { CmdCtx } from "../src/commands/registry.js";
 import { execute } from "../src/commands/registry.js";
 import "../src/commands/handlers.js";
-import { installScheduleControls, lastRunStatus, parseScheduleFields, scheduleConfirmView, scheduleCreateView } from "../src/schedules/controls.js";
+import { installScheduleControls, lastRunStatus, parseScheduleFields, PROMPT_MAX, scheduleConfirmView, scheduleCreateView } from "../src/schedules/controls.js";
 import { ScheduleStore, type ScheduleRun } from "../src/schedules/store.js";
 
 const root = resolve("test/.fixtures/schedule-controls");
@@ -31,7 +31,7 @@ function setup() {
   const cancel = vi.fn(async () => {});
   const controls = installScheduleControls({ app: app as unknown as App, owner: "UOWNER", store, now: () => NOW,
     cancel, poll, stopping: () => false });
-  const ctx = { channelId: "DOWNER", threadTs: "100.001", thread: null, state: { currentProjectDir: root }, cwd: root,
+  const ctx = { channelId: "DOWNER", threadTs: "100.001", thread: null, state: { defaultDir: () => root }, cwd: root,
     render: { post: vi.fn(async () => ({ ts: "101.001" })) }, postToThread: vi.fn(async () => {}) } as unknown as CmdCtx;
   return { app, actions, views, store, controls, ctx, poll, cancel };
 }
@@ -57,6 +57,25 @@ describe("scheduled report controls", () => {
     const preview = scheduleConfirmView("draft", parseScheduleFields(fields({ name: "<@UALL>" })), NOW);
     expect(preview.blocks.every(b => b.text.type === "plain_text")).toBe(true);
     expect(preview.blocks.map(b => b.text.text).join(" ")).toContain("Read-only tools");
+  });
+
+  it("keeps every text input within Slack's 1–3000 max_length, and the parser agrees on the prompt limit", () => {
+    const job = parseScheduleFields(fields({ prompt: "p".repeat(PROMPT_MAX) }));
+    for (const form of [scheduleCreateView("draft", { projectDir: root }), scheduleCreateView("draft", { projectDir: root }, job)]) {
+      const limits = form.blocks.map(b => (b.element as any)).filter(el => el.type === "plain_text_input").map(el => el.max_length);
+      expect(limits.length).toBeGreaterThan(0);
+      expect(limits.every(n => Number.isInteger(n) && n >= 1 && n <= 3000)).toBe(true);
+    }
+    expect(PROMPT_MAX).toBe(3000);
+    expect(() => parseScheduleFields(fields({ prompt: "p".repeat(PROMPT_MAX + 1) }))).toThrow(`1–${PROMPT_MAX} characters`);
+  });
+
+  it("refuses to open the edit form for a longer saved prompt instead of truncating it", async () => {
+    const s = setup();
+    const job = s.store.createJob({ ...parseScheduleFields(fields()), prompt: "p".repeat(6000) });
+    await expect(s.controls.run(s.ctx, `edit ${job.id}`)).rejects.toThrow("3000-character form limit");
+    expect(s.ctx.render!.post).not.toHaveBeenCalled();
+    expect(s.store.job(job.id)!.prompt).toHaveLength(6000);
   });
 
   it("parses the DM choice and the channel picker's selected_conversation", () => {

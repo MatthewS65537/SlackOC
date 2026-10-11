@@ -99,7 +99,7 @@ export function createCatchupRunner(app: App, deps: {
       if (groups.length) receiptOffset = (receiptOffset + 4) % groups.length;
       if (isStopping()) return;
       const n = await sweepMissedMessages(catchupDeps) + (isStopping() ? 0 : await sweepTopLevelMessages({ state,
-        ownerSlackUserId: deps.ownerSlackUserId, channels: deps.topLevelChannels(), fetchHistory, dispatch: catchupDeps.dispatch }));
+        ownerSlackUserId: deps.ownerSlackUserId, channels: deps.topLevelChannels(), fetchHistory, fetchReplies: catchupDeps.fetchReplies, dispatch: catchupDeps.dispatch }));
       if (n && !boot) ghost.noteReplayed(n); // boot pass replays are the restart gap, not a ghost
       const warn = ghost.check();
       if (warn) logErr(warn);

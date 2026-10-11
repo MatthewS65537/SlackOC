@@ -150,7 +150,7 @@ export async function recoverInterruptedRuns(deps: BootRecoveryDeps): Promise<Bo
           : ":warning: Bridge restarted — this run was interrupted. Send a new instruction to continue.";
         try {
           // Replace a frozen progress bar when possible, otherwise post one concise notice.
-          if (snapshot.pendingRun?.statusTs) await render.update(key.split(":")[0]!, snapshot.pendingRun.statusTs, text);
+          if (snapshot.pendingRun?.statusTs) await render.update(key.split(":")[0]!, snapshot.pendingRun.statusTs, text, key.slice(key.indexOf(":") + 1));
           else await render.post(key.split(":")[0]!, key.slice(key.indexOf(":") + 1), text, undefined, { unfurl: false, lane: "interactive" });
           counts.notices++;
           if (!current()) return invalidated;
@@ -248,7 +248,7 @@ export async function recoverInterruptedRuns(deps: BootRecoveryDeps): Promise<Bo
       cleared = true;
       // Do not feed historical output into the renderer/finalize backstop.
       if (snapshot.pendingRun?.statusTs && current()) {
-        try { await render.delete(key.split(":")[0]!, snapshot.pendingRun.statusTs); }
+        try { await render.delete(key.split(":")[0]!, snapshot.pendingRun.statusTs, key.slice(key.indexOf(":") + 1)); }
         catch (error) { reportError("status cleanup failed", error); }
         if (!current()) return invalidated;
       }

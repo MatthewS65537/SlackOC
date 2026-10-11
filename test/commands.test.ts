@@ -204,6 +204,24 @@ describe("command registry (user-mandated surface)", () => {
     expect(t.hushed).toBeUndefined();
   });
 
+  it("\\verbose is channel-wide: existing threads, new threads, other channels untouched", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/verbose-channel/state.json`);
+    state.setThread("C1:T1", newThreadState("s1", "/p"));
+    state.setThread("C1:T2", newThreadState("s2", "/p"));
+    state.setThread("C2:T3", newThreadState("s3", "/p"));
+    state.setThread("C1:T4", { ...newThreadState("s4", "/p", "off"), scheduledRunId: "r1" });
+    const { ctx, out } = hushCtx(state);
+    await getCommand("verbose")!.run(ctx, "full");
+    expect(state.getThread("C1:T1")!.verbose).toBe("full");
+    expect(state.getThread("C1:T2")!.verbose).toBe("full");
+    expect(state.getThread("C2:T3")!.verbose).toBe("on");
+    expect(state.getThread("C1:T4")!.verbose).toBe("off"); // scheduled reports stay silent
+    expect(state.channelVerbose("C1")).toBe("full");
+    expect(state.channelVerbose("C2")).toBe("on");
+    await getCommand("verbose")!.run(ctx, "");
+    expect(out.at(-1)).toContain("`full`");
+  });
+
   it("\\hush toggles the thread state and announces it", async () => {
     const state = new StateStore(`${import.meta.dirname}/.fixtures/hush/state.json`);
     state.setThread("C1:T1", newThreadState("s1", "/p"));
@@ -1367,5 +1385,116 @@ describe("\\usage", () => {
     expect(out.at(-1)).toMatch(/^\*Usage · all projects · today\*/);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.project).toBeUndefined();
+  });
+});
+
+describe("overlapping rebinds (#12)", () => {
+  const FIX = join(IDENTITY_FIXTURES, "rebind-race");
+  const dirA = join(FIX, "a"), dirB = join(FIX, "b");
+  mkdirSync(dirA, { recursive: true });
+  mkdirSync(dirB, { recursive: true });
+  const A = canonicalDir(dirA), B = canonicalDir(dirB);
+
+  /** Every session create/abort waits until the test resolves it. */
+  function rig(name: string, bound?: string) {
+    const state = new StateStore(join(FIX, name, "state.json"));
+    state.setCurrentProject(A);
+    if (bound) state.setThread("C1:T1", newThreadState(bound, A));
+    const creates: Array<{ dir: string; done: (id: string) => void }> = [];
+    const aborts: Array<() => void> = [];
+    const killed: string[] = [];
+    const out: string[] = [];
+    const client = (dir: string) => ({ session: {
+      create: () => new Promise((res) => creates.push({ dir, done: (id) => res({ data: { id } }) })),
+      abort: () => new Promise((res) => aborts.push(() => res({ data: {} }))),
+      delete: async () => ({ data: {} }),
+    } });
+    const pool = { acquire: async (dir: string) => ({ entry: { client: client(dir) }, release: () => {} }),
+      killOne: async (dir: string) => { killed.push(dir); } };
+    /** Starts a command the way the router does: thread read when it arrives. */
+    const run = (name: string, args: string, messageTs: string) => getCommand(name)!.run(baseCtx(state, out,
+      state.getThread("C1:T1"), { pool: pool as never, messageTs }), args);
+    return { state, creates, aborts, killed, out, run };
+  }
+
+  it("a delayed older \\new cannot replace a newer completed binding", async () => {
+    const { state, creates, out, run } = rig("existing", "ses_old");
+    const older = run("new", "", "1.1");
+    await vi.waitFor(() => expect(creates).toHaveLength(1));
+    const newer = run("new", dirB, "1.2");
+    await vi.waitFor(() => expect(creates).toHaveLength(2));
+    creates[1]!.done("ses_fast");
+    await newer;
+    creates[0]!.done("ses_slow");
+    await older;
+    expect(state.getThread("C1:T1")).toMatchObject({ sessionId: "ses_fast", projectDir: B });
+    expect(state.currentProjectDir).toBe(B);
+    expect(out.at(-1)).toContain("Superseded");
+  });
+
+  it.each([["newer", 1, 0], ["older", 0, 1]])("an initially unbound thread keeps the newer \\new when the %s finishes first", async (_label, first, second) => {
+    const { state, creates, run } = rig(`unbound-${first}`);
+    const runs = [run("new", "", "2.1")];
+    await vi.waitFor(() => expect(creates).toHaveLength(1));
+    runs.push(run("new", dirB, "2.2"));
+    await vi.waitFor(() => expect(creates).toHaveLength(2));
+    creates[first]!.done(`ses_${first}`);
+    await runs[first];
+    creates[second]!.done(`ses_${second}`);
+    await runs[second];
+    expect(state.getThread("C1:T1")).toMatchObject({ sessionId: "ses_1", projectDir: B });
+  });
+
+  it("a superseded \\cd skips the rest of its teardown, sparing the newer session's server", async () => {
+    const { state, creates, aborts, killed, run } = rig("teardown", "ses_old");
+    const older = run("cd", dirB, "3.1");
+    await vi.waitFor(() => expect(aborts).toHaveLength(1));
+    const newer = run("new", dirA, "3.2"); // back in project A, so A's server must survive
+    await vi.waitFor(() => expect(creates).toHaveLength(1));
+    creates[0]!.done("ses_new");
+    await newer;
+    aborts[0]!();
+    await vi.waitFor(() => expect(creates).toHaveLength(2));
+    creates[1]!.done("ses_stale");
+    await older;
+    expect(killed).toEqual([]);
+    expect(state.getThread("C1:T1")).toMatchObject({ sessionId: "ses_new", projectDir: A });
+  });
+});
+
+
+describe("\\pin (channel project lock)", () => {
+  const FIX = `${import.meta.dirname}/.fixtures/pin/state.json`;
+  afterAll(() => rmSync(`${import.meta.dirname}/.fixtures/pin`, { recursive: true, force: true }));
+  const pinned = canonicalDir(homedir());
+  const other = canonicalDir(import.meta.dirname);
+  const pool = {
+    async acquire(dir: string) { return { entry: { client: { session: { create: async () => ({ data: { id: `ses_in_${dir}` } }) } } }, release: () => {} }; },
+    ensure: async () => ({ client: { session: {
+      list: async () => ({ data: [{ id: "ses_foreign", title: "t", directory: other, time: { updated: 1 } }] }),
+      get: async () => ({ data: { id: "ses_foreign" } }) } } }),
+    list: () => [],
+  } as never;
+
+  it("pins, persists, refuses other folders, allows its own, and unpins", async () => {
+    const state = new StateStore(FIX);
+    const out: string[] = [];
+    await getCommand("pin")!.run(baseCtx(state, out, null, { pool }), "~");
+    expect(new StateStore(FIX).channelProject("C1")).toBe(pinned); // canonical + survives reload
+    expect(state.defaultDir("C1", "/")).toBe(pinned);
+    expect(state.defaultDir("C2", "/")).not.toBe(pinned); // other channels unaffected
+
+    await expect(getCommand("cd")!.run(baseCtx(state, out, null, { pool }), other)).rejects.toThrow(/pinned to/);
+    await expect(getCommand("new")!.run(baseCtx(state, out, null, { pool }), other)).rejects.toThrow(/pinned to/);
+    await expect(getCommand("resume")!.run(baseCtx(state, out, null, { pool }), "ses_foreign")).rejects.toThrow(/pinned to/);
+    expect(state.getThread("C1:T1")).toBeNull();
+
+    await getCommand("cd")!.run(baseCtx(state, out, null, { pool }), "~");
+    expect(state.getThread("C1:T1")?.projectDir).toBe(pinned);
+
+    await getCommand("unpin")!.run(baseCtx(state, out, null, { pool }), "");
+    expect(state.channelProject("C1")).toBeUndefined();
+    await getCommand("cd")!.run(baseCtx(state, out, null, { pool }), other);
+    expect(state.getThread("C1:T1")?.projectDir).toBe(other);
   });
 });

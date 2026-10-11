@@ -220,7 +220,7 @@ describe("exact accepted run observation", () => {
     expect(await f.run()).toMatchObject({ restored: 1, notices: 0 });
     expect(getView(sessionId)?.isActive).toBe(true);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(f.render.update).toHaveBeenCalledWith("C", "frozen", expect.stringContaining(kind === "question" ? "Waiting for your answer" : "Waiting for permission"));
+    expect(f.render.update).toHaveBeenCalledWith("C", "frozen", expect.stringContaining(kind === "question" ? "Waiting for your answer" : "Waiting for permission"), "100.000000");
     expect(f.client.session.promptAsync).not.toHaveBeenCalled();
   });
 
@@ -264,7 +264,7 @@ describe("completion is distinct from acceptance", () => {
     expect(await f.run()).toMatchObject({ completed: 1, notices: 0, restored: 0 });
     expect(f.state.getThread(key)?.pendingRun).toBeUndefined();
     expect(f.state.getThread(key)?.recovery?.lastRun).toMatchObject({ outcome: "completed", messageIds: ["msg_exact"] });
-    expect(f.render.delete).toHaveBeenCalledWith("C", "frozen");
+    expect(f.render.delete).toHaveBeenCalledWith("C", "frozen", "100.000000");
     expect(f.render.post).not.toHaveBeenCalled();
     expect(f.render.update).not.toHaveBeenCalled();
     expect(getView(sessionId)).toBeUndefined();
@@ -277,7 +277,7 @@ describe("completion is distinct from acceptance", () => {
     expect(await f.run()).toMatchObject({ interrupted: 1, completed: 0, notices: 1 });
     expect(f.state.getThread(key)?.recovery?.lastRun?.outcome).toBe("interrupted");
     expect(f.state.getThread(key)?.pendingRun).toBeUndefined();
-    expect(f.render.update).toHaveBeenCalledWith("C", "frozen", expect.stringContaining("was interrupted"));
+    expect(f.render.update).toHaveBeenCalledWith("C", "frozen", expect.stringContaining("was interrupted"), "100.000000");
   });
 
   it.each(["pending", "running"])("rejects completion with a %s tool", async status => {

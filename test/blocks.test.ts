@@ -96,8 +96,8 @@ describe("questionBlocks", () => {
       ],
     });
     const blocks = questionBlocks(req, [["A"], []]);
-    // header + q1 ✅ + q2 section + q2 actions + skip = 5
-    expect(blocks.length).toBe(5);
+    // header + q1 ✅ + q2 section + q2 actions + Back + skip = 6
+    expect(blocks.length).toBe(6);
     const q1 = (blocks[1] as { text: { text: string } }).text.text;
     expect(q1).toContain("✅");
     expect(q1).toContain("A");
@@ -223,7 +223,7 @@ describe("permission and question Slack contract", () => {
       const blocks = questionBlocks(req, [answers], done);
       assertSlackContract(blocks);
       for (const row of rows(blocks)) for (const e of row.elements!) {
-        if (["qsubmit", "qretry", "qedit"].includes(e.action_id!)) continue;
+        if (["qsubmit", "qsubmit_all", "qretry", "qedit"].includes(e.action_id!)) continue;
         expect(QUESTION_ACTION_PATTERN.test(e.action_id!)).toBe(true);
         const v = JSON.parse(e.value!) as QuestionButtonValue;
         expect(e.action_id).toBe(v.a === -1 ? "question_skip" : `question_${v.i}_${v.a}`);
@@ -259,11 +259,11 @@ describe("questionBlocks generation and submission state", () => {
     const buttons = rows(open).flatMap(row => row.elements!);
     expect(buttons.map(button => button.action_id)).toEqual([
       ...Array.from({ length: 20 }, (_, i) => `question_1_${i + 20}`),
-      "qsubmit", "qpage_prev", "qpage_next", "qtext", "qomit", "question_skip",
+      "qsubmit", "qpage_prev", "qpage_next", "qtext", "qomit", "qnav_prev", "question_skip",
     ]);
     for (const button of buttons) {
       const value = JSON.parse(button.value!) as QuestionActionValue;
-      expect(value).toMatchObject({ s: "sess-1", q: "q-1", g: generation, i: button.action_id === "question_skip" ? 0 : 1 });
+      expect(value).toMatchObject({ s: "sess-1", q: "q-1", g: generation, i: ["question_skip", "qnav_prev"].includes(button.action_id!) ? 0 : 1 });
     }
     expect(JSON.parse(buttons.find(button => button.action_id === "question_1_21")!.value!)).toEqual({ s: "sess-1", q: "q-1", i: 1, a: 21, g: generation });
     expect(buttons.find(button => button.action_id === "question_1_21")!.style).toBe("primary");
@@ -276,9 +276,10 @@ describe("questionBlocks generation and submission state", () => {
     const ready = questionBlocks(req, answers, [true, true], 1, { generation, response: "pending" });
     assertSlackContract(ready);
     const readyButtons = rows(ready).flatMap(row => row.elements!);
-    expect(readyButtons.map(button => button.action_id)).toEqual(["qretry", "qedit"]);
+    expect(readyButtons.map(button => button.action_id)).toEqual(["qsubmit_all", "qnav_prev", "qedit"]);
     expect(readyButtons.map(button => JSON.parse(button.value!))).toEqual([
       { s: "sess-1", q: "q-1", i: 0, g: generation },
+      { s: "sess-1", q: "q-1", i: 1, g: generation },
       { s: "sess-1", q: "q-1", i: 0, g: generation },
     ]);
   });
@@ -341,6 +342,25 @@ describe("questionBlocks generation and submission state", () => {
     expect(rows(blocks)).toEqual([]);
     expect(JSON.stringify(blocks)).toContain("no longer pending");
     expect(JSON.stringify(blocks)).not.toMatch(/continuing|resumed|Answer confirmed/);
+  });
+
+  it("renders the shown question with Back/Next and a review step once every question is answered", () => {
+    const options = [{ label: "A", description: "" }, { label: "B", description: "" }];
+    const req = makeReq({ questions: ["One", "Two", "Three"].map(header => ({ header, question: `${header}?`, options })) });
+    const answers = [["A"], ["B"], ["A"]];
+    const nav = (blocks: unknown[]) => rows(blocks).flatMap(row => row.elements!)
+      .filter(button => button.action_id!.startsWith("qnav_")).map(button => [button.action_id, JSON.parse(button.value!)]);
+    const revisit = questionBlocks(req, answers, [true, true, true], 0, { generation: 7, shown: 1 });
+    assertSlackContract(revisit);
+    expect(JSON.stringify(revisit)).toContain("Q2/3");
+    expect(rows(revisit).flatMap(row => row.elements!).filter(button => button.style === "primary").map(b => b.action_id)).toEqual(["question_1_1"]);
+    expect(nav(revisit)).toEqual([["qnav_prev", { s: "sess-1", q: "q-1", i: 0, g: 7 }], ["qnav_next", { s: "sess-1", q: "q-1", i: 2, g: 7 }]]);
+    // Next from the last question leaves the cursor (r: 1); an unfinished question has no Next.
+    expect(nav(questionBlocks(req, answers, [true, true, true], 0, { generation: 7, shown: 2 }))[1]).toEqual(["qnav_next", { s: "sess-1", q: "q-1", i: 2, g: 7, r: 1 }]);
+    expect(nav(questionBlocks(req, [["A"], [], []], [true, false, false], 0, { generation: 7 }))).toEqual([["qnav_prev", { s: "sess-1", q: "q-1", i: 0, g: 7 }]]);
+    const review = questionBlocks(req, answers, [true, true, true], 0, { generation: 7 });
+    expect(JSON.stringify(review)).toContain("• *Two*: B");
+    expect(rows(review).flatMap(row => row.elements!).map(button => button.action_id)).toEqual(["qsubmit_all", "qnav_prev", "qedit"]);
   });
 
   it("keeps hidden fields and caller-finalized conditional fields out of the wizard", () => {

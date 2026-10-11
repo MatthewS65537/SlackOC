@@ -9,7 +9,7 @@ import type { SlackocConfig } from "../src/config.js";
 import { MAX_MESSAGE_RECEIPTS, RECOVERY_RECEIPT_RESERVE, StateStore } from "../src/state.js";
 import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_EDGE, TARGET_IMAGE_BYTES } from "../src/image.js";
 import { SessionView, deleteView } from "../src/slack/render.js";
-import { sweepMissedMessages } from "../src/slack/catchup.js";
+import { sweepMissedMessages, sweepTopLevelMessages } from "../src/slack/catchup.js";
 import { registerCommand } from "../src/commands/registry.js";
 import { MAX_REPLAY_AGE_MS, timestampFromMs } from "../src/slack/recovery-policy.js";
 
@@ -946,6 +946,16 @@ describe("shortcut project choice (C3)", () => {
     expect(await handleIncomingMessage(ownerMsg("C7", "950.002", "950.001", "fix it"), d, { source: "live", projectDir: "/elsewhere" })).toBe("accepted");
     expect(d.state.getThread(`C7:${ts("950.001")}`)?.projectDir).toBe("/elsewhere");
   });
+
+  it("a new thread in a pinned channel starts in the pin, not the current project", async () => {
+    const client = { session: { promptAsync: async () => ({ data: {} }), create: async () => ({ data: { id: "sess-pin" } }),
+      messages: async () => ({ data: [] }), get: async () => { throw new Error("no summary"); } } };
+    const d = makeDeps("pinned-channel", fakePool(client), fakeRender({ posted: [], deleted: [], reacted: [], dms: [] }));
+    d.state.setCurrentProject("/p");
+    d.state.setChannelProject("C8", "/pinned");
+    expect(await handleIncomingMessage(ownerMsg("C8", "951.001", "951.001", "fix it"), d, { source: "live" })).toBe("accepted");
+    expect(d.state.getThread(`C8:${ts("951.001")}`)?.projectDir).toBe("/pinned");
+  });
 });
 
 describe("shouldRouteMessage (which raw message events reach the router)", () => {
@@ -956,5 +966,35 @@ describe("shouldRouteMessage (which raw message events reach the router)", () =>
     expect(shouldRouteMessage({ channel: "CLISTEN", channel_type: "channel" }, listening)).toBe(true);
     expect(shouldRouteMessage({ channel: "G1", channel_type: "group" }, listening)).toBe(false);
     expect(shouldRouteMessage({ channel: "C1", channel_type: "channel" }, listening)).toBe(false);
+  });
+});
+
+describe("top-level catch-up inspects a missed root's thread first (#10)", () => {
+  it.each([["\\listen channel", "CLISTEN"], ["owner DM", "DOWNER"]])("%s: a root canceled in its thread never submits; a clean root runs once", async (_label, channel) => {
+    const prompt = vi.fn(async (_args: any) => ({ data: {} }));
+    const create = vi.fn(async () => ({ data: { id: `sess-top-${channel}` } }));
+    const client = { session: { promptAsync: prompt, create, messages: async () => ({ data: [] }),
+      get: async () => { throw new Error("no summary"); } } };
+    const d = makeDeps(`top-stop-${channel}`, fakePool(client), fakeRender({ posted: [], deleted: [], reacted: [], dms: [] }));
+    const canceled = ownerMsg(channel, "1300.000001", undefined, "delete the build dir");
+    const clean = ownerMsg(channel, "1300.000003", undefined, "run the tests");
+    const replies: Record<string, SlackMsg[]> = {
+      [canceled.ts]: [canceled, ownerMsg(channel, "1300.000002", "1300.000001", "\\stop")],
+      [clean.ts]: [clean],
+    };
+    d.state.setTopLevelWatermark(channel, ts("1300.000000"));
+    const sweep = () => sweepTopLevelMessages({ state: d.state, ownerSlackUserId: "U1", channels: [channel],
+      fetchHistory: async () => ({ messages: [canceled, clean], hasMore: false }),
+      fetchReplies: async (_c, root) => ({ messages: replies[root]!, hasMore: false, pagesUsed: 1 }),
+      dispatch: (m, context) => handleIncomingMessage(m, d, context) });
+    try {
+      expect(await sweep()).toBe(1);
+      expect(await sweep()).toBe(0);
+      expect(create).toHaveBeenCalledOnce();
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(prompt.mock.calls[0]![0].body.parts[0].text).toBe("run the tests");
+      expect(d.state.getThread(`${channel}:${canceled.ts}`)).toBeNull();
+      expect(d.state.getThread(`${channel}:${clean.ts}`)?.sessionId).toBe(`sess-top-${channel}`);
+    } finally { deleteView(`sess-top-${channel}`); }
   });
 });

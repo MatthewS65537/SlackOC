@@ -1048,14 +1048,13 @@ describe("SessionView owner DMs (remote pager)", () => {
     });
   }
 
-  it("failures always DM the owner", async () => {
+  it("failures stay in-thread and never DM the owner", async () => {
     const log = blank();
-    const v = dmSeededView(log, "sess-dm-a", false);
+    const v = dmSeededView(log, "sess-dm-a", true);
     await v.beginPrompt("111.980");
     await v.finalize("provider blew up");
-    expect(log.dms.length).toBe(1);
-    expect(log.dms[0]).toContain("failed");
-    expect(log.dms[0]).toContain("provider blew up");
+    expect(log.posted.some((p) => p.includes("provider blew up"))).toBe(true);
+    expect(log.dms).toEqual([]);
     deleteView("sess-dm-a");
   });
 
@@ -1155,7 +1154,7 @@ describe("SessionView queued-prompt idle handling (counter + grace)", () => {
 });
 
 describe("SessionView watchdog pager + nudge cap", () => {
-  it("the first true stall DMs the owner once; later nudges stay thread-only", async () => {
+  it("stalls show in the status line only — no owner DM", async () => {
     vi.useFakeTimers();
     try {
       const log = blank();
@@ -1163,9 +1162,8 @@ describe("SessionView watchdog pager + nudge cap", () => {
       await v.beginPrompt("111.960");
       await vi.advanceTimersByTimeAsync(180_000);
       expect(log.updates.some((u) => u.includes("no updates for 3m"))).toBe(true);
-      expect(log.dms.some((m) => m.includes("stalled"))).toBe(true);
       await vi.advanceTimersByTimeAsync(180_000); // second nudge
-      expect(log.dms.filter((m) => m.includes("stalled")).length).toBe(1); // DM is first-stall-only
+      expect(log.dms).toEqual([]);
       deleteView("sess-watch-c");
     } finally {
       vi.useRealTimers();
@@ -1292,7 +1290,7 @@ describe("summary delivery fallback (RB5)", () => {
     await v.beginPrompt("111.604");
     await v.finalize();
     expect(log.posted.some((p) => p.startsWith("*p*"))).toBe(false); // summary post really failed
-    expect(log.dms.some((d) => d.includes("couldn't post the run's final line"))).toBe(true);
+    expect(log.dms).toEqual([]);
     expect(getView("sess-rb5")).toBeUndefined(); // registry cleanup still ran
   });
 });
@@ -1759,6 +1757,46 @@ describe("SessionView.attach (watch a computer-driven session)", () => {
       expect(log.deleted.length).toBe(1); // the watching status line
       expect(log.posted.at(-1)).toContain("watch ended");
       deleteView("ses-watch-e");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("SessionView.settle (barrier before interaction cards)", () => {
+  it("posts unfinished text and buffered tools before resolving, once", async () => {
+    const log = blank();
+    const v = makeView(log, "sess-settle-a", { verbose: "on" });
+    await v.handle({
+      type: "message.part.updated",
+      properties: { part: { id: "t1", type: "tool", tool: "bash", callID: "c1", state: { status: "running", input: { command: "ls" } } } },
+    } as never);
+    await v.handle({ type: "message.part.updated", properties: { part: { id: "p1", type: "text", text: "Which option do you want?" } } } as never);
+    expect(log.posted.some((p) => p.includes("Which option"))).toBe(false); // no paragraph break yet
+    await v.settle();
+    const tools = log.posted.findIndex((p) => p.includes("🔧 `ls`"));
+    const text = log.posted.findIndex((p) => p.includes("Which option do you want?"));
+    expect(tools).toBeGreaterThanOrEqual(0);
+    expect(text).toBeGreaterThan(tools);
+    await v.handle({ type: "message.part.updated", properties: { part: { id: "p1", type: "text", text: "Which option do you want?", time: { end: 1 } } } } as never);
+    expect(log.posted.filter((p) => p.includes("Which option")).length).toBe(1);
+    deleteView("sess-settle-a");
+  });
+
+  it("gives up waiting after the timeout when the chain is stuck", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      const deps = { ...fakeDeps(log), post: () => new Promise<never>(() => {}) };
+      const v = makeView(log, "sess-settle-b", { verbose: "on", deps });
+      void v.handle({ type: "message.part.updated", properties: { part: { id: "p1", type: "text", text: "a\n\nb", time: { end: 1 } } } } as never);
+      let done = false;
+      void v.settle(1_000).then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(done).toBe(true);
+      deleteView("sess-settle-b");
     } finally {
       vi.useRealTimers();
     }

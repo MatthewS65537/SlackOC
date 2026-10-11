@@ -11,6 +11,10 @@
  * this supervisor is the only thing that calls start() after boot: every
  * close/disconnect schedules a reconnect with jittered backoff, so there is
  * never a second, racing reconnect loop and every failure is caught.
+ *
+ * The library cannot cancel a start(): a timed-out one can still fetch its URL
+ * and open a socket later, which a newer start() would orphan. So at most one
+ * start() is ever in flight, and a timed-out start's late success is closed.
  */
 
 /** The SocketModeClient surface the supervisor depends on. */
@@ -60,6 +64,8 @@ export class SocketSupervisor {
   private timer?: NodeJS.Timeout;
   private retryTimer?: NodeJS.Timeout;
   private restarting = false;
+  /** A timed-out start() has not settled yet; no new start() until it does. */
+  private expiredStart = false;
   private failures = 0;
   private reconnects = 0;
   private lastError?: string;
@@ -142,7 +148,7 @@ export class SocketSupervisor {
   }
 
   private schedule(delayMs: number): void {
-    if (this.stopped || this.connected || this.restarting || this.retryTimer) return;
+    if (this.stopped || this.connected || this.restarting || this.retryTimer || this.expiredStart) return;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
       void this.reconnect();
@@ -151,16 +157,18 @@ export class SocketSupervisor {
   }
 
   private async reconnect(): Promise<void> {
-    if (this.stopped || this.connected || this.restarting) return;
+    if (this.stopped || this.connected || this.restarting || this.expiredStart) return;
     this.restarting = true;
     this.reconnects += 1;
     let timeout: NodeJS.Timeout | undefined;
+    let started: Promise<unknown> | undefined;
+    let settled = false;
     try {
       // Flush any half-open socket first; the library resolves once it emits `disconnected`.
       await this.bounded(this.client.disconnect().catch(() => {}), DISCONNECT_TIMEOUT_MS);
       if (this.stopped) return;
-      const started = this.client.start();
-      started.catch(() => {}); // a late rejection after the timeout won must not go unhandled
+      started = this.client.start();
+      started.then(() => { settled = true; }, () => { settled = true; }); // also keeps a late rejection handled
       await Promise.race([
         started,
         new Promise((_, reject) => {
@@ -178,7 +186,13 @@ export class SocketSupervisor {
       const wait = Math.round(base * (0.75 + this.random() * 0.5));
       this.opts.log(`slack socket: reconnect failed (${this.lastError}) — retrying in ${Math.round(wait / 1000)}s`);
       this.restarting = false;
-      this.schedule(wait);
+      if (started && !settled) {
+        // Timed out: wait for that start to settle and close a late success
+        // (its "disconnected" lands in markDown), then retry with the same backoff.
+        this.expiredStart = true;
+        void started.then(() => this.bounded(this.client.disconnect().catch(() => {}), DISCONNECT_TIMEOUT_MS), () => {})
+          .finally(() => { this.expiredStart = false; this.schedule(wait); });
+      } else this.schedule(wait);
     } finally {
       clearTimeout(timeout);
       this.restarting = false;

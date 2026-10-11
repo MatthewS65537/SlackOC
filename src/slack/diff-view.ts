@@ -6,6 +6,7 @@ import { sessionDiff } from "../opencode/client.js";
 import { VIEW_DIFF_ACTION } from "./blocks.js";
 import { enqueue } from "./queue.js";
 import { SLACK_UPLOAD_TIMEOUT_MS } from "./transport.js";
+import { sourceThreadTs } from "./source-thread.js";
 import { logErr } from "../log.js";
 import { esc, shortPath, truncate } from "../util.js";
 
@@ -14,6 +15,8 @@ export const DIFF_DOWNLOAD_ACTION = "diff_download";
 /** Per code section (Slack caps section text at 3,000) and per modal (Slack caps views at 100 blocks). */
 const SECTION_CHARS = 2_900;
 const MAX_SECTIONS = 40;
+/** "Download full diff" uploads the whole patch or refuses; it never sends a partial file. */
+export const DIFF_DOWNLOAD_MAX_BYTES = 10 * 1024 * 1024;
 
 export function formatDiffSummary(diffs: OcFileDiff[]): string {
   const totals = diffs.reduce(
@@ -51,7 +54,7 @@ export function patchSections(patch: string): { sections: string[]; truncated: b
   return { sections, truncated: false };
 }
 
-/** Where the "Download full diff" snippet lands: the button's own thread (session, channel, thread ts). */
+/** Where the "Download full diff" snippet lands: the button's thread root (session, channel, thread ts). */
 export interface DiffMeta { s: string; c: string; t: string }
 
 /** D1: the file-by-file diff modal — a file dropdown and one file's diff at a time. */
@@ -111,9 +114,9 @@ export function registerDiffActions(app: App, deps: {
       return;
     }
     const sessionId = (action as { value?: string }).value;
-    const container = (body as { container?: { channel_id?: string; thread_ts?: string; message_ts?: string } }).container;
+    const container = (body as { container?: { channel_id?: string } }).container;
     const trigger = (body as { trigger_id?: string }).trigger_id;
-    const thread = container?.thread_ts ?? container?.message_ts;
+    const thread = sourceThreadTs(body);
     if (!sessionId || !trigger || !container?.channel_id || !thread) return;
     try {
       const opened = await app.client.views.open({ trigger_id: trigger, view: loadingModal() as never });
@@ -152,10 +155,17 @@ export function registerDiffActions(app: App, deps: {
     try {
       const file = (await diffsFor(meta.s))?.[Number((action as { value?: string }).value ?? 0)];
       if (!file?.patch) return;
+      const bytes = Buffer.byteLength(file.patch, "utf8");
+      if (bytes > DIFF_DOWNLOAD_MAX_BYTES) {
+        const text = `${shortPath(file.file)}'s diff is ${(bytes / 1024 / 1024).toFixed(1)} MB, over the ${DIFF_DOWNLOAD_MAX_BYTES / 1024 / 1024} MB download limit — nothing was uploaded.`;
+        await enqueue(() => app.client.chat.postEphemeral({ channel: meta.c, user: body.user.id, thread_ts: meta.t, text }),
+          { channel: meta.c, method: "chat.postEphemeral", lane: "interactive", thread: meta.t ?? "" });
+        return;
+      }
       const filename = `${shortPath(file.file).split("/").pop() || "file"}.diff`;
       await enqueue(() => app.client.filesUploadV2({ channel_id: meta.c, thread_ts: meta.t, filename, title: shortPath(file.file),
-        content: file.patch.slice(0, 200_000) }),
-      { channel: meta.c, method: "files.upload", lane: "interactive", timeoutMs: SLACK_UPLOAD_TIMEOUT_MS, retryRateLimits: false });
+        content: file.patch }),
+      { channel: meta.c, method: "files.upload", lane: "interactive", thread: meta.t ?? "", timeoutMs: SLACK_UPLOAD_TIMEOUT_MS, retryRateLimits: false });
     } catch (err) {
       logErr(`diff download failed (${meta.s}): ${String((err as Error)?.message ?? err)}`);
     }

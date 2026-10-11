@@ -20,8 +20,9 @@ export interface RenderDeps {
     blocks?: unknown[],
     opts?: { unfurl?: boolean; lane?: SlackLane },
   ): Promise<{ ts: string }>;
-  update(channel: string, ts: string, text: string): Promise<void>;
-  delete(channel: string, ts: string): Promise<void>;
+  /** `threadTs` keeps the edit ordered with the thread's posts (queue.ts). */
+  update(channel: string, ts: string, text: string, threadTs?: string): Promise<void>;
+  delete(channel: string, ts: string, threadTs?: string): Promise<void>;
   react(channel: string, ts: string, name: string): Promise<void>;
   unreact(channel: string, ts: string, name: string): Promise<void>;
   upload(opts: {
@@ -36,8 +37,8 @@ export interface RenderDeps {
   }): Promise<void>;
   /**
    * DM the owner about something that happened in (channel, threadTs) — the
-   * remote pager: failures always, completions when \notify is on, permission
-   * asks mirrored with their buttons. Absent when DMs are unavailable.
+   * remote pager: completions when \notify is on, permission/question asks
+   * mirrored with their buttons. Absent when DMs are unavailable.
    */
   dm?(channel: string, threadTs: string, text: string, blocks?: unknown[], opts?: { lane?: SlackLane }): Promise<{ ts: string }>;
 }
@@ -120,8 +121,10 @@ function completedTail(msgs: Transcript, since: number): Transcript[number] | un
   return last;
 }
 
+/** Live view for a session. A finalizing view is still registered (its cleanup is awaiting Slack) but never returned — a new prompt gets a fresh observer (#13). */
 export function getView(sessionId: string): SessionView | undefined {
-  return registry.get(sessionId);
+  const view = registry.get(sessionId);
+  return view?.isFinalized ? undefined : view;
 }
 
 export function deleteView(sessionId: string): void {
@@ -199,7 +202,10 @@ function registerView(view: SessionView): void {
     const first = registry.keys().next().value;
     if (first) deleteView(first);
   }
-  registry.get(view.sessionId)?.dispose();
+  // A finalizing predecessor finishes its own cleanup (reactions, summary) and
+  // only unregisters itself if still registered; anything else is replaced.
+  const prev = registry.get(view.sessionId);
+  if (prev && !prev.isFinalized) prev.dispose();
   registry.set(view.sessionId, view);
 }
 
@@ -330,7 +336,7 @@ export class SessionView {
   private finalized = false;
   /** Serializes event renders — every handle() runs after the previous one. */
   private tail: Promise<void> = Promise.resolve();
-  /** Wall-clock start of the current prompt run — backstop only ever posts text created after this. */
+  /** Wall-clock start of the current run — its EARLIEST outstanding prompt; a queued prompt never moves it (#14). */
   private runStartedAt = Date.now();
   /** Last SSE event seen — the watchdog only fires after a truly silent gap. */
   private lastEventAt = Date.now();
@@ -450,7 +456,7 @@ export class SessionView {
   }
 
   private async deleteStatus(ts: string): Promise<void> {
-    try { await this.deps.delete(this.channel, ts); }
+    try { await this.deps.delete(this.channel, ts, this.threadTs); }
     catch (err) {
       if (!messageNotFound(err)) logErr(`status cleanup failed (${this.sessionId}, ${ts}): ${errorMessage(err)}`);
     }
@@ -465,6 +471,9 @@ export class SessionView {
   }
   get currentRunElapsedMs(): number {
     return Date.now() - this.runStartedAt;
+  }
+  get isFinalized(): boolean {
+    return this.finalized;
   }
 
   /**
@@ -590,14 +599,6 @@ export class SessionView {
       this.nudges += 1;
       this.stalled = true; // the ticker takes over the stall line from here
       void this.updateStatus(this.statusTs, "⏳ still working… no updates for 3m — `\\stop` to cancel");
-      // First true stall also pages the owner — a stalled run needs attention
-      // even when nobody is watching the thread.
-      if (this.nudges === 1) {
-        const proj = this.projectDir.split("/").filter(Boolean).pop() ?? "run";
-        void this.deps
-          .dm?.(this.channel, this.threadTs, `:alarm_clock: *${safePayload(proj)}* stalled — no events for 3m. Reply \`\\stop\` in the thread to cancel.`)
-          .catch(() => {});
-      }
       if (this.nudges < SessionView.MAX_NUDGES) this.armWatchdog();
     }, SessionView.WATCHDOG_MS);
     this.watchdog.unref();
@@ -624,7 +625,7 @@ export class SessionView {
     this.stalled = false;
     if (!this.hasPendingQuestion()) this.contentBelow = false; // keep deferred content dirty while answering
     if (!this.pendingUserMsgs.includes(userMsgTs)) this.pendingUserMsgs.push(userMsgTs);
-    this.runStartedAt = Date.now();
+    if (!wasActive) this.runStartedAt = Date.now();
     this.lastEventAt = Date.now();
     this.armWatchdog();
     void this.start().catch(err => logErr(`status post failed: ${errorMessage(err)}`));
@@ -922,6 +923,26 @@ export class SessionView {
   }
 
   /**
+   * Barrier before an interaction card (question/permission): the run is
+   * blocked on it, so buffered tool lines and any unfinished text post first.
+   * Bounded — a stuck chain must never hold the card back.
+   */
+  async settle(timeoutMs = 10_000): Promise<void> {
+    if (this.finalized || this.disposed) return;
+    const run = this.tail.then(async () => {
+      await this.flushTools();
+      for (const [id, text] of [...this.pendingText]) {
+        this.pendingText.delete(id);
+        if (!this.postedPartIds.has(id)) await this.postRemainder(id, text);
+      }
+    }).catch((err) => logErr(`settle before interaction failed (${this.sessionId}): ${errorMessage(err)}`));
+    this.tail = run.then(() => {}, () => {});
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([run, new Promise<void>((r) => { timer = setTimeout(r, timeoutMs); timer.unref?.(); })]);
+    clearTimeout(timer);
+  }
+
+  /**
    * Events from a subagent (child session) of this run roll up into one lane
    * line per child. Child activity counts as liveness for the stall watchdog.
    */
@@ -1092,7 +1113,7 @@ export class SessionView {
   }
 
   private async updateStatus(ts: string, text: string): Promise<void> {
-    try { await this.deps.update(this.channel, ts, text); }
+    try { await this.deps.update(this.channel, ts, text, this.threadTs); }
     catch (err) {
       if (messageNotFound(err) && this.statusTs === ts && !this.finalized && !this.disposed) {
         this.statusTs = null;
@@ -1378,7 +1399,7 @@ export class SessionView {
     if (!card.ts || this.disposed || card.text === card.shown) return;
     card.shown = card.text;
     card.at = Date.now();
-    await this.deps.update(this.channel, card.ts, card.text)
+    await this.deps.update(this.channel, card.ts, card.text, this.threadTs)
       .catch(err => logErr(`live card update failed (${this.sessionId}): ${errorMessage(err)}`));
   }
 
@@ -1501,6 +1522,27 @@ export class SessionView {
     this.maybeSink();
   }
 
+  /**
+   * Backstop membership by prompt identity, not time (#9, #14): assistants
+   * replying to this run's own submitted prompts, or to unclaimed user
+   * messages after the first of them (OpenCode's synthetic compaction /
+   * continue turns). A completed earlier turn or another Slack prompt's reply
+   * is never ours, however close in time. Without known identity (\watch,
+   * unsubmitted prompts) fall back to the run's time window.
+   */
+  private runAssistants(msgs: Transcript): Transcript {
+    const own = new Set<string>();
+    const claimed = new Set<string>();
+    for (const r of this.state.messageReceipts(this.threadKey)) {
+      const id = r.submission?.messageId;
+      if (id) (this.pendingUserMsgs.includes(r.ts) ? own : claimed).add(id);
+    }
+    const first = msgs.findIndex((m) => m.info?.role === "user" && own.has(m.info.id));
+    if (first < 0) return msgs.filter((m) => m.info?.role === "assistant" && (m.info.time?.created ?? 0) >= this.runStartedAt - 2_000);
+    const users = new Set(msgs.slice(first).filter((m) => m.info.role === "user" && !claimed.has(m.info.id)).map((m) => m.info.id));
+    return msgs.filter((m, i) => m.info?.role === "assistant" && (m.info.parentID ? users.has(m.info.parentID) : i > first));
+  }
+
   async finalize(err?: string): Promise<void> {
     // Finalize can be invoked from outside the event chain (prompt-failure
     // path in the router) — run it through the same serialization so it
@@ -1537,17 +1579,15 @@ export class SessionView {
 
     // Delivery backstop: the SSE stream can drop the final text part (or its
     // post can be silently lost), so pull the session's messages and post any
-    // assistant text Slack never got. Only messages created for THIS run are
-    // considered — earlier turns were already delivered (and this view's
+    // assistant text Slack never got. Only THIS run's messages are considered
+    // (runAssistants) — earlier turns were already delivered (and this view's
     // posted-set doesn't know about them). Errors degrade to SSE-only behavior.
     // The diff summary is independent of the backstop — fetch it alongside.
     const summaryFetch = sessionGet(this.client, this.sessionId).then(s => s.summary ?? null, () => null);
     try {
       const msgs = await sessionMessages(this.client, this.sessionId);
       this.reconcileReceipts(msgs);
-      for (const m of msgs) {
-        if (m.info?.role !== "assistant") continue;
-        if ((m.info.time?.created ?? 0) < this.runStartedAt - 2_000) continue;
+      for (const m of this.runAssistants(msgs)) {
         for (const p of m.parts ?? []) {
           if (p.type === "text") {
             const text = (p as { text?: string }).text ?? "";
@@ -1615,27 +1655,22 @@ export class SessionView {
     this.statusTs = null;
     await Promise.all([...outcomes, statusTs ? this.deleteStatus(statusTs) : undefined]);
     // The summary/error line is the one message that must never be lost: a
-    // dropped post (rate-limit give-up etc.) used to skip the DM + registry
-    // cleanup entirely and leak the view. If it fails, tell the owner by DM.
+    // dropped post (rate-limit give-up etc.) used to skip registry cleanup
+    // entirely and leak the view. A failure is logged, never thrown.
     if (this.disposed) return;
     const summaryLine = err ? `:x: ${safePayload(truncate(err, 200))}` : bits.length ? bits.join(" · ") : null;
     if (summaryLine) {
       // D1: a run that edited files gets an in-thread "View changes" button.
       const blocks = !err && summary?.files ? viewDiffBlocks(summaryLine, this.sessionId) : undefined;
-      await this.deps.post(this.channel, this.threadTs, summaryLine, blocks, { unfurl: false }).catch(async (postErr) => {
+      await this.deps.post(this.channel, this.threadTs, summaryLine, blocks, { unfurl: false }).catch((postErr) => {
         logErr(`run summary post failed (${this.sessionId}): ${String((postErr as Error)?.message ?? postErr)}`);
-        await this.deps
-          .dm?.(this.channel, this.threadTs, `:warning: couldn't post the run's final line in-thread (Slack error) — outcome: ${truncate(summaryLine, 300)}`)
-          .catch(() => {});
       });
     }
-    // Owner DM — the remote pager. Failures always page; completions only
-    // when \notify is on for this thread. Best-effort: DM delivery must
-    // never hold up or fail the thread-side finalize.
+    // Owner DM — completions only, when \notify is on for this thread. Errors
+    // stay in-thread (no DM clutter). Best-effort: DM delivery must never hold
+    // up or fail the thread-side finalize.
     try {
-      if (err) {
-        await this.deps.dm?.(this.channel, this.threadTs, `:x: *${safePayload(proj ?? "run")}* failed: ${safePayload(truncate(err, 200))}`);
-      } else if (bits.length) {
+      if (!err && bits.length) {
         const notify = this.state.getThread(this.threadKey)?.notify;
         if (notify) {
           const dmText = `:white_check_mark: done — ${bits.join(" · ")}`;

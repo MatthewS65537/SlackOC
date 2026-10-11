@@ -314,6 +314,8 @@ describe("startBridge reliability wiring", () => {
     expect(stale).toHaveBeenCalledWith(expect.objectContaining({ response_type: "ephemeral", text: expect.stringContaining("latest") }));
     expect(f.reply).not.toHaveBeenCalled();
     await drain(clickButton(postedButton("question_1_0")));
+    expect(f.reply).not.toHaveBeenCalled();
+    await drain(clickButton(postedButton("qsubmit_all")));
     expect(f.reply).toHaveBeenCalledExactlyOnceWith(f.pool.entry.client, req.id, [["A"], ["A"]], { request: req });
   });
 
@@ -331,6 +333,65 @@ describe("startBridge reliability wiring", () => {
     await drain(clickButton(postedButton("qsubmit")), 4_400);
     expect(new QuestionsStore(`${f.root}/questions.json`).get(req.id)?.askTs).not.toBe(initial.askTs);
     expect(f.reply).not.toHaveBeenCalled();
+  });
+
+  describe("Back / Next and the review step", () => {
+    const options = [{ label: "A", description: "" }, { label: "B", description: "" }];
+    const req: OcQuestionRequest = { ...request, questions: ["One", "Two", "Three"].map(header => ({ header, question: `${header}?`, options })) };
+    const saved = () => new QuestionsStore(`${f.root}/questions.json`).get(req.id)!;
+    const latestCard = () => JSON.stringify(questionCards().find(card => card.args.channel === "C" &&
+      JSON.stringify(card.args.blocks ?? "").includes("OpenCode has a question"))!.args.blocks);
+    async function answerFirstTwo() {
+      await boot(); f.questions.mockResolvedValue([req]);
+      f.pool.onEvent(f.root, "question.asked", req); await vi.advanceTimersByTimeAsync(1_100);
+      await drain(clickQuestion(), 4_400);
+      await drain(clickButton(postedButton("question_1_0")), 4_400);
+    }
+
+    it("goes back in place, highlights the saved pick, re-answers, and submits only from review", async () => {
+      await answerFirstTwo();
+      const atQ3 = saved(); const posts = f.app.client.chat.postMessage.mock.calls.length;
+      await drain(clickButton(postedButton("qnav_prev")));
+      expect(saved()).toMatchObject({ cursor: 1, presentation: atQ3.presentation, askTs: atQ3.askTs });
+      expect(f.app.client.chat.postMessage).toHaveBeenCalledTimes(posts);
+      expect(latestCard()).toContain("Q2/3");
+      expect(postedButton("question_1_0").style).toBe("primary");
+      expect(postedButton("question_1_1").style).toBeUndefined();
+      expect(JSON.parse(postedButton("qnav_next").value)).toMatchObject({ i: 2 });
+
+      await drain(clickButton(postedButton("question_1_1")), 4_400);
+      expect(saved().answers).toEqual([["A"], ["B"], []]); expect(saved().cursor).toBeUndefined();
+      expect(latestCard()).toContain("Q3/3");
+      await drain(clickButton(postedButton("question_2_0")));
+      expect(f.reply).not.toHaveBeenCalled();
+      expect(latestCard()).toContain("qsubmit_all");
+      expect(latestCard()).toContain("• *Two*: B");
+
+      await drain(clickButton(postedButton("qnav_prev")));
+      expect(latestCard()).toContain("Q3/3");
+      await drain(clickButton(postedButton("qnav_next")));
+      expect(latestCard()).toContain("qsubmit_all");
+      await drain(clickButton(postedButton("qsubmit_all")));
+      expect(f.reply).toHaveBeenCalledExactlyOnceWith(f.pool.entry.client, req.id, [["A"], ["B"], ["A"]], { request: req });
+    });
+
+    it("restores the cursor after a bridge restart so the revisited question stays answerable", async () => {
+      await answerFirstTwo();
+      await drain(clickButton(postedButton("qnav_prev")));
+      stop(); await vi.advanceTimersByTimeAsync(0); _resetQueueForTests();
+      await boot();
+      f.pool.onReady(f.root, f.pool.entry.baseUrl);
+      await vi.advanceTimersByTimeAsync(2_200);
+      const before = saved(); expect(before.cursor).toBe(1);
+      // Tapping a finalized question is only accepted while it is the one on screen.
+      const respond = vi.fn(async () => {});
+      await drain(actionHandler("question_1_1")({ ack: vi.fn(async () => {}), respond,
+        body: { user: { id: "UOWNER" }, channel: { id: "C" }, message: { ts: before.askTs, thread_ts: ROOT_TS } },
+        action: { action_id: "question_1_1", value: JSON.stringify({ s: before.sessionId, q: before.id, i: 1, a: 1,
+          g: before.generation, b: questionBindingToken(before), c: before.presentation }) } }), 4_400);
+      expect(respond).not.toHaveBeenCalled();
+      expect(saved().answers).toEqual([["A"], ["B"], []]); expect(saved().cursor).toBeUndefined();
+    });
   });
 
   it.each(["message_not_found", "cant_delete_message"])("handles %s during old-card cleanup without a replacement notice", async error => {
@@ -519,6 +580,8 @@ describe("startBridge reliability wiring", () => {
       body: { user: { id: "UOWNER" }, channel: { id: "C" }, message: { ts: saved.askTs, thread_ts: ROOT_TS } },
       action: { action_id: "question_1_0", value: JSON.stringify({ s: saved.sessionId, q: saved.id, i: 1, a: 0,
         g: saved.generation, b: questionBindingToken(saved), c: saved.presentation }) } }));
+    expect(f.reply).not.toHaveBeenCalled();
+    await drain(clickButton(postedButton("qsubmit_all")));
     expect(f.reply).toHaveBeenCalledExactlyOnceWith(f.pool.entry.client, req.id, [["A"], ["A"]], { request: req });
   });
 
@@ -734,6 +797,7 @@ describe("startBridge reliability wiring", () => {
     f.pool.onEvent(f.root, "question.asked", req); await vi.advanceTimersByTimeAsync(1_100);
     f.reply.mockRejectedValueOnce(Object.assign(new Error("native validation rejected"), { _tag: "FormInvalidAnswerError" }));
     await drain(clickQuestion()); await drain(clickButton(postedButton("question_1_0")));
+    await drain(clickButton(postedButton("qsubmit_all")));
     await drain(clickButton(postedButton("qedit"))); await clickButton(postedButton("qtext"));
     const modal = f.app.client.views.open.mock.calls[0][0].view;
     expect(modal.blocks.find((b: any) => b.type === "input").element.initial_value).toBe("A");
@@ -1358,6 +1422,8 @@ describe("startBridge reliability wiring", () => {
     });
     await vi.advanceTimersByTimeAsync(2_200);
     await submitting;
+    expect(f.reply).not.toHaveBeenCalled();
+    await drain(clickButton(postedButton("qsubmit_all")));
     expect(f.reply).toHaveBeenCalledExactlyOnceWith(f.pool.entry.client, req.id, [["A", "B"], ["custom answer"]], { request: req });
   });
 

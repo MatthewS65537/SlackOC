@@ -115,7 +115,7 @@ function movingHarness() {
   const remove = vi.fn(async (channel: string, ts: string, allowed: () => boolean) => {
     if (allowed()) deleted.push({ channel, ts });
   });
-  const find = vi.fn(async (_channel: string, _threadTs: string | undefined, _marker: string): Promise<{ ts: string } | undefined> => undefined);
+  const find = vi.fn(async (_channel: string, _threadTs: string | undefined, _marker: string, _oldest?: string): Promise<{ ts: string } | undefined> => undefined);
   const errors = vi.fn();
   const adopted = vi.fn();
   const ui = new QuestionUiReconciler({ store, dmChannel: () => "DM", eligible: () => state.eligible, stopping: () => state.stopping,
@@ -339,7 +339,8 @@ it("never reposts a response-lost card without positive exact-epoch evidence", a
   expect(store.get("form")?.relocation?.thread).toMatchObject({ status: "uncertain", attempts: 1, revision: 2 });
   await h.ui.refresh("form", true); await h.ui.refresh("form", true);
   expect(h.post).toHaveBeenCalledOnce();
-  expect(h.find).toHaveBeenLastCalledWith("C", "1", marker(1));
+  // Searches only history at or after the copy being replaced.
+  expect(h.find).toHaveBeenLastCalledWith("C", "1", marker(1), "2");
   expect(store.get("form")?.askTs).toBe("2");
   expect(h.updates.every(u => u.card.blocks.every((b: any) => b.type !== "actions"))).toBe(true);
   h.find.mockResolvedValueOnce({ ts: "found" });
@@ -377,7 +378,7 @@ it("reconciles an interrupted post after restart and adopts only its exact epoch
   const h = movingHarness(); h.find.mockResolvedValue({ ts: "recovered" });
   await h.ui.refreshAll();
   expect(h.post).not.toHaveBeenCalled();
-  expect(h.find).toHaveBeenCalledWith("C", "1", marker(1));
+  expect(h.find).toHaveBeenCalledWith("C", "1", marker(1), "2");
   expect(store.get("form")).toMatchObject({ askTs: "recovered", threadPresentation: 1, ui: { threadApplied: 2 } });
 });
 it("cleans up exact old-epoch evidence after restart before posting the newer step", async () => {
@@ -386,7 +387,7 @@ it("cleans up exact old-epoch evidence after restart before posting the newer st
   store = new QuestionsStore(store.path);
   const h = movingHarness(); h.find.mockResolvedValue({ ts: "old-epoch" });
   await h.ui.refresh("form");
-  expect(h.find).toHaveBeenCalledWith("C", "1", marker(1));
+  expect(h.find).toHaveBeenCalledWith("C", "1", marker(1), "2");
   expect(h.posts[0]?.card.text).toContain("slackoc-question:form:1:card:2:thread");
   expect(h.adopted).toHaveBeenCalledOnce();
   expect(h.deleted.map(u => u.ts).sort()).toEqual(["2", "old-epoch"]);
@@ -444,7 +445,7 @@ it("retains ambiguous old-binding intent and recovers it even when the current b
   store = new QuestionsStore(store.path);
   const restarted = movingHarness(); restarted.state.eligible = false; restarted.find.mockResolvedValue({ ts: "old-binding-post" });
   await restarted.ui.refreshAll();
-  expect(restarted.find).toHaveBeenCalledWith("C", "1", marker(1));
+  expect(restarted.find).toHaveBeenCalledWith("C", "1", marker(1), "2");
   expect(restarted.post).not.toHaveBeenCalled();
   expect(restarted.adopted).not.toHaveBeenCalled();
   expect(restarted.deleted).toContainEqual({ channel: "C", ts: "old-binding-post" });

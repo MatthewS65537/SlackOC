@@ -352,4 +352,50 @@ describe("permission delivery", () => {
     expect(recentLogs().join("\n")).toContain("diagnostics failed");
     expect(recentLogs().join("\n")).toContain("collapse failed");
   });
+
+  describe("terminal recovery (marker-only)", () => {
+    const resolved = (): PermissionRecord => ({ ...record(),
+      thread: { format: "card", status: "uncertain", attempts: 1 },
+      dm: { format: "card", status: "delivered", attempts: 1, channel: "D1", ts: "101.000002", collapsed: true },
+      response: { status: "resolved", choice: "once", actor: "U1", confirmed: true, text: "Allowed once" } });
+
+    it("adopts a proven accepted copy and hands it to onDelivered without posting", async () => {
+      const h = setup(resolved());
+      h.findCopy.mockResolvedValue({ channel: "C1", ts: "101.000003" });
+      await h.manager.recoverTerminal(resolved());
+      expect(h.findCopy).toHaveBeenCalledOnce();
+      expect(h.findCopy).toHaveBeenCalledWith(expect.anything(), "thread", permissionDeliveryMarker(resolved(), "thread"));
+      expect(h.latest().thread).toMatchObject({ status: "delivered", channel: "C1", ts: "101.000003", collapsed: false });
+      expect(h.latest().response).toMatchObject({ status: "resolved", choice: "once", confirmed: true, text: "Allowed once" });
+      expect(h.onDelivered).toHaveBeenCalledWith(expect.objectContaining({ response: expect.objectContaining({ status: "resolved" }) }), "thread");
+      expect(h.post).not.toHaveBeenCalled();
+    });
+
+    it("keeps unknown history uncertain (with a cooldown) and ends the search on proven absence; never posts", async () => {
+      const h = setup(resolved());
+      await h.manager.recoverTerminal(resolved());
+      expect(h.latest().thread.status).toBe("uncertain");
+      await h.manager.recoverTerminal(resolved());
+      expect(h.findCopy).toHaveBeenCalledOnce();
+      h.advance(5 * 60_000 + 1);
+      h.findCopy.mockRejectedValueOnce(slackError("channel_not_found"));
+      await h.manager.recoverTerminal(resolved());
+      expect(h.latest().thread.status).toBe("uncertain");
+      h.advance(5 * 60_000 + 1);
+      h.findCopy.mockResolvedValueOnce("absent");
+      await h.manager.recoverTerminal(resolved());
+      expect(h.latest().thread.status).toBe("rejected");
+      await h.manager.recoverTerminal(resolved());
+      expect(h.findCopy).toHaveBeenCalledTimes(3);
+      expect(h.post).not.toHaveBeenCalled();
+      expect(h.onDelivered).not.toHaveBeenCalled();
+    });
+
+    it("leaves pending requests to ordinary delivery", async () => {
+      const h = setup({ ...record(), thread: { format: "card", status: "uncertain", attempts: 1 } });
+      await h.manager.recoverTerminal(record());
+      expect(h.findCopy).not.toHaveBeenCalled();
+      expect(h.post).not.toHaveBeenCalled();
+    });
+  });
 });

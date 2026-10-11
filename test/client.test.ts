@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { makeClient, configGet, pendingPermissions, pendingQuestions, questionReply, questionReject,
   sessionIdle, sessionMessages, sessionStatus, promptAsync, permRespond } from "../src/opencode/client.js";
-import { formAnswer, visibleQuestions, normalizeForm, V2Events } from "../src/opencode/v2.js";
+import { formAnswer, visibleQuestions, normalizeForm, normalizeMessages, V2Events } from "../src/opencode/v2.js";
 import type { FormInfo, V2Event } from "@opencode/client";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -139,6 +139,19 @@ describe("native V2 event translation", () => {
     const events = new V2Events();
     expect(events.translate({ type: "form.created", data: { form } } as V2Event)[0]).toMatchObject({ type: "question.asked", properties: { id: form.id } });
     expect(events.translate({ type: "session.text.ended", created: 100, data: { sessionID: "ses_test", assistantMessageID: "msg_a", ordinal: 1, text: "hello" } } as V2Event)[0])
-      .toMatchObject({ type: "message.part.updated", properties: { part: { id: "msg_a:1", text: "hello", time: { end: 100 } } } });
+      .toMatchObject({ type: "message.part.updated", properties: { part: { id: "msg_a:text:1", text: "hello", time: { end: 100 } } } });
+  });
+  it("keeps text and reasoning ordinals apart, matching transcript ids (#26)", () => {
+    // OpenCode counts ordinals per block kind; text deltas may beat the durable reasoning.ended.
+    const events = new V2Events();
+    const e = (type: string, created: number, data: object) => events.translate({ type, created, data: { sessionID: "s", assistantMessageID: "m", ordinal: 0, ...data } } as V2Event);
+    e("session.reasoning.delta", 0, { delta: "thinking" });
+    e("session.text.delta", 100, { delta: "Hey! " });
+    e("session.reasoning.ended", 200, { text: "thinking" });
+    const [live] = e("session.text.delta", 1_000, { delta: "Rex here." });
+    expect(live?.properties).toMatchObject({ part: { id: "m:text:0", type: "text", text: "Hey! Rex here." } });
+    const [row] = normalizeMessages([{ type: "assistant", id: "m", time: { created: 0, completed: 2_000 }, model: { id: "x", providerID: "p" },
+      content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hey! Rex here." }] }] as never, "s");
+    expect(row?.parts.map(p => p.id)).toEqual(["m:reasoning:0", "m:text:0"]);
   });
 });

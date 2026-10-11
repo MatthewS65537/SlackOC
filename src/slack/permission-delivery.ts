@@ -25,6 +25,8 @@ export interface PermissionDeliveryDeps {
 
 const RETRY_BASE_MS = 2_000;
 const RETRY_CAP_MS = 60_000;
+/** Unreadable/incomplete history for a resolved request's copy: search again no sooner than this. */
+const TERMINAL_RETRY_MS = 5 * 60_000;
 function failure(error: unknown): { text: string; payload: boolean; rejected: boolean; retryAfterMs: number } {
   const e = error as { statusCode?: number; message?: string } | undefined;
   const code = slackErrorCode(error);
@@ -72,6 +74,39 @@ export class PermissionDeliveryManager {
         for (const destination of ["thread", "dm"] as const) this.retries.delete(`${key}:${destination}`);
       }
     });
+    this.inFlight.set(key, work);
+    return work;
+  }
+
+  /**
+   * Marker-only recovery for a resolved request's unconfirmed copies: a proven
+   * copy is adopted (onDelivered collapses it); proven absence ends the search.
+   * Never posts, and unknown history keeps the copy uncertain.
+   */
+  recoverTerminal(identity: PermissionIdentity): Promise<void> {
+    const key = permissionKey(identity);
+    const existing = this.inFlight.get(key);
+    if (existing) return existing;
+    const work = Promise.resolve().then(async () => {
+      await Promise.all((["thread", "dm"] as const).map(async destination => {
+        const record = this.deps.store.get(identity);
+        if (record?.response.status !== "resolved" || !["uncertain", "in-flight"].includes(record[destination].status)) return;
+        const retryKey = `${key}:${destination}:terminal`;
+        if ((this.retries.get(retryKey)?.at ?? 0) > this.now()) return;
+        let found: PermissionCopy | "absent" | "unknown";
+        try { found = await this.deps.findCopy(record, destination, permissionDeliveryMarker(record, destination)); }
+        catch (error) {
+          found = "unknown";
+          logErr(`permission ${record.requestId} ${destination} terminal history: ${failure(error).text}`);
+        }
+        if (found === "unknown") { this.retries.set(retryKey, { at: this.now() + TERMINAL_RETRY_MS, rateUntil: 0 }); return; }
+        this.retries.delete(retryKey);
+        if (typeof found === "object") return this.adopt(identity, destination, found);
+        if (found === "absent") this.deps.store.update(identity, r => {
+          if (["uncertain", "in-flight"].includes(r[destination].status)) r[destination].status = "rejected";
+        });
+      }));
+    }).catch(error => this.report(key, error)).finally(() => { this.inFlight.delete(key); });
     this.inFlight.set(key, work);
     return work;
   }

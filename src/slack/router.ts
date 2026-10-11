@@ -490,7 +490,7 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
   if (d.isStopping?.()) return "retry";
   checkSubmission(msg, d, attempt);
   if (!thread) {
-    const dir = canonicalDir(attempt.context.projectDir ?? d.state.currentProjectDir ?? d.cwd);
+    const dir = canonicalDir(attempt.context.projectDir ?? d.state.defaultDir(msg.channel, d.cwd));
     const create = (async (): Promise<ThreadState> => {
       const lease = await d.pool.acquire(dir);
       try {
@@ -503,7 +503,7 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
         const now = Date.now();
         // Start at the thread boundary; live receipt evidence protects this
         // creating prompt while history can still discover an earlier gap.
-        const fresh: ThreadState = { sessionId: sess.id, projectDir: dir, verbose: "on", lastSeenTs: msg.ts,
+        const fresh: ThreadState = { sessionId: sess.id, projectDir: dir, verbose: d.state.channelVerbose(msg.channel), lastSeenTs: msg.ts,
           historyCursorTs: threadTs === msg.ts ? prevTs(msg.ts) : threadTs, createdAt: now, lastUsedAt: now };
         d.state.setThread(threadKey, fresh);
         attempt.context.generation = d.state.bindingGeneration(threadKey);
@@ -520,6 +520,16 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
     } finally {
       creatingThreads.delete(threadKey);
     }
+  }
+
+  // A chosen project (the shortcut's) only places a NEW session. A thread bound
+  // elsewhere must never silently run it in that other repo; later rebinds are
+  // caught by checkSubmission's binding generation.
+  const chosen = attempt.context.projectDir && canonicalDir(attempt.context.projectDir);
+  if (chosen && canonicalDir(thread.projectDir) !== chosen) {
+    await d.render.post(msg.channel, threadTs, `⚠️ Not sent: this thread runs in \`${thread.projectDir}\`, not the project you picked (\`${chosen}\`). Send again choosing that project, or “My DM” for a fresh session in \`${chosen}\`.`,
+      undefined, { unfurl: false, lane: "interactive" });
+    return "accepted";
   }
 
   let lease: RequestLease;

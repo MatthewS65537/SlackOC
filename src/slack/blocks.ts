@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { OcPermission, OcQuestionRequest } from "../opencode/api.js";
+import { visibleQuestions } from "../opencode/v2.js";
 import { esc, truncate } from "../util.js";
 import { unicodeEmoji } from "./emoji.js";
 
@@ -147,6 +148,7 @@ export interface QuestionActionValue {
   g?: number; // binding generation; questionGuard rejects cards without it
   b?: string;
   c?: number;
+  r?: 1; // qnav_next only: leave the cursor and return to the first unfinished question / review step
 }
 
 /**
@@ -158,9 +160,17 @@ export interface QuestionActionValue {
  * Defaults `finalized` to "has an answer" so single-select callers
  * (and tests) can omit it. Submission states lock answer-changing controls;
  * uncertain submissions offer reconciliation through the existing retry action.
+ *
+ * `context.shown` is the question on screen (the Back/Next cursor; -1 = the
+ * review step). It defaults to the first unfinished visible question. Forms
+ * with >1 visible question get a `◀ Back` (qnav_prev) / `Next ▶` (qnav_next,
+ * only once the shown question is finalized) row whose payload `i` is the
+ * target. Picked options render `primary` so a revisited answer is visible.
+ * When everything is answered the card becomes a review step: an answer
+ * summary with `Submit answers` (qsubmit_all), Back and `Edit answers` (qedit).
  */
 export function questionBlocks(req: OcQuestionRequest, answers: string[][], finalized?: boolean[], page = 0,
-  context?: { generation?: number; binding?: string; presentation?: number; response?: "pending" | "answering" | "uncertain" | "resolved" }): unknown[] {
+  context?: { generation?: number; binding?: string; presentation?: number; response?: "pending" | "answering" | "uncertain" | "resolved"; shown?: number }): unknown[] {
   const generation = context?.generation;
   if (generation !== undefined && (!Number.isSafeInteger(generation) || generation < 0)) throw new Error("Invalid question generation");
   if (context?.presentation !== undefined && (!Number.isSafeInteger(context.presentation) || context.presentation < 0)) throw new Error("Invalid question presentation");
@@ -187,7 +197,10 @@ export function questionBlocks(req: OcQuestionRequest, answers: string[][], fina
     return blocks;
   }
   // A bounded wizard keeps arbitrarily long forms within Slack's 50-block cap.
-  const current = req.questions.findIndex((q, i) => !done[i] && !(q.field && "hidden" in q.field && q.field.hidden));
+  const visible = visibleQuestions(req, answers);
+  const visibleIdx = req.questions.flatMap((_, i) => visible[i] ? [i] : []);
+  const current = context?.shown !== undefined && (context.shown < 0 || visible[context.shown]) ? context.shown
+    : req.questions.findIndex((_, i) => !done[i] && visible[i]);
   if (current > 0) blocks.push({ type: "section", text: { type: "mrkdwn",
     text: boundedSection(`✅ ${done.filter(Boolean).length}/${n} answered: ${esc(answers.slice(0, current).flat().join(", "))}`) } });
   req.questions.forEach((q, qi) => {
@@ -211,7 +224,7 @@ export function questionBlocks(req: OcQuestionRequest, answers: string[][], fina
         action_id: `question_${qi}_${offset + oi}`,
         value: buttonValue({ ...payload(qi), a: offset + oi } satisfies QuestionButtonValue),
       };
-      if (q.multiple && picked.includes(o.value ?? o.label)) b.style = "primary";
+      if (picked.includes(o.value ?? o.label)) b.style = "primary";
       return b;
     });
     for (let start = 0; start < optionButtons.length; start += 5) {
@@ -265,10 +278,23 @@ export function questionBlocks(req: OcQuestionRequest, answers: string[][], fina
       value: buttonValue(payload(qi)),
     }] });
   });
+  const back = current < 0 ? visibleIdx.at(-1) : visibleIdx.filter(i => i < current).at(-1);
+  const backButton = back === undefined ? [] : [{ type: "button", action_id: "qnav_prev",
+    text: { type: "plain_text", text: "◀ Back" }, value: buttonValue(payload(back)) }];
+  if (current >= 0 && visibleIdx.length > 1) {
+    // Next jumps to the following visible question, or (from the last one) leaves the cursor.
+    const next = visibleIdx.find(i => i > current);
+    const nav = [...backButton, ...(done[current] ? [{ type: "button", action_id: "qnav_next", text: { type: "plain_text", text: "Next ▶" },
+      value: buttonValue(next === undefined ? { ...payload(current), r: 1 } : payload(next)) }] : [])];
+    if (nav.length) blocks.push({ type: "actions", block_id: blockId(`ques_nav_${req.id}`), elements: nav });
+  }
   if (current < 0) {
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: boundedSection(`✅ Answers ready: ${esc(answers.flat().join(", "))}`) } });
-    blocks.push({ type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: "Retry submission" },
-      action_id: "qretry", value: buttonValue(payload(0)) },
+    // Review step: nothing is sent until the owner confirms (single-question asks submit on tap).
+    const lines = visibleIdx.map(i => `• *${esc(req.questions[i]!.header)}*: ${esc(answers[i]?.join(", ") || "(default)")}`);
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: boundedSection(["✅ *Answers:*", ...lines].join("\n")) } });
+    blocks.push({ type: "actions", block_id: blockId(`ques_review_${req.id}`), elements: [{ type: "button", text: { type: "plain_text", text: "Submit answers" },
+      style: "primary", action_id: "qsubmit_all", value: buttonValue(payload(0)) },
+      ...(visibleIdx.length > 1 ? backButton : []),
       { type: "button", text: { type: "plain_text", text: "Edit answers" }, action_id: "qedit", value: buttonValue(payload(0)) }] });
   }
   // Skip (reject) row — only while something is still open.
