@@ -28,6 +28,6 @@ jobs:
       - name: Run opencode
         uses: anomalyco/opencode/github@latest
         env:
-          SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
+          SYNTHETIC_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         with:
-          model: synthetic/hf:zai-org/GLM-5.3-Flash
+          model: opencode-go/glm-5.3-flash
