@@ -3,6 +3,7 @@ import {
   _resetQueueForTests,
   droppedOpCount,
   enqueue,
+  isSlackDrop,
   laneDepth,
   oldestPendingAgeMs,
   PROMOTE_AFTER_MS,
@@ -108,11 +109,15 @@ describe("Slack queue: per-op guards (B2)", () => {
   it("dropped ops are counted for \\status (RB5)", async () => {
     expect(droppedOpCount()).toBe(0);
     const p1 = enqueue(() => Promise.reject(new Error("HTTP 429")), { channel: "C1" }).catch(() => {});
-    const p2 = enqueue(() => Promise.reject(new Error("channel_not_found")), { channel: "C1" }).catch(() => {});
+    const p2 = enqueue(() => Promise.reject(Object.assign(new Error("channel_not_found"), { data: { error: "channel_not_found" } })),
+      { channel: "C1" }).catch((err: unknown) => err);
     // The final 429 still brakes following operations, even after this op gives up.
     await vi.advanceTimersByTimeAsync(40_000);
-    await Promise.all([p1, p2]);
+    const [, err] = await Promise.all([p1, p2]);
     expect(droppedOpCount()).toBe(2);
+    // Tagged in place for render (#29), keeping Slack's error payload.
+    expect(isSlackDrop(err)).toBe(true);
+    expect((err as { data?: unknown }).data).toEqual({ error: "channel_not_found" });
   });
 });
 

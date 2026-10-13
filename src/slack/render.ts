@@ -8,7 +8,7 @@ import type { StateStore, ThreadState, VerboseMode } from "../state.js";
 import { planText, planTodos, viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
 import { chunkText, dur, mdToMrkdwn, money, shortId, tok, truncate } from "../util.js";
-import { laneDepth } from "./queue.js";
+import { isSlackDrop, laneDepth } from "./queue.js";
 import type { SlackLane } from "./queue.js";
 import { classifyPendingRun, replayAge } from "./recovery-policy.js";
 
@@ -764,8 +764,8 @@ export class SessionView {
 
   /**
    * Delta-poll the transcript and post what's new through the same rendering
-   * path the SSE handlers use (postedPartIds/postedToolStarts dedup makes the
-   * two delivery paths mutually safe). Also detects run completion: when the
+   * path the SSE handlers use (postedPartIds/postedToolStarts dedup plus
+   * postRemainder's streamedLen make the two delivery paths mutually safe). Also detects run completion: when the
    * tail message is a completed assistant message and the transcript has
    * stopped growing, settle → finalize with the usual stats line — or, when
    * nothing streamed at all, a quiet detach (attaching to an idle session).
@@ -813,9 +813,8 @@ export class SessionView {
                 continue;
               }
               this.pendingText.delete(p.id);
-              this.postedPartIds.add(p.id);
               this.streamedAny = true;
-              await this.postThreadText(text);
+              await this.postRemainder(p.id, text); // skips paragraphs SSE already streamed (#28)
             } else if (p.type === "tool") {
               await this.handleTool(p);
               if (this.verbose !== "off") this.streamedAny = true;
@@ -913,6 +912,9 @@ export class SessionView {
     // posts out of arrival order (dividers/messages out of order). Chain every
     // event's render run after the previous one, whatever it awaits inside.
     const run = this.tail.then(() => this.handleInner(ev)).catch((err) => {
+      // One lost Slack post (already logged + counted for \status by the queue)
+      // must not end a run OpenCode is still working on (#29).
+      if (isSlackDrop(err)) return logErr(`slack delivery dropped (${ev.type}, ${this.sessionId}); run continues`);
       logErr(`session view event error (${ev.type}): ${String((err as Error)?.message ?? err)}`);
       // A pipeline error must not leave the thread hanging at ⏳ until the
       // watchdog — surface it as a finalized failure (idempotent).
@@ -1283,6 +1285,7 @@ export class SessionView {
         await this.flushTools();
         this.maybeSink();
       }).catch((err) => {
+        if (isSlackDrop(err)) return logErr(`slack delivery dropped (tool batch, ${this.sessionId}); run continues`);
         logErr(`tool batch failed (${this.sessionId}): ${errorMessage(err)}`);
         void this.finalize(`tool batch delivery failed: ${errorMessage(err)}`);
       });

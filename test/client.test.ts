@@ -145,6 +145,8 @@ describe("native V2 event translation", () => {
     // OpenCode counts ordinals per block kind; text deltas may beat the durable reasoning.ended.
     const events = new V2Events();
     const e = (type: string, created: number, data: object) => events.translate({ type, created, data: { sessionID: "s", assistantMessageID: "m", ordinal: 0, ...data } } as V2Event);
+    e("session.reasoning.started", 0, {});
+    e("session.text.started", 0, {});
     e("session.reasoning.delta", 0, { delta: "thinking" });
     e("session.text.delta", 100, { delta: "Hey! " });
     e("session.reasoning.ended", 200, { text: "thinking" });
@@ -153,5 +155,15 @@ describe("native V2 event translation", () => {
     const [row] = normalizeMessages([{ type: "assistant", id: "m", time: { created: 0, completed: 2_000 }, model: { id: "x", providerID: "p" },
       content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hey! Rex here." }] }] as never, "s");
     expect(row?.parts.map(p => p.id)).toEqual(["m:reasoning:0", "m:text:0"]);
+  });
+
+  it("stays silent on deltas for a part started before this subscription (#27)", () => {
+    const events = new V2Events();
+    const e = (type: string, created: number, data: object) => events.translate({ type, created, data: { sessionID: "s", assistantMessageID: "m", ordinal: 0, ...data } } as V2Event);
+    expect(e("session.text.delta", 0, { delta: "tail " })).toEqual([]);
+    expect(e("session.text.delta", 1_000, { delta: "more" })).toEqual([]);
+    const out = e("session.text.ended", 2_000, { text: "head tail more" });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.properties).toMatchObject({ part: { id: "m:text:0", text: "head tail more", time: { end: 2_000 } } });
   });
 });

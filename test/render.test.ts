@@ -1028,6 +1028,40 @@ describe("SessionView event pipeline errors surface visibly", () => {
     expect(log.posted.some((p) => p.includes("boom text"))).toBe(false);
     deleteView("sess-err");
   });
+
+  it("a Slack post the queue dropped does not end the run (#29)", async () => {
+    const log = blank();
+    const deps = fakeDeps(log);
+    const origPost = deps.post;
+    deps.post = async (c, t, text, blocks, opts) => {
+      if (text.includes("lost text")) throw Object.assign(new Error("request timed out"), { slackDropped: true });
+      return origPost(c, t, text, blocks, opts);
+    };
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/render-sess-drop/state.json`);
+    const v = new SessionView({
+      sessionId: "sess-drop",
+      projectDir: "/p",
+      channel: "C1",
+      threadTs: "T1",
+      threadKey: "C1:T1",
+      client: {} as never,
+      deps,
+      state,
+      threadState: { sessionId: "sess-drop", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1 },
+    });
+    await v.beginPrompt("111.971");
+    const text = (id: string, value: string) => ({
+      type: "message.part.updated",
+      properties: { part: { id, messageID: "dm", type: "text", text: value, time: { end: 1 } } },
+    }) as never;
+    await v.handle(text("d1", "lost text"));
+    expect(getView("sess-drop")).toBe(v);
+    await v.handle(text("d2", "later text"));
+    await v.handle({ type: "session.idle", properties: { sessionID: "sess-drop" } } as never);
+    expect(log.posted.some((p) => p.includes("later text"))).toBe(true);
+    expect(log.reacted).toEqual([["111.971", "white_check_mark"]]);
+    deleteView("sess-drop");
+  });
 });
 
 describe("SessionView owner DMs (remote pager)", () => {
@@ -1634,6 +1668,34 @@ describe("SessionView.attach (watch a computer-driven session)", () => {
       expect(log.updates.join("\n")).toMatch(/👀/);
       await v.stopWatching();
       deleteView("ses-watch-a");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the poll posts only what SSE paragraph streaming hasn't (#28)", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      let done = false;
+      const client = {
+        session: {
+          get: async () => ({ data: { id: "ses-watch-28" } }),
+          messages: async () => ({ data: done ? [{ info: { id: "m1", role: "assistant", time: { created: Date.now(), completed: Date.now() } },
+            parts: [{ id: "p1", messageID: "m1", type: "text", text: "Para one\n\nPara two", time: { end: 1 } }] }] : [] }),
+        },
+      } as never;
+      const { v } = watchView(log, "ses-watch-28", client);
+      await v.attach();
+      await vi.advanceTimersByTimeAsync(0);
+      await v.handle({ type: "message.part.updated", properties: { part: { id: "p1", messageID: "m1", type: "text", text: "Para one\n\nPara tw" } } });
+      done = true;
+      await vi.advanceTimersByTimeAsync(3_000);
+      const body = log.posted.join("\n");
+      expect(body.split("Para one")).toHaveLength(2);
+      expect(body.split("Para two")).toHaveLength(2);
+      await v.stopWatching();
+      deleteView("ses-watch-28");
     } finally {
       vi.useRealTimers();
     }

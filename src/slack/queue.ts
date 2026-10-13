@@ -137,6 +137,11 @@ export function droppedOpCount(): number {
   return droppedOps;
 }
 
+/** True for a rejection from an op the queue permanently dropped (already logged and counted). */
+export function isSlackDrop(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { slackDropped?: unknown }).slackDropped === true;
+}
+
 /** Total pending ops across every channel lane (drives the \status queue line). */
 export function queueDepth(): number {
   let n = 0;
@@ -253,7 +258,10 @@ export function enqueue<T>(op: (signal: AbortSignal) => Promise<T>, opts: Enqueu
             // console to notice it in. Log it and count it for \status (RB5).
             droppedOps += 1;
             logErr(`slack op dropped after ${attempt + 1} attempt(s): ${String((err as Error)?.message ?? err)}`);
-            reject(err);
+            // Tag in place (keeps .data/.code for slackErrorCode) so callers can tell a
+            // lost Slack op from a real bug — see isSlackDrop.
+            const dropped = typeof err === "object" && err !== null ? err : new Error(String(err));
+            reject(Object.assign(dropped, { slackDropped: true }));
             return;
           }
         }

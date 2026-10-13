@@ -113,7 +113,7 @@ export class V2Events {
   private messages = new Map<string, OcMessageInfo>();
   private parents = new Map<string, string>();
   private idle = new Set<string>();
-  private text = new Map<string, { text: string; emitted: number }>();
+  private text = new Map<string, { text: string; emitted: number; started: boolean }>();
   translate(event: V2Event): OcEvent[] {
     const d = event.data;
     const emit = (type: string, properties: object): OcEvent[] => [{ type, properties: { ...properties } }];
@@ -154,14 +154,25 @@ export class V2Events {
         return emit("message.part.updated", { part: { id, sessionID: p.sessionID,
           messageID: p.assistantMessageID, type: "text", text: p.text, time: { end: event.created } } });
       }
+      case "session.text.started": case "session.reasoning.started": {
+        const p = event.data;
+        const id = partId(p.assistantMessageID, event.type === "session.text.started" ? "text" : "reasoning", p.ordinal);
+        const prior = this.text.get(id);
+        if (prior) prior.started = true; // deltas may beat the durable start; they were buffered
+        else this.text.set(id, { text: "", emitted: 0, started: true });
+        return [];
+      }
       case "session.text.delta": case "session.reasoning.delta": {
         const p = event.data;
         const kind = event.type === "session.text.delta" ? "text" : "reasoning";
         const id = partId(p.assistantMessageID, kind, p.ordinal);
-        const prior = this.text.get(id) ?? { text: "", emitted: 0 };
+        const prior = this.text.get(id) ?? { text: "", emitted: 0, started: false };
         prior.text += p.delta;
         this.text.set(id, prior);
-        if (event.created - prior.emitted < 500) return [];
+        // A part whose start this subscription never saw began before a
+        // (re)subscribe: its buffer lacks a prefix, so stay silent until
+        // text.ended carries the full value (#27).
+        if (!prior.started || event.created - prior.emitted < 500) return [];
         prior.emitted = event.created;
         return emit("message.part.updated", { part: { id, sessionID: p.sessionID, messageID: p.assistantMessageID,
           type: kind, text: prior.text } });

@@ -3,6 +3,7 @@ import { rmSync } from "node:fs";
 import { SessionView, deleteView, paragraphCut, setProjectConnectionState, type RenderDeps } from "../src/slack/render.js";
 import { StateStore } from "../src/state.js";
 import type { OCClient, OcEvent } from "../src/opencode/api.js";
+import { V2Events } from "../src/opencode/v2.js";
 import * as logModule from "../src/log.js";
 
 const partial = (id: string, value: string): OcEvent =>
@@ -96,6 +97,28 @@ describe("paragraph streaming", () => {
     expect(texts[0]).toBe("Para one");
     expect(texts.at(-1)).toBe("Para two. Final");
     expect(texts.filter(t => /Para one/.test(t))).toHaveLength(1);
+  });
+
+  it("a resubscribe mid-part posts every paragraph exactly once, in order (#27)", async () => {
+    const f = fixture();
+    const v2 = (type: string, created: number, data: object) =>
+      ({ type, created, data: { sessionID: f.v.sessionId, assistantMessageID: "m1", ordinal: 0, ...data } }) as never;
+    const feed = async (evs: OcEvent[]) => { for (const e of evs) await f.v.handle(e); };
+    const P = (n: number) => `Para ${n} ${"x".repeat(40)}.`;
+    const a = new V2Events();
+    await feed(a.translate(v2("session.text.started", 900, {})));
+    await feed(a.translate(v2("session.text.delta", 1_000, { delta: `${P(1)}\n\n${P(2)}\n\n` })));
+    await feed(a.translate(v2("session.text.delta", 2_000, { delta: `${P(3)}\n\n` })));
+    // Stream drops (Para 4 lost); the pool resubscribes with a fresh adapter. The
+    // post-gap buffer must outgrow what was streamed for the old offsets to bite.
+    const b = new V2Events();
+    await feed(b.translate(v2("session.text.delta", 9_000, { delta: [5, 6, 7, 8, 9].map(P).join("\n\n") + "\n\n" })));
+    const all = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    await feed(b.translate(v2("session.text.ended", 9_500, { text: all.map(P).join("\n\n") })));
+    const body = f.answerPosts().map(p => p.text).join("\n");
+    const order = all.map(n => body.indexOf(`Para ${n} `));
+    for (const n of all) expect(body.split(`Para ${n} `)).toHaveLength(2);
+    expect(order).toEqual([...order].sort((x, y) => x - y));
   });
 
   it("paragraphCut finds the last blank line outside fences", () => {

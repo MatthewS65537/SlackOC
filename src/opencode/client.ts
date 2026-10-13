@@ -376,6 +376,8 @@ async function fetchHeaders(request: Request, timeoutMs: number): Promise<Respon
 }
 
 /** V2 subscriptions are live-only. The pool owns resubscription and reconciliation.
+ * One adapter per subscription is safe: it only streams parts whose `*.started` it saw,
+ * so a part already in flight at (re)subscribe waits for its full-text `*.ended` (#27).
  * `onActivity` fires for every transport read, keepalives included — the pool's idle watchdog. */
 export async function* clientEvents(client: OCClient, signal: AbortSignal, onActivity?: () => void): AsyncGenerator<OcEvent> {
   const adapter = new V2Events();

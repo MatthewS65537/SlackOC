@@ -77,12 +77,15 @@ export function esc(s: string): string {
 /**
  * Convert GitHub-flavored markdown (what LLMs emit) to Slack mrkdwn.
  * Handles the constructs assistants actually use: headings, bold, italics,
- * inline code, fenced blocks, links, bullet lists. Slack has no headings or
- * blockquotes-as-syntax, so headings become *bold* lines and lists keep "-".
- * Fenced code and inline code are passed through untouched (Slack renders ```).
+ * inline code, fenced blocks, links, bullet lists. Slack has no headings, so
+ * headings become *bold* lines and bullets become "•".
+ * All text escapes &, <, > (#30), code included: Slack parses <!channel> and
+ * <url|label> even inside backticks. Only markup this emits stays raw:
+ * <url|label> links, <url> autolinks and a leading ">" quote marker.
+ * Code is otherwise passed through untransformed (Slack renders ```).
  */
 export function mdToMrkdwn(s: string): string {
-  // Split out fenced code blocks first so nothing inside them is transformed.
+  // Split out fenced code blocks first so nothing inside them is transformed (only escaped).
   const blocks: string[] = [];
   const withStash = s.replace(/```[^\n]*\n[\s\S]*?```|```[\s\S]*?```/g, (m) => {
     blocks.push(m);
@@ -119,10 +122,16 @@ export function mdToMrkdwn(s: string): string {
       lines.push(`${b[1]}• ${inline(b[2])}`);
       continue;
     }
+    // A leading ">" is Slack's quote syntax — keep it raw, escape the rest.
+    const q = /^(\s*>+ ?)(.*)$/.exec(line);
+    if (q) {
+      lines.push(`${q[1]}${inline(q[2]!)}`);
+      continue;
+    }
     lines.push(inline(line));
   }
 
-  const out = lines.join("\n").replace(/\0(\d+)\0/g, (_, i) => blocks[Number(i)] ?? "");
+  const out = lines.join("\n").replace(/\0(\d+)\0/g, (_, i) => esc(blocks[Number(i)] ?? ""));
   return out;
 }
 
@@ -155,23 +164,30 @@ function rewrapTable(rows: string[]): string {
       .join("  ")
       .replace(/\s+$/, ""),
   );
-  return "```\n" + body.join("\n") + "\n```";
+  return "```\n" + esc(body.join("\n")) + "\n```"; // pad raw text, escape after
 }
 
 /** Inline-level GFM → mrkdwn (bold/italic/code images links) for one line. */
 function inline(s: string): string {
-  // Images ![alt](url) → plain link text
-  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (_m, alt, url) => `${alt} ${url}`.trim());
-  // Links [text](url) → <url|text> (skip bare code spans)
-  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)[^)]*\)/g, (m, text, url) => {
-    if (/^(https?:|mailto:)/.test(url)) return `<${url}|${text}>`;
-    return m;
-  });
-  // Inline code spans: stash so emphasis rules don't mangle their content.
+  // Inline code spans: stash so escaping/link/emphasis rules don't mangle them.
   const codes: string[] = [];
   s = s.replace(/`[^`]+`/g, (m) => {
     codes.push(m);
     return `\u0001${codes.length - 1}\u0001`;
+  });
+  // GFM autolinks <https://…> are already Slack links: stash them, then escape the prose.
+  const autolinks: string[] = [];
+  s = s.replace(/<((?:https?:|mailto:)[^\s<>|]+)>/g, (_m, url: string) => {
+    autolinks.push(`<${esc(url)}>`);
+    return `\u0002${autolinks.length - 1}\u0002`;
+  });
+  s = esc(s);
+  // Images ![alt](url) → plain link text
+  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (_m, alt, url) => `${alt} ${url}`.trim());
+  // Links [text](url) → <url|text>; a "|" in the label would end it early.
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)[^)]*\)/g, (m, text: string, url) => {
+    if (/^(https?:|mailto:)/.test(url)) return `<${url}|${text.replace(/\|/g, "∣")}>`;
+    return m;
   });
   // Emphasis in ONE pass, longest-first, so bold output isn't re-matched as italic.
   s = s.replace(/\*\*\*([^*]+?)\*\*\*|\*\*([^*]+?)\*\*|\*([^*\n]+?)\*/g, (_m, tri, bold, ital) => {
@@ -181,7 +197,9 @@ function inline(s: string): string {
   });
   // Underscore italics with boundaries (snake_case_id stays untouched).
   s = s.replace(/(^|[\s(>])_([^_\n]+?)_(?=[\s.,:;!?)]|$)/g, "$1_$2_");
-  return s.replace(/\u0001(\d+)\u0001/g, (_, i) => codes[Number(i)] ?? "");
+  return s
+    .replace(/\u0002(\d+)\u0002/g, (_, i) => autolinks[Number(i)] ?? "")
+    .replace(/\u0001(\d+)\u0001/g, (_, i) => esc(codes[Number(i)] ?? ""));
 }
 
 /**
@@ -209,16 +227,25 @@ export function slackToPlain(s: string): string {
   return out.replace(/\u0000(\d+)\u0000/g, (_, i) => stashed[Number(i)] ?? "");
 }
 
-/** Split into chunks ≤ max (soft), preferring newline boundaries. */
+/**
+ * Split into chunks ≤ max (soft), preferring newline boundaries. A cut inside a
+ * ``` block closes the fence in this chunk and reopens it in the next (#40).
+ */
 export function chunkText(s: string, max = 3800): string[] {
   if (s.length <= max) return [s];
   const chunks: string[] = [];
   let rest = s;
   while (rest.length > max) {
-    let cut = rest.lastIndexOf("\n", max);
-    if (cut < max * 0.3) cut = max;
-    chunks.push(rest.slice(0, cut));
+    const room = max - 4; // leave space for a closing "\n```"
+    let cut = rest.lastIndexOf("\n", room);
+    if (cut < max * 0.3) cut = room;
+    let chunk = rest.slice(0, cut);
     rest = rest.slice(cut).replace(/^\n/, "");
+    if ((chunk.match(/^[ \t]*```/gm) ?? []).length % 2) {
+      chunk += "\n```";
+      rest = "```\n" + rest;
+    }
+    chunks.push(chunk);
     if (!rest) break;
   }
   if (rest.trim()) chunks.push(rest);

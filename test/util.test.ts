@@ -64,6 +64,17 @@ describe("chunkText", () => {
     const chunks = chunkText("a".repeat(9000), 3800);
     expect(chunks.length).toBe(3);
   });
+  it("keeps ``` fences balanced in every chunk of a long code block (#40)", () => {
+    const code = Array.from({ length: 300 }, (_, i) => `const value_${i} = compute(${i}); // line ${i}`).join("\n");
+    const src = `Some prose first.\n\n\`\`\`ts\n${code}\n\`\`\`\nafter`;
+    const chunks = chunkText(src);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) {
+      expect(c.length).toBeLessThanOrEqual(3800);
+      expect((c.match(/^[ \t]*```/gm) ?? []).length % 2).toBe(0);
+    }
+    expect(chunks.join("\n").replace(/\n```\n```\n/g, "\n")).toBe(src);
+  });
 });
 
 describe("shortPath", () => {
@@ -119,6 +130,17 @@ describe("mdToMrkdwn (GFM → Slack)", () => {
 
   it("passes plain text through", () => {
     expect(mdToMrkdwn("plain line 1\nplain line 2")).toBe("plain line 1\nplain line 2");
+  });
+
+  it("escapes &, <, > in prose, mentions and code (#30)", () => {
+    expect(mdToMrkdwn("<!channel> a<b & c>d `Vec<String>`")).toBe("&lt;!channel&gt; a&lt;b &amp; c&gt;d `Vec&lt;String&gt;`");
+    expect(mdToMrkdwn("```\n<div>&</div>\n```")).toBe("```\n&lt;div&gt;&amp;&lt;/div&gt;\n```");
+  });
+
+  it("keeps links, quotes and autolinks working after escaping (#30)", () => {
+    expect(mdToMrkdwn("[a|b](https://x.y/?q=1&r=2)")).toBe("<https://x.y/?q=1&amp;r=2|a∣b>");
+    expect(mdToMrkdwn("> quoted <!here>")).toBe("> quoted &lt;!here&gt;");
+    expect(mdToMrkdwn("see <https://x.y>")).toBe("see <https://x.y>");
   });
 });
 
