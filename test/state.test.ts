@@ -243,6 +243,19 @@ describe("canonical identity and durable recovery", () => {
     expect(restarted.getThread("bound:root")?.historyCursorTs).toBe("100.000000");
   });
 
+  it("pruneConfirmedReceipts drops only accepted receipts the cursor covers outside the pending run (#39)", () => {
+    const { path } = tempStore("receipt-confirmed");
+    mkdirSync(join(FIXTURES, "receipt-confirmed"), { recursive: true });
+    const receipt = (n: number, disposition: string) => [`C:${ts(n)}`, { threadKey: "C:100", ts: ts(n), disposition, updatedAt: NOW }];
+    writeFileSync(path, JSON.stringify({ projects: {}, threads: { "C:100": { sessionId: "s", projectDir: "/p", verbose: "on",
+      createdAt: NOW, lastUsedAt: NOW, historyCursorTs: ts(10), pendingRun: { userMsgTs: [ts(9)] } } },
+    receipts: Object.fromEntries([receipt(8, "accepted"), receipt(9, "accepted"), receipt(7, "uncertain"), receipt(11, "accepted")]) }));
+    const s = new StateStore(path, () => NOW);
+    expect(s.pruneConfirmedReceipts()).toBe(1);
+    expect(s.messageReceipts().map((r) => r.ts)).toEqual([ts(7), ts(9), ts(11)]);
+    expect(s.claimMessage("C:100", ts(8))).toBe("accepted"); // a redelivery stays suppressed
+  });
+
   it("reclaims old command-only traffic before checking the cap", () => {
     const { path } = tempStore("receipt-gc-cap");
     mkdirSync(join(FIXTURES, "receipt-gc-cap"), { recursive: true });

@@ -37,6 +37,8 @@ const MAX_THREADS_PER_SWEEP = 10;
 const MAX_PAGES_PER_SWEEP = 20;
 const MAX_PAGES_PER_THREAD = 2;
 export const MAX_SNAPSHOT_CANDIDATES = 200;
+/** History never classifies messages this young: their live event gets first claim (#38). */
+export const LIVE_GRACE_MS = 30_000;
 
 interface Scheduler {
   flight?: Promise<number>;
@@ -70,6 +72,7 @@ export function sweepMissedMessages(deps: CatchupDeps): Promise<number> {
 async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
   const { state, ownerSlackUserId, fetchReplies, dispatch } = deps;
   state.pruneAcceptedUnboundReceipts();
+  state.pruneConfirmedReceipts();
   const all = state.threadsForCatchup();
   const retained = new Set(all.map((c) => c.key));
   for (const key of scheduler.polled.keys()) if (!retained.has(key)) scheduler.polled.delete(key);
@@ -99,7 +102,9 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
     if (!scan) {
       const oldest = [thread.historyCursorTs, recovery.replayFloorTs, replayFloor(state.now())]
         .filter((ts): ts is string => !!ts).sort(compareTs).at(-1)!;
-      scan = { upperTs: timestampFromMs(state.now()), afterTs: oldest, generation: recovery.bindingGeneration,
+      const upperTs = timestampFromMs(state.now() - LIVE_GRACE_MS);
+      if (compareTs(oldest, upperTs) > 0) continue; // nothing outside the live grace yet
+      scan = { upperTs, afterTs: oldest, generation: recovery.bindingGeneration,
         intentVersion: recovery.intentVersion, candidates: [], complete: false };
     }
     const ageFloor = replayFloor(state.now());
@@ -268,7 +273,9 @@ export async function sweepTopLevelMessages(deps: TopLevelCatchupDeps): Promise<
       logErr(`catch-up: history fetch failed for ${channel} (${String(err)}) — retrying next sweep`);
       continue;
     }
-    const newer = page.messages.filter((m) => timestampMicros(m.ts) !== undefined && compareTs(m.ts, mark) > 0);
+    const horizon = timestampFromMs(state.now() - LIVE_GRACE_MS);
+    const newer = page.messages.filter((m) => timestampMicros(m.ts) !== undefined && compareTs(m.ts, mark) > 0
+      && compareTs(m.ts, horizon) <= 0);
     const newest = newer.map((m) => m.ts).sort(compareTs).at(-1);
     if (!newest) continue;
     if (page.hasMore) {
@@ -284,7 +291,8 @@ export async function sweepTopLevelMessages(deps: TopLevelCatchupDeps): Promise<
         && (!m.thread_ts || m.thread_ts === m.ts);
       const receipt = isOwnerPrompt ? state.getReceipt(state.threadKey(channel, m.ts), m.ts) : undefined;
       if (receipt?.disposition === "processing") break; // live delivery is mid-flight
-      if (isOwnerPrompt && !receipt) {
+      // A bound root belongs to the thread sweep, which may already have confirmed it and dropped its receipt (#51).
+      if (isOwnerPrompt && !receipt && !state.getThread(state.threadKey(channel, m.ts))) {
         let later: RecoveryDecision | undefined;
         try {
           later = historyCommand(m) ? undefined : await laterOwnerIntent(deps, channel, m);

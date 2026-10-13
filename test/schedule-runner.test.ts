@@ -454,6 +454,22 @@ describe("saved report delivery", () => {
     expect(h.deliver).toHaveBeenCalledTimes(1); expect(h.submit).toHaveBeenCalledTimes(1); expect(h.onDelivered).toHaveBeenCalledTimes(2);
   });
 
+  it("settles an unconfirmed delivery after 3 fruitless checks instead of re-checking every poll (#33)", async () => {
+    const h = setup(); await h.ready();
+    h.deliver.mockRejectedValue(new Error("accepted post, response lost")); await h.tick();
+    expect(h.latest().status).toBe("uncertain");
+    const scheduler = new Scheduler({ store: h.store, tickRun: r => h.runner.tick(r), now: h.now });
+    for (let i = 0; i < 20; i++) { await scheduler.poll(); h.advance(5_000); }
+    expect(h.findDelivery).toHaveBeenCalledTimes(3);
+    expect(h.latest()).toMatchObject({ status: "uncertain", settledAt: expect.any(Number) });
+    expect(isTerminalRun(h.latest())).toBe(true);
+    const update = vi.spyOn(h.store, "updateRun");
+    for (let i = 0; i < 3; i++) { await scheduler.poll(); h.advance(5_000); }
+    expect(update).not.toHaveBeenCalled();
+    h.advance(8 * 24 * 60 * 60 * 1000); h.store.claim(h.job.id, h.now(), true);
+    expect(h.store.run(h.run.id)).toBeUndefined();
+  });
+
   it("keeps saved reports deliverable after the generation deadline without running the model again", async () => {
     const h = setup(); await h.ready(); h.advance(120_000); await h.tick();
     expect(h.latest().status).toBe("delivered"); expect(h.submit).toHaveBeenCalledTimes(1); expect(h.abort).not.toHaveBeenCalled();
@@ -523,6 +539,16 @@ describe("scheduled cancellation, shutdown, and deadlines", () => {
     h.transcript([user(h.latest()), answer(h.latest())]); await h.tick();
     expect(h.latest().status).toBe("failed"); expect(h.latest().output).toBeUndefined(); expect(h.deliver).not.toHaveBeenCalled();
     expect(h.notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("settles an expired run of unknown admission after 3 re-checks, aborting only once (#33)", async () => {
+    const h = setup(); await h.tick(); h.setRun(r => { r.status = "submitting"; r.messageId = "msg_unknown"; }); h.advance(60_000);
+    const scheduler = new Scheduler({ store: h.store, tickRun: r => h.runner.tick(r), now: h.now });
+    for (let i = 0; i < 10; i++) { await scheduler.poll(); h.advance(5_000); }
+    expect(h.messages).toHaveBeenCalledTimes(4);
+    expect(h.abort).toHaveBeenCalledTimes(1);
+    expect(h.latest()).toMatchObject({ status: "uncertain", settledAt: expect.any(Number) });
+    expect(isTerminalRun(h.latest())).toBe(true);
   });
 
   it("checks deadline after awaited completion before persisting any output", async () => {

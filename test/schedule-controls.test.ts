@@ -41,8 +41,9 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 describe("scheduled report controls", () => {
   it("validates explicit zone, project, days, time, target and runtime", () => {
     expect(parseScheduleFields(fields())).toMatchObject({ projectDir: root, timeoutMs: 900_000, destination: { kind: "dm" } });
+    expect(parseScheduleFields(fields({ model: "openrouter/anthropic/claude-sonnet-4.5" })).model).toBe("openrouter/anthropic/claude-sonnet-4.5");
     const invalid: Array<Record<string, string>> = [{ time: "6pm" }, { timezone: "not/a-zone" }, { directory: "/missing-project-fixture" },
-      { destination: "channel" }, { timeout: "0" }, { model: "guess" }, { prompt: "" }];
+      { destination: "channel" }, { timeout: "0" }, { model: "guess" }, { model: "openrouter/" }, { model: "a//b" }, { model: "a/b c" }, { prompt: "" }];
     for (const overrides of invalid) {
       expect(() => parseScheduleFields(fields(overrides))).toThrow();
     }

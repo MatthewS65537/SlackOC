@@ -42,6 +42,8 @@ export interface ScheduleRun {
   /** Delivery is confirmed; only the idempotent continuation hook remains. */
   deliveryBindingPending?: boolean;
   notified?: boolean;
+  /** Uncertain outcome automatic checks gave up on: kept as evidence, cancelable, pruned like terminal runs (#33). */
+  settledAt?: number;
 }
 
 export const MAX_SCHEDULE_JOBS = 100;
@@ -55,10 +57,11 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<ScheduleRun["status"]> = new Set
 const GENERATING = new Set<ScheduleRun["status"]>(["claimed", "creating", "submitting", "running", "waiting", "uncertain"]);
 const STATUSES = new Set<ScheduleRun["status"]>([...TERMINAL_RUN_STATUSES, ...GENERATING, "ready", "delivering"]);
 const JOB_FIELDS = ["id", "name", "projectDir", "prompt", "schedule", "destination", "timeoutMs", "agent", "model", "enabled", "createdAt", "updatedAt", "nextRunAt"];
-const RUN_FIELDS = ["id", "jobId", "scheduledAt", "startedAt", "deadlineAt", "manual", "snapshot", "status", "sessionId", "messageId", "output", "error", "context", "contextAttemptedAt", "delivery", "deliveryBindingPending", "notified"];
+const RUN_FIELDS = ["id", "jobId", "scheduledAt", "startedAt", "deadlineAt", "manual", "snapshot", "status", "sessionId", "messageId", "output", "error", "context", "contextAttemptedAt", "delivery", "deliveryBindingPending", "notified", "settledAt"];
 const NEW_JOB_FIELDS = JOB_FIELDS.filter(key => !["id", "enabled", "createdAt", "updatedAt", "nextRunAt"].includes(key));
 
 export function isTerminalRun(run: ScheduleRun): boolean {
+  if (run.status === "uncertain" && run.settledAt !== undefined) return !!run.notified || !run.error;
   if (run.status === "delivered" && run.deliveryBindingPending) return false;
   if (run.status === "failed" && run.error && !run.notified) return false;
   return TERMINAL_RUN_STATUSES.has(run.status);
@@ -136,6 +139,7 @@ function validateRun(run: ScheduleRun): void {
   if (run.output !== undefined) text(run.output, MAX_SCHEDULE_OUTPUT_BYTES, "schedule output", true);
   if (run.error !== undefined) text(run.error, 8 * 1024, "schedule error", true);
   if (run.contextAttemptedAt !== undefined) timestamp(run.contextAttemptedAt, "schedule context attempt time");
+  if (run.settledAt !== undefined) timestamp(run.settledAt, "schedule settle time");
   if (run.notified !== undefined && typeof run.notified !== "boolean") throw new Error("Invalid schedule notification flag");
   if (run.deliveryBindingPending !== undefined && typeof run.deliveryBindingPending !== "boolean") throw new Error("Invalid schedule continuation flag");
   if (run.deliveryBindingPending && (run.status !== "delivered" || !run.delivery?.ts)) throw new Error("Invalid pending report continuation");

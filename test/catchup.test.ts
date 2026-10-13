@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { MAX_SNAPSHOT_CANDIDATES, sweepMissedMessages, sweepTopLevelMessages, type CatchupDeps, type RepliesPage, type TopLevelCatchupDeps } from "../src/slack/catchup.js";
+import { LIVE_GRACE_MS, MAX_SNAPSHOT_CANDIDATES, sweepMissedMessages, sweepTopLevelMessages, type CatchupDeps, type RepliesPage, type TopLevelCatchupDeps } from "../src/slack/catchup.js";
 import { StateStore, type ThreadState } from "../src/state.js";
 import { MAX_REPLAY_AGE_MS, classifyRecovery, replayFloor, timestampFromMs } from "../src/slack/recovery-policy.js";
 import type { SlackMsg } from "../src/slack/router.js";
@@ -51,7 +51,7 @@ describe("bounded classified history", () => {
     deps = { ...deps, state };
     expect(await sweepMissedMessages(deps)).toBe(0);
     expect(fetch.mock.calls[1]![2]).toBe(ts(2).replace(".000000", ".000001"));
-    expect(fetch.mock.calls[1]![3]).toMatchObject({ latest: timestampFromMs(NOW), maxPages: 2 });
+    expect(fetch.mock.calls[1]![3]).toMatchObject({ latest: timestampFromMs(NOW - LIVE_GRACE_MS), maxPages: 2 });
     expect(dispatched).toEqual([]);
     expect(state.getThread(key)?.recovery?.canceledThroughTs).toBe(ts(4));
     expect(state.isMessageAccepted(key, ts(2))).toBe(false);
@@ -83,6 +83,21 @@ describe("bounded classified history", () => {
     state.setThread(key, { ...state.getThread(key)!, pendingRun: undefined });
     expect(await sweepMissedMessages(deps)).toBe(1);
     expect(dispatched.map((m) => m.ts)).toEqual([ts(2), ts(3)]);
+  });
+
+  it("drops a confirmed prompt's receipt on the first sweep after its run ends (#39)", async () => {
+    const { state, deps, dispatched } = fixture("receipt-leak");
+    state.claimMessage(key, ts(2), { source: "live" });
+    state.settleMessage(key, ts(2), "accepted");
+    state.setThread(key, { ...state.getThread(key)!, pendingRun: { userMsgTs: [ts(2)] } });
+    deps.fetchReplies = async () => page([msg(2)]);
+    await sweepMissedMessages(deps);
+    expect(state.getThread(key)?.historyCursorTs).toBe(ts(2));
+    expect(state.recoveryStatus().receipts).toBe(1); // kept while the run is pending
+    state.setThread(key, { ...state.getThread(key)!, pendingRun: undefined });
+    await sweepMissedMessages(deps);
+    expect(state.recoveryStatus().receipts).toBe(0);
+    expect(dispatched).toEqual([]);
   });
 
   it("new live intent invalidates a collected snapshot before any replay", async () => {
@@ -175,7 +190,7 @@ describe("recent eligibility and fair read-only discovery", () => {
     const { state, deps } = fixture("fair");
     state.deleteThread(key);
     for (let i = 0; i < 16; i++) {
-      const owner = timestampFromMs(NOW - (i < 11 ? 1000 : MAX_REPLAY_AGE_MS + 1000));
+      const owner = timestampFromMs(NOW - (i < 11 ? LIVE_GRACE_MS + 1000 : MAX_REPLAY_AGE_MS + 1000));
       state.setThread(`${i < 11 ? "R" : "O"}:${i}`, { sessionId: `s${i}`, projectDir: "/p", verbose: "on", createdAt: NOW,
         lastUsedAt: NOW, lastSeenTs: owner, historyCursorTs: owner });
     }
@@ -191,6 +206,8 @@ describe("recent eligibility and fair read-only discovery", () => {
 
   it("coalesces overlapping timer/reconnect calls", async () => {
     const { deps } = fixture("coordinator");
+    let now = NOW;
+    deps.state = new StateStore(join(FIXTURES, "coordinator", "state.json"), () => now);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let calls = 0;
@@ -198,6 +215,7 @@ describe("recent eligibility and fair read-only discovery", () => {
     const first = sweepMissedMessages(deps);
     await vi.waitFor(() => expect(calls).toBe(1));
     expect(sweepMissedMessages(deps)).toBe(first);
+    now += LIVE_GRACE_MS; // the coalesced rerun scans past the first sweep's grace horizon
     release();
     await first;
     expect(calls).toBe(2);
@@ -206,8 +224,8 @@ describe("recent eligibility and fair read-only discovery", () => {
 
 describe("top-level sweep (\\listen channels + owner DM)", () => {
   const top = (seconds: number, extra: Partial<SlackMsg> = {}): SlackMsg => ({ channel: "L", ts: ts(seconds), user: "U1", text: "work", ...extra });
-  function topFixture(name: string, messages: SlackMsg[] = []) {
-    const state = new StateStore(join(FIXTURES, name, "state.json"), () => NOW);
+  function topFixture(name: string, messages: SlackMsg[] = [], clock = () => NOW) {
+    const state = new StateStore(join(FIXTURES, name, "state.json"), clock);
     const dispatched: SlackMsg[] = [];
     const deps: TopLevelCatchupDeps = { state, ownerSlackUserId: "U1", channels: ["L"],
       fetchHistory: vi.fn(async () => ({ messages, hasMore: false })),
@@ -241,6 +259,33 @@ describe("top-level sweep (\\listen channels + owner DM)", () => {
     expect(state.topLevelWatermark("L")).toBe(ts(7));
     expect(await sweepTopLevelMessages(deps)).toBe(0);
     expect(deps.fetchHistory).toHaveBeenLastCalledWith("L", ts(7));
+  });
+
+  it("skips a DM root the thread sweep already confirmed (#51)", async () => {
+    const root = top(2, { channel: "D" });
+    const { state, deps, dispatched } = topFixture("top-bound", [root]);
+    deps.channels = ["D"];
+    state.setTopLevelWatermark("D", ts(1));
+    // After confirmHistory: the root is bound and its receipt is gone.
+    state.setThread(`D:${root.ts}`, { sessionId: "s", projectDir: "/p", verbose: "on", createdAt: NOW, lastUsedAt: NOW,
+      lastSeenTs: root.ts, historyCursorTs: root.ts });
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(deps.fetchReplies).not.toHaveBeenCalled();
+    expect(state.topLevelWatermark("D")).toBe(root.ts);
+  });
+
+  it("leaves a root inside the live grace to its live event, then recovers it (#38)", async () => {
+    let now = NOW;
+    const fresh = { ...top(0), ts: timestampFromMs(NOW - 2000) };
+    const { state, deps, dispatched } = topFixture("top-grace", [top(2), fresh], () => now);
+    state.setTopLevelWatermark("L", ts(1));
+    expect(await sweepTopLevelMessages(deps)).toBe(1);
+    expect(dispatched.map((m) => m.ts)).toEqual([ts(2)]);
+    expect(state.topLevelWatermark("L")).toBe(ts(2));
+    now += LIVE_GRACE_MS;
+    expect(await sweepTopLevelMessages(deps)).toBe(1);
+    expect(dispatched.map((m) => m.ts)).toEqual([ts(2), fresh.ts]);
   });
 
   it("stops at a retry so the next sweep tries it again", async () => {

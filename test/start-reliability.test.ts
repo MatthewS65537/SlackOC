@@ -250,24 +250,25 @@ function waitingSpy() {
 }
 
 describe("startBridge message catch-up cadence", () => {
-  it("recovers a history-only prompt at ten seconds, not before, without resubmitting it", async () => {
+  it("recovers a history-only prompt on the first tick past the live grace, not before, without resubmitting it", async () => {
     await boot();
     expect(f.app.client.conversations.replies).toHaveBeenCalledOnce();
     const missedTs = `${NOW / 1000 + 5}.000001`;
     f.app.client.conversations.replies.mockResolvedValue({ messages: [{
       ts: missedTs, user: "UOWNER", text: "missed prompt",
     }] });
-    await vi.advanceTimersByTimeAsync(9_999);
-    expect(f.app.client.conversations.replies).toHaveBeenCalledOnce();
+    // Ticks at 10s/20s/30s still scan, but the prompt stays inside the 30s live grace until the 40s tick.
+    await vi.advanceTimersByTimeAsync(39_999);
+    expect(f.app.client.conversations.replies).toHaveBeenCalledTimes(4);
     expect(f.pool.entry.client.session.promptAsync).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    expect(f.app.client.conversations.replies).toHaveBeenCalledTimes(2);
+    expect(f.app.client.conversations.replies).toHaveBeenCalledTimes(5);
     expect(f.pool.entry.client.session.promptAsync).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       path: { id: request.sessionID }, body: expect.objectContaining({ parts: [{ type: "text", text: "missed prompt" }] }),
     }));
     expect(state.getReceipt(THREAD_KEY, missedTs)?.disposition).toBe("accepted");
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(f.app.client.conversations.replies).toHaveBeenCalledTimes(3);
+    expect(f.app.client.conversations.replies).toHaveBeenCalledTimes(6);
     expect(f.pool.entry.client.session.promptAsync).toHaveBeenCalledOnce();
   });
 

@@ -23,7 +23,7 @@ import { GhostDetector } from "./ghosts.js";
 import { noteSlackOnline, slackOffline } from "./slack/queue.js";
 import { slackWebClientOptions, slackSocketClientOptions } from "./slack/transport.js";
 import { isSocketModeFailure, SocketSupervisor } from "./slack/socket-supervisor.js";
-import { boundedShutdown, parsePid, pidAlive, startManagedRuntime, stopManagedService } from "./service.js";
+import { boundedShutdown, parsePid, pidAlive, pidfilePredatesBoot, startManagedRuntime, stopManagedService } from "./service.js";
 import { enableFileLog, logErr, pushLog, ringLogger } from "./log.js";
 import { type OcMessageInfo, type OcPermission, type OcQuestionRequest } from "./opencode/api.js";
 import { createScheduledReports, type ScheduledReports } from "./schedules/slack.js";
@@ -468,7 +468,7 @@ function openStore<T>(path: string, open: (path: string) => T): T {
 }
 
 function readPid(pidPath: string): number | null {
-  return existsSync(pidPath) ? parsePid(readFileSync(pidPath, "utf8")) : null;
+  return existsSync(pidPath) && !pidfilePredatesBoot(pidPath) ? parsePid(readFileSync(pidPath, "utf8")) : null;
 }
 
 /** Unlike pidAlive, EPERM counts as dead: `slackoc stop` then clears a pidfile whose pid was reused by another user. */
@@ -548,7 +548,7 @@ export function claimPidfile(pidPath: string): PidClaim {
     try {
       const existing = parsePid(readFileSync(pidPath, "utf8"));
       if (existing !== null) {
-        if (pidAlive(existing)) return "running";
+        if (!pidfilePredatesBoot(pidPath) && pidAlive(existing)) return "running";
       } else if (Date.now() - statSync(pidPath).mtimeMs < PARTIAL_PID_GRACE_MS) {
         return "starting";
       }

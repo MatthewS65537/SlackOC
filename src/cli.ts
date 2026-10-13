@@ -1,7 +1,9 @@
 import type { InitOptions } from "./init.js";
+import { resolve } from "node:path";
 import { runServiceCommand } from "./service.js";
 import { parseFlags } from "./args.js";
 import { VERSION } from "./version.js";
+import { expandHome } from "./paths.js";
 
 const HELP = `slackoc v${VERSION} — control your local OpenCode from Slack
 
@@ -75,7 +77,7 @@ async function main(): Promise<void> {
       const flags = parseFlags(rest.slice(1), ["dir"]);
       const { daemonInstall, daemonStatus, daemonUninstall, installedWorkdir } = await import("./daemon.js");
       if (sub === "install") {
-        process.exitCode = await daemonInstall(flags.dir ?? process.cwd());
+        process.exitCode = await daemonInstall(resolve(expandHome(flags.dir ?? process.cwd())));
       } else if (sub === "uninstall") {
         process.exitCode = await daemonUninstall();
       } else if (sub === "status") {

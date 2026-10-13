@@ -553,6 +553,23 @@ export class StateStore {
     return removed;
   }
 
+  /** Drop accepted receipts a bound thread's cursor covers once their run left pendingRun (#39). */
+  pruneConfirmedReceipts(): number {
+    let removed = 0;
+    for (const [key, r] of Object.entries(this.state.receipts ?? {})) {
+      const t = this.state.threads[r.threadKey];
+      if (r.disposition !== "accepted" || !t?.historyCursorTs || compareTs(r.ts, t.historyCursorTs) > 0
+        || t.pendingRun?.userMsgTs.includes(r.ts)) continue;
+      delete this.state.receipts![key];
+      removed++;
+    }
+    if (removed) {
+      if (Object.keys(this.state.receipts ?? {}).length < MAX_MESSAGE_RECEIPTS) this.state.recoveryPaused = false;
+      this.save();
+    }
+    return removed;
+  }
+
   /** Caller proves history is contiguous through ts. In-flight/uncertain work blocks it. */
   confirmHistory(threadKey: string, ts: string): boolean {
     const t = this.state.threads[threadKey];

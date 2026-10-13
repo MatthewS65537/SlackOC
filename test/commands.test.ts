@@ -96,6 +96,21 @@ describe("canonical project choices", () => {
     expect(scoped.refs[0]?.projectDir).toBe(canonicalDir(a));
   });
 
+  it("an exact project name wins over substring matches; a partial name stays ambiguous (#47)", async () => {
+    const state = new StateStore(join(IDENTITY_FIXTURES, "exact-state.json"));
+    state.setCurrentProject("/launch");
+    const client = { session: { create: async () => ({ data: { id: "exact-new" } }) } };
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, null, { threadKey: "exact:1", pool: {
+      list: () => [{ dir: "/code/app", status: "ready" }, { dir: "/code/app-web", status: "ready" }],
+      acquire: async () => ({ entry: { client }, release: () => {} }),
+    } as never });
+    await getCommand("project")!.run(ctx, "ap");
+    expect(out.at(-1)).toContain("Ambiguous");
+    await getCommand("project")!.run(ctx, "app");
+    expect(state.getThread("exact:1")?.projectDir).toBe("/code/app");
+  });
+
   it("requires a fresh successfully displayed per-thread list for numeric choices", async () => {
     const state = new StateStore(join(IDENTITY_FIXTURES, "fresh-state.json"));
     state.setCurrentProject("/current");
@@ -554,6 +569,22 @@ describe("QoL round (Sep 2026)", () => {
     const reply = out.join("\n");
     expect(reply).toContain("kept");
     expect(reply).toContain("ses_oldoldold".slice(4, 14)); // shortId of the kept session
+  });
+
+  it("bare \\new stays in the thread's project unless the channel is pinned (#36)", async () => {
+    const state = new StateStore(join(IDENTITY_FIXTURES, "new-thread-project.json"));
+    state.setThread("C1:T1", newThreadState("ses_projbbbb", "/projB"));
+    state.setCurrentProject("/launch"); // a restart (or a \cd in another thread) moved the global default
+    const client = { session: { create: async () => ({ data: { id: "ses_newnewnew", title: "t" } }) } };
+    const ctx = baseCtx(state, [], state.getThread("C1:T1"), { pool: {
+      acquire: async () => ({ entry: { client }, release: () => {} }), ensure: async () => ({ client }), killOne: async () => {},
+    } as never });
+    await getCommand("new")!.run(ctx, "");
+    expect(state.getThread("C1:T1")?.projectDir).toBe("/projB");
+    expect(state.currentProjectDir).toBe("/launch");
+    state.setChannelProject("C1", "/pinned");
+    await getCommand("new")!.run({ ...ctx, thread: state.getThread("C1:T1") }, "");
+    expect(state.getThread("C1:T1")?.projectDir).toBe("/pinned");
   });
 
   it("\\stop with nothing running says so and never touches the server", async () => {

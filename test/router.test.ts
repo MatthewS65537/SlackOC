@@ -9,7 +9,7 @@ import type { SlackocConfig } from "../src/config.js";
 import { MAX_MESSAGE_RECEIPTS, RECOVERY_RECEIPT_RESERVE, StateStore } from "../src/state.js";
 import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_EDGE, TARGET_IMAGE_BYTES } from "../src/image.js";
 import { SessionView, deleteView } from "../src/slack/render.js";
-import { sweepMissedMessages, sweepTopLevelMessages } from "../src/slack/catchup.js";
+import { LIVE_GRACE_MS, sweepMissedMessages, sweepTopLevelMessages, type CatchupDeps } from "../src/slack/catchup.js";
 import { registerCommand } from "../src/commands/registry.js";
 import { MAX_REPLAY_AGE_MS, timestampFromMs } from "../src/slack/recovery-policy.js";
 
@@ -297,6 +297,22 @@ describe("real-router recovery receipts", () => {
       expect(prompt).toHaveBeenCalledOnce();
       expect(d.state.getThread(`C:${root}`)?.historyCursorTs).toBe(msg.ts);
     } finally { deleteView("receipt-retry"); }
+  });
+
+  it("a sweep leaves a fresh command to its live event instead of retiring it (#38)", async () => {
+    const { d } = setup("receipt-grace", async () => ({ data: {} }));
+    const msg = ownerMsg("C", timestampFromMs(NOW - 2000), root, "\\verbose off");
+    const fetchReplies = vi.fn<CatchupDeps["fetchReplies"]>(async () => ({ messages: [msg], hasMore: false, pagesUsed: 1 }));
+    try {
+      expect(await sweepMissedMessages({ state: d.state, ownerSlackUserId: "U1", fetchReplies,
+        dispatch: (m, context) => handleIncomingMessage(m, d, context) })).toBe(0);
+      expect(fetchReplies.mock.calls[0]![3]).toMatchObject({ latest: timestampFromMs(NOW - LIVE_GRACE_MS) });
+      const recovery = d.state.getThread(`C:${root}`)!.recovery!;
+      expect(recovery.lastDecision).toBeUndefined();
+      expect(recovery.replayFloorTs! < msg.ts).toBe(true);
+      expect(await handleIncomingMessage(msg, d)).toBe("accepted");
+      expect(d.state.getThread(`C:${root}`)?.verbose).toBe("off");
+    } finally { deleteView("receipt-grace"); }
   });
 
   it("timeout (even mentioning 404) is not rebound or replayed after restart", async () => {

@@ -28,11 +28,18 @@ describe("daemon unit rendering (D3)", () => {
 
   it("systemd unit is a user service that restarts on failure", () => {
     const unit = renderSystemdUnit(opts);
-    expect(unit).toContain(`ExecStart=${opts.node} ${opts.cli} start`);
+    expect(unit).toContain(`ExecStart="${opts.node}" "${opts.cli}" start`);
     expect(unit).toContain(`WorkingDirectory=${opts.workdir}`);
+    expect(unit).toContain(`Environment="PATH=${opts.path}"`);
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("[Install]");
     expect(unit).toContain("WantedBy=default.target");
     expect(unit).toContain("daemon-stderr.log");
+  });
+
+  it("systemd unit keeps paths with spaces whole inside double quotes (#45)", () => {
+    const unit = renderSystemdUnit({ ...opts, node: "/home/u/My Tools/node", path: "/usr/bin:/mnt/c/Program Files/Git/cmd" });
+    expect(unit).toContain(`ExecStart="/home/u/My Tools/node" "${opts.cli}" start`);
+    expect(unit).toContain(`Environment="PATH=/usr/bin:/mnt/c/Program Files/Git/cmd"`);
   });
 });

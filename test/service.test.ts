@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utime
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import {
-  boundedShutdown, installService, parseServiceArgs, renderServicePlist, serviceEnvironment,
+  boundedShutdown, installService, parseServiceArgs, pidfilePredatesBoot, renderServicePlist, serviceEnvironment,
   serviceStatus, startService, stopManagedService, stopService, uninstallService,
   SERVICE_LABEL, type ServiceContext, type ServiceDefinition,
 } from "../src/service.js";
@@ -268,5 +268,20 @@ describe("managed log rotation and shutdown", () => {
     await boundedShutdown(async () => {}, done)(2);
     expect(done).toHaveBeenCalledExactlyOnceWith(2);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("pidfilePredatesBoot", () => {
+  const now = Date.parse("2026-10-12T12:00:00Z");
+  const boot = now - 3600_000;
+  it.each([
+    ["older than boot minus the slack", boot - 11 * 60_000, true],
+    ["within the slack", boot - 9 * 60_000, false],
+    ["after boot", boot + 60_000, false],
+    ["missing", undefined, false],
+  ] as const)("%s", (_label, mtime, expected) => {
+    const path = join(root, "slackoc.pid");
+    if (mtime !== undefined) { writeFileSync(path, "1234"); utimesSync(path, mtime / 1000, mtime / 1000); }
+    expect(pidfilePredatesBoot(path, now, 3600)).toBe(expected);
   });
 });

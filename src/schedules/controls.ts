@@ -85,7 +85,8 @@ export function parseScheduleFields(values: Values): NewScheduleJob {
   const timeout = Number(value("timeout"));
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 60) fail("timeout", "Use a runtime limit from 1 to 60 minutes.");
   const model = value("model");
-  if (model && !/^[^\s/]+\/[^\s/]+$/.test(model)) fail("model", "Use provider/model, or leave this blank.");
+  // First slash separates the provider; model IDs may contain slashes (openrouter/anthropic/…).
+  if (model && !/^[^\s/]+\/[^\s/]\S*$/.test(model)) fail("model", "Use provider/model, or leave this blank.");
   const agent = value("agent");
   if (agent && (agent.length > 100 || /\s/.test(agent))) fail("agent", "Use one agent ID, or leave this blank.");
   return { name, projectDir: canonicalDir(directory), prompt, schedule: { time, timezone, days },

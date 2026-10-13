@@ -70,6 +70,8 @@ const SLACK_REJECTIONS = new Set([
 
 /** Non-rate-limit rejections are terminal after this many delivery attempts. */
 const PERMANENT_REJECTION_ATTEMPTS = 5;
+/** Fruitless checks of an uncertain outcome before it settles (#33). */
+const RECONCILE_CHECKS = 3;
 
 function rateLimited(error: unknown): boolean {
   return isRateLimited(error) || (error as { data?: { error?: string } } | undefined)?.data?.error === "ratelimited";
@@ -136,6 +138,7 @@ export class ReportRunner {
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly retries = new Map<string, { attempts: number; at: number }>();
+  private readonly misses = new Map<string, number>();
 
   constructor(private readonly options: ReportRunnerOptions) { this.now = options.now ?? Date.now; }
 
@@ -148,7 +151,8 @@ export class ReportRunner {
       try {
         const current = this.current(run.id);
         if (current.status === "delivered" && current.deliveryBindingPending) { await this.finishBinding(current.id); return; }
-        if (current.status === "failed") { await this.notifyFailure(current.id); return; }
+        // Settled uncertain runs only owe their notification (#33).
+        if (current.status === "failed" || current.settledAt !== undefined) { await this.notifyFailure(current.id); return; }
         if (TERMINAL_RUN_STATUSES.has(current.status)) return;
         this.check(run.id);
         switch (current.status) {
@@ -362,7 +366,21 @@ export class ReportRunner {
     const copy = await this.options.findDelivery(run);
     this.check(id);
     if (copy) await this.adopt(id, copy);
-    else this.update(id, r => { r.status = "uncertain"; r.error = "Saved report delivery remains unconfirmed; no automatic repost"; });
+    else {
+      const settle = this.missed(id);
+      this.update(id, r => {
+        r.status = "uncertain"; r.error = "Saved report delivery remains unconfirmed; no automatic repost";
+        if (settle) { r.settledAt = this.now(); r.error += " (checks stopped; verify the destination)"; }
+      });
+    }
+  }
+
+  /** Count a fruitless uncertain check; true once the run should settle. */
+  private missed(id: string): boolean {
+    const n = (this.misses.get(id) ?? 0) + 1;
+    if (n < RECONCILE_CHECKS) { this.misses.set(id, n); return false; }
+    this.misses.delete(id);
+    return true;
   }
 
   private async adopt(id: string, copy: { channel: string; ts: string }): Promise<void> {
@@ -376,6 +394,7 @@ export class ReportRunner {
       r.deliveryBindingPending = true;
     });
     this.retries.delete(id);
+    this.misses.delete(id);
     await this.finishBinding(id);
   }
 
@@ -419,7 +438,12 @@ export class ReportRunner {
       } catch (error) { if (error instanceof Stopped || this.options.signal?.aborted) return; }
       run = this.active(id);
       const unknownEffect = !admitted && (!!run.messageId || (!run.sessionId && run.status !== "claimed"));
-      this.update(id, r => { r.status = unknownEffect ? "uncertain" : "failed"; r.error = DEADLINE + (unknownEffect ? "; external admission remains unconfirmed, no automatic retry" : ""); });
+      // Only re-checks of an already-expired run count toward settling; the first expiry still aborts.
+      const settle = unknownEffect && alreadyExpired && this.missed(id);
+      this.update(id, r => {
+        r.status = unknownEffect ? "uncertain" : "failed"; r.error = DEADLINE + (unknownEffect ? "; external admission remains unconfirmed, no automatic retry" : "");
+        if (settle) r.settledAt = this.now();
+      });
       if (!alreadyExpired && run.sessionId && lease?.entry.client?.v2) {
         try { await sessionAbort(lease.entry.client, run.sessionId, this.options.signal); } catch { /* Durable deadline forbids late delivery even if interrupt fails. */ }
         this.current(id);

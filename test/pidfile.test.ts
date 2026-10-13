@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { fork, type ChildProcess } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
+import { uptime } from "node:os";
 import { pathToFileURL } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { claimPidfile } from "../src/start.js";
@@ -49,6 +50,14 @@ describe("claimPidfile", () => {
     seed(p, process.pid); // our own pid is alive — another start sees "running"
     expect(claimPidfile(p)).toBe("running");
     expect(Number(readFileSync(p, "utf8"))).toBe(process.pid);
+  });
+
+  it("reclaims a pidfile from before the last boot even if its pid is live", () => {
+    const p = pidPath("pre-boot");
+    seed(p, process.pid);
+    const before = (Date.now() - uptime() * 1000 - 11 * 60_000) / 1000;
+    utimesSync(p, before, before);
+    expect(claimPidfile(p)).toBe("claimed");
   });
 
   it("replaces a stale pidfile from a dead process", () => {

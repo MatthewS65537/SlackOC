@@ -77,6 +77,9 @@ export function renderLaunchdPlist(opts: { node: string; cli: string; workdir: s
 `;
 }
 
+/** One double-quoted systemd word: escape \ and ", and % (specifier expansion). */
+const unitWord = (v: string) => `"${v.replace(/[\\"]/g, "\\$&").replace(/%/g, "%%")}"`;
+
 /** Render the systemd user unit. Pure — tested directly. */
 export function renderSystemdUnit(opts: { node: string; cli: string; workdir: string; path: string }): string {
   const { node, cli, workdir, path: envPath } = opts;
@@ -87,9 +90,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${node} ${cli} start
+ExecStart=${unitWord(node)} ${unitWord(cli)} start
 WorkingDirectory=${workdir}
-Environment=PATH=${envPath}
+Environment=${unitWord(`PATH=${envPath}`)}
 Restart=always
 RestartSec=3
 StandardOutput=append:${join(CONFIG_DIR, "daemon-stdout.log")}

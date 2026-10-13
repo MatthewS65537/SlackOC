@@ -526,7 +526,9 @@ async function resolveProject(ctx: CmdCtx, q: string, dirs: string[]): Promise<s
     return dir;
   }
   const ql = q.toLowerCase();
-  const hits = dirs.filter((d) => projectName(d).toLowerCase() === ql || d.toLowerCase().includes(ql));
+  // An exact folder name wins; only then fall back to substring matches on the path.
+  const exact = dirs.filter((d) => projectName(d).toLowerCase() === ql);
+  const hits = exact.length ? exact : dirs.filter((d) => d.toLowerCase().includes(ql));
   if (hits.length > 1) {
     await ctx.postToThread(`Ambiguous — ${hits.map((h) => `\`${projectName(h)}\``).join(", ")}. Use \`\\project <#>\` from the list.`);
     return;
@@ -628,7 +630,7 @@ registerCommand({
   name: "new", rebinds: "always",
   usage: "\\new [/abs/path]",
   summary: "Fresh session in this thread",
-  detail: "`\\new /abs/path` also switches the current project. Accepts `~` paths. The previous session is kept (\\resume recovers it).",
+  detail: "Bare `\\new` stays in this thread's project; `\\new /abs/path` also switches the current project. Accepts `~` paths. The previous session is kept (\\resume recovers it).",
   async run(ctx, args) {
     if (args) {
       const dir = requireDir(ctx, args);
@@ -637,7 +639,8 @@ registerCommand({
       await rebindThread(ctx, dir, "✨ New project session.", { teardown: false });
       return;
     }
-    const dir = ctx.state.defaultDir(ctx.channelId, ctx.cwd);
+    // Same project as the thread (a channel pin still wins); unbound threads use the channel default.
+    const dir = ctx.state.channelProject(ctx.channelId) ?? ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
     await rebindThread(ctx, dir, "✨", { teardown: false });
   },
 });

@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { homedir } from "node:os";
+import { homedir, uptime } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CONFIG_DIR } from "./config.js";
 import { parseFlags } from "./args.js";
@@ -33,6 +33,13 @@ export interface ServiceContext {
 export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (err) { return (err as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+
+/** Slack for wall-clock steps after boot (e.g. NTP sync): only clearly older pidfiles are stale. */
+const BOOT_SLACK_MS = 10 * 60_000;
+/** A pidfile last written before this boot names a previous boot's (possibly recycled) pid (#37). */
+export function pidfilePredatesBoot(path: string, now = Date.now(), uptimeSec = uptime()): boolean {
+  try { return statSync(path).mtimeMs < now - uptimeSec * 1000 - BOOT_SLACK_MS; } catch { return false; }
 }
 
 /** Strict pidfile contents: a bare integer > 1, else null (empty/partial/garbage). */
@@ -130,7 +137,7 @@ function loadedJob(ctx: ServiceContext): { loaded: boolean; pid: number | null; 
 }
 
 function readPid(path: string, allowStalePartial = false): number | null {
-  if (!existsSync(path)) return null;
+  if (!existsSync(path) || pidfilePredatesBoot(path)) return null;
   const pid = parsePid(readFileSync(path, "utf8"));
   if (pid === null) {
     // Match claimPidfile's legacy-partial grace. The bridge still owns recovery
