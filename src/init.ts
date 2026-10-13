@@ -24,14 +24,28 @@ function manifestPath(): string | null {
 // ---------------------------------------------------------------------------
 // Slack API validation helpers (also used by doctor; unit-tested with a stubbed fetch)
 
-/** POST a Web API method; `payload` is sent as a JSON body. */
-export async function slackApi<T>(method: string, token: string, payload?: object): Promise<T> {
-  const res = await fetch(`https://slack.com/api/${method}`, {
+/** POST a Web API method; `payload` is sent as a JSON body. Gives up after 10 s so init/doctor never hang. */
+function slackPost(method: string, token: string, payload?: object): Promise<Response> {
+  return fetch(`https://slack.com/api/${method}`, {
     method: "POST",
+    signal: AbortSignal.timeout(10_000),
     headers: { authorization: `Bearer ${token}`, ...(payload ? { "content-type": "application/json" } : {}) },
     ...(payload ? { body: JSON.stringify(payload) } : {}),
   });
-  return res.json() as Promise<T>;
+}
+
+export async function slackApi<T>(method: string, token: string, payload?: object): Promise<T> {
+  return (await slackPost(method, token, payload)).json() as Promise<T>;
+}
+
+/**
+ * slackApi plus the calling token's granted scopes, which Slack lists in the
+ * `x-oauth-scopes` response header. null when the header is absent (e.g. a proxy stripped it).
+ */
+export async function slackApiWithScopes<T>(method: string, token: string, payload?: object): Promise<{ body: T; scopes: string[] | null }> {
+  const res = await slackPost(method, token, payload);
+  const header = res.headers.get("x-oauth-scopes");
+  return { body: await res.json() as T, scopes: header === null ? null : header.split(",").map((s) => s.trim()).filter(Boolean) };
 }
 
 export function assertBotTokenShape(t: string): void {
@@ -85,8 +99,10 @@ export async function verifyOwnerId(botToken: string, ownerId: string): Promise<
 export async function runInit(opts: InitOptions = {}): Promise<void> {
   console.log(`slackoc v${VERSION} — first-time setup\n`);
 
-  if (loadConfig()) {
-    console.log(`Found existing config at ${CONFIG_PATH} (will be overwritten).`);
+  // Optional settings (e.g. `ship`) survive a re-init; tokens/owner are replaced.
+  const prev = loadConfig();
+  if (prev) {
+    console.log(`Found existing config at ${CONFIG_PATH} (tokens will be replaced).`);
   }
 
   const interactive = !(opts.botToken && opts.appToken && opts.ownerId);
@@ -131,6 +147,7 @@ export async function runInit(opts: InitOptions = {}): Promise<void> {
     console.log(owner?.name ? `  ✓ paired owner: ${owner.name}` : `  ✓ paired owner: ${ownerId} (name check skipped — app lacks users:read)`);
 
     saveConfig({
+      ...prev,
       slackBotToken: botToken,
       slackAppToken: appToken,
       ownerSlackUserId: ownerId,

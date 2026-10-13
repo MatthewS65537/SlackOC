@@ -1,6 +1,8 @@
 /** Deadlines cover response bodies too; abort always reaches the actual transport. */
 export const HTTP_TIMEOUT_MS = 30_000;
 export const COMMAND_TIMEOUT_MS = 120_000;
+/** `\!` shell runs and worktree setup scripts may hold their request for minutes (client.ts). */
+export const SLOW_REQUEST_TIMEOUT_MS = 30 * 60_000;
 
 export interface RequestOptions {
   signal?: AbortSignal;

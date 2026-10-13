@@ -38,6 +38,13 @@ describe("bounded classified history", () => {
     expect(state.getThread(key)?.recovery?.ownerActivityTs).toBe(ts(2));
   });
 
+  it("replays an owner's \"Also send to channel\" reply (thread_broadcast) (#53)", async () => {
+    const { deps, dispatched } = fixture("broadcast");
+    deps.fetchReplies = async () => page([msg(0), { ...msg(2), subtype: "thread_broadcast" }]);
+    expect(await sweepMissedMessages(deps)).toBe(1);
+    expect(dispatched).toEqual([{ ...msg(2), subtype: "thread_broadcast" }]);
+  });
+
   it("does not execute page one before a page-three stop; persists snapshot through restart", async () => {
     let { state, deps, dispatched } = fixture("page-stop");
     const fetch = vi.fn<CatchupDeps["fetchReplies"]>()
@@ -83,6 +90,20 @@ describe("bounded classified history", () => {
     state.setThread(key, { ...state.getThread(key)!, pendingRun: undefined });
     expect(await sweepMissedMessages(deps)).toBe(1);
     expect(dispatched.map((m) => m.ts)).toEqual([ts(2), ts(3)]);
+  });
+
+  it("steps past a command still running live, but a prompt still processing holds later ones back", async () => {
+    const cmd = fixture("processing-command");
+    cmd.state.claimMessage(key, ts(2), { source: "live" }); // `\!` mid-run
+    cmd.deps.fetchReplies = async () => page([msg(2, "\\! make test"), msg(3)]);
+    expect(await sweepMissedMessages(cmd.deps)).toBe(1);
+    expect(cmd.dispatched.map((m) => m.ts)).toEqual([ts(3)]);
+
+    const prompt = fixture("processing-prompt");
+    prompt.state.claimMessage(key, ts(2), { source: "live" });
+    prompt.deps.fetchReplies = async () => page([msg(2), msg(3)]);
+    expect(await sweepMissedMessages(prompt.deps)).toBe(0);
+    expect(prompt.dispatched).toEqual([]);
   });
 
   it("drops a confirmed prompt's receipt on the first sweep after its run ends (#39)", async () => {
@@ -296,6 +317,21 @@ describe("top-level sweep (\\listen channels + owner DM)", () => {
     expect(state.topLevelWatermark("L")).toBe(ts(1));
   });
 
+  it("steps past a top-level command still running live; a prompt still processing stops the channel", async () => {
+    const { state, deps, dispatched } = topFixture("top-processing", [top(2, { text: "\\! make test" }), top(3)]);
+    state.setTopLevelWatermark("L", ts(1));
+    state.claimMessage(`L:${ts(2)}`, ts(2), { source: "live" });
+    expect(await sweepTopLevelMessages(deps)).toBe(1);
+    expect(dispatched.map((m) => m.ts)).toEqual([ts(3)]);
+
+    const held = topFixture("top-processing-prompt", [top(2), top(3)]);
+    held.state.setTopLevelWatermark("L", ts(1));
+    held.state.claimMessage(`L:${ts(2)}`, ts(2), { source: "live" });
+    expect(await sweepTopLevelMessages(held.deps)).toBe(0);
+    expect(held.dispatched).toEqual([]);
+    expect(held.state.topLevelWatermark("L")).toBe(ts(1));
+  });
+
   it("holds an over-budget backlog instead of replaying a partial window", async () => {
     const { state, deps, dispatched } = topFixture("top-backlog");
     state.setTopLevelWatermark("L", ts(1));
@@ -318,6 +354,17 @@ describe("top-level sweep (\\listen channels + owner DM)", () => {
     expect(await sweepTopLevelMessages(deps)).toBe(0);
     expect(dispatched).toEqual([]);
     expect(state.topLevelWatermark("L")).toBe(root.ts);
+  });
+
+  it("a broadcast \\stop supersedes the root, and the broadcast itself is never a root (#53)", async () => {
+    const root = top(2);
+    const stop = reply(root, 3, "\\stop", { subtype: "thread_broadcast" });
+    // Broadcast replies also appear in channel history (newest first).
+    const { deps, dispatched } = topFixture("top-later-broadcast", [stop, root]);
+    deps.state.setTopLevelWatermark("L", ts(1));
+    deps.fetchReplies = async () => page([root, stop]);
+    expect(await sweepTopLevelMessages(deps)).toBe(0);
+    expect(dispatched).toEqual([]);
   });
 
   it("read-only commands, non-owner replies, and follow-up prompts do not supersede the root", async () => {

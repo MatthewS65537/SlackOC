@@ -160,6 +160,8 @@ export class ScheduleStore {
   private definitions = new Map<string, ScheduleJob>();
   private records = new Map<string, ScheduleRun>();
   private persisted?: string;
+  /** Called after every write: job edits and run state changes (the Home tab refreshes on it). */
+  onCommit?: () => void;
 
   constructor(readonly path: string, private readonly now: () => number = Date.now) {
     if (!existsSync(path)) return;
@@ -302,5 +304,6 @@ export class ScheduleStore {
     this.definitions = jobs;
     this.records = runs;
     this.persisted = raw;
+    this.onCommit?.();
   }
 }

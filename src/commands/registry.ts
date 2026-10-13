@@ -5,6 +5,7 @@ import type { StateStore, ThreadState } from "../state.js";
 import type { RenderDeps } from "../slack/render.js";
 import type { ParsedCmd } from "./parse.js";
 import type { PermissionResponseInput, PermissionResponseResult } from "../slack/permissions.js";
+import type { PromptStore } from "../prompts.js";
 
 export interface PermissionCommands {
   list(context: PermissionResponseInput["context"], refresh?: boolean): Promise<string>;
@@ -22,6 +23,8 @@ export interface CmdCtx {
   ownerDm?: boolean;
   schedules?: ScheduleCommands;
   permissions?: PermissionCommands;
+  /** Saved prompts (D1: \save, \run, \saved). */
+  prompts?: PromptStore;
   questions?(context: { threadKey: string } | { dm: true }, beforeRefresh?: (status: string) => Promise<void>): Promise<string | void>;
   resumeQuestions?(context: { threadKey: string; sessionId: string; generation: number; ownerTs: string }): Promise<void>;
   /** Bound OpenCode session for this thread, if any. */
@@ -36,8 +39,8 @@ export interface CmdCtx {
   threadUrl?(threadKey: string): string | null;
   /** Post into the current thread/DM; `blocks` (optional) carry interactive controls. */
   postToThread(text: string, blocks?: unknown[]): Promise<void>;
-  /** Upload a text file (snippet, diff…) into the current thread. */
-  uploadToThread(filename: string, content: string): Promise<void>;
+  /** Upload a text snippet (diff…) or binary file (\shot PNG/PDF) into the current thread. */
+  uploadToThread(filename: string, content: string | Buffer, comment?: string): Promise<void>;
   /**
    * Best-effort liveness ack on the command's own message (👀 → ✅/❌), mirroring
    * the prompt path. add=false removes the reaction. Optional so non-Slack
@@ -73,7 +76,8 @@ export interface CmdDef {
    * messages is canceled as superseded: always, or only when given arguments.
    */
   rebinds?: "always" | "withArgs";
-  run(ctx: CmdCtx, args: string): Promise<void>;
+  /** Resolve "view" when the command's message now belongs to a SessionView run, whose finalize sets ✅/❌. */
+  run(ctx: CmdCtx, args: string): Promise<void | "view">;
 }
 
 const registry = new Map<string, CmdDef>();
@@ -149,7 +153,7 @@ export async function execute(parsed: ParsedCmd, ctx: CmdCtx): Promise<void> {
   }
   try {
     await ctx.react?.("eyes");
-    await def.run(ctx, parsed.args);
+    if (await def.run(ctx, parsed.args) === "view") return; // the view's finalize resolves 👀
     await ctx.react?.("eyes", false);
     await ctx.react?.("white_check_mark");
   } catch (err) {

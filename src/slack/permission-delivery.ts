@@ -5,17 +5,25 @@ import {
   type PermissionDeliveryStore, type PermissionIdentity, type PermissionRecord,
 } from "./permissions-store.js";
 import { retryAfterSeconds, SLACK_ACCESS_ERRORS, SLACK_PAYLOAD_ERRORS, slackErrorCode } from "./transport.js";
+import { markerMetadata, type MarkerMetadata } from "./markers.js";
 
 export type PermissionDestination = "thread" | "dm";
+
+/** Invisible delivery marker for a copy; the visible text carries none (web/slack-message-metadata.md). */
+export function permissionMarkerMetadata(record: PermissionRecord, destination: PermissionDestination): MarkerMetadata {
+  return markerMetadata("permission", record.requestId, permissionDeliveryMarker(record, destination));
+}
 export interface PermissionCopy { ts: string; channel: string }
 export interface PermissionDeliveryDeps {
   store: PermissionDeliveryStore;
   /** Includes binding generation and authoritative pending/recovery eligibility. */
   isCurrent(record: PermissionRecord): boolean;
   /** Use the bounded interactive Slack queue; it owns timeouts and 429 retries.
-   * Recheck eligibility inside the queued operation before its external effect. */
+   * Recheck eligibility inside the queued operation before its external effect.
+   * Must attach `permissionMarkerMetadata(record, destination)`: it is what findCopy matches. */
   post(record: PermissionRecord, destination: PermissionDestination, text: string, blocks?: unknown[]): Promise<PermissionCopy>;
-  /** Only bot-authored exact markers qualify. Incomplete/unreadable history is unknown. */
+  /** Only bot-authored exact markers qualify (metadata payload, or text on pre-metadata copies).
+   * Incomplete/unreadable history is unknown. */
   findCopy(record: PermissionRecord, destination: PermissionDestination, marker: string): Promise<PermissionCopy | "absent" | "unknown">;
   /** Runs after durable adoption, even if the request resolved during the await. */
   onDelivered(record: PermissionRecord, destination: PermissionDestination): Promise<void> | void;
@@ -199,7 +207,6 @@ export class PermissionDeliveryManager {
       text = permissionFallbackText({ id: record.requestId, sessionID: record.sessionId,
         type: record.permission.type, title: record.permission.title });
     }
-    text += `\n${permissionDeliveryMarker(record, destination)}`;
     record = this.deps.store.update(identity, r => {
       Object.assign(r[destination], { format, status: "in-flight", attempts: r[destination].attempts + 1, error: undefined });
     });

@@ -1,7 +1,7 @@
 /** Bounded, fair recovery from retained Slack threads; live observations never confirm history. */
 import type { StateStore } from "../state.js";
 import { logErr } from "../log.js";
-import { cleanMentionText, type IncomingOutcome, type SlackMsg } from "./router.js";
+import { cleanMentionText, isOwnerInput, type IncomingOutcome, type SlackMsg } from "./router.js";
 import { classifyRecovery, compareTs, isRecentRecoveryEligibleThread, nextTs, replayAge, replayFloor, timestampFromMs, timestampMicros, type IncomingContext, type RecoveryDecision } from "./recovery-policy.js";
 import { parseBackslash } from "../commands/parse.js";
 import { resolveCommandName } from "../commands/registry.js";
@@ -129,7 +129,7 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
       if (!Number.isInteger(used) || used < 1 || used > maxPages) throw new Error("fetchReplies exceeded/omitted its page budget");
       pagesLeft -= used;
       const replies = page.messages.filter((m) => timestampMicros(m.ts) !== undefined && compareTs(m.ts, scan!.upperTs) <= 0);
-      const owner = replies.filter((m) => !m.bot_id && (!m.subtype || m.subtype === "file_share") && m.user === ownerSlackUserId);
+      const owner = replies.filter((m) => isOwnerInput(m, ownerSlackUserId));
       for (const m of owner) {
         if (compareTs(m.ts, scan.afterTs) < 0 || scan.candidates.some((row) => row.ts === m.ts)) continue;
         scan.candidates.push({ ...m, channel, thread_ts: rootTs });
@@ -178,7 +178,9 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
       state.markThreadSeen(key, m.ts);
       if (state.isMessageAccepted(key, m.ts)) continue;
       const command = historyCommand(m);
-      if (command && command !== "stop" && !READ_ONLY_COMMANDS.includes(command) && !state.isMessageAccepted(key, m.ts)) state.holdHistoricalContext(key);
+      // A missed command leaves later prompts without context; one still running live wasn't missed.
+      const live = state.getReceipt(key, m.ts)?.disposition === "processing";
+      if (command && command !== "stop" && !READ_ONLY_COMMANDS.includes(command) && !live) state.holdHistoricalContext(key);
       if (CANCELING_COMMANDS.includes(command ?? "")) {
         const current = state.getThread(key)?.recovery?.canceledThroughTs;
         const priorIntent = state.getThread(key)!.recovery!.intentVersion;
@@ -194,7 +196,15 @@ async function sweep(deps: CatchupDeps, scheduler: Scheduler): Promise<number> {
       const command = historyCommand(m);
       const context: IncomingContext = { source: "history", generation: scan.generation, intentVersion: scan.intentVersion };
       const receipt = state.getReceipt(key, m.ts);
-      if (receipt?.disposition === "processing") break; // live HTTP/SSE may still settle it
+      if (receipt?.disposition === "processing") {
+        if (!command || command === "run") break; // a prompt: live HTTP/SSE may still settle it; later prompts keep their order
+        // A command still running live (`\!` can take an hour, `\new --wt` minutes) is its handler's:
+        // step past it rather than stall every later message in this thread.
+        state.retireHistory(key, nextTs(m.ts));
+        scan.candidates.shift();
+        state.setRecoveryScan(key, scan);
+        continue;
+      }
       let decision = classifyRecovery({ ts: m.ts, thread: current, receipt, now: state.now(), context, command });
       if (state.isMessageAccepted(key, m.ts)) decision = { decision: "already_handled", reason: "confirmed_history" };
       if (decision.decision === "recover" && current.pendingRun?.userMsgTs.length && !command) {
@@ -254,8 +264,9 @@ export interface TopLevelCatchupDeps {
  * Thread sweeps only see replies inside bound threads, so a top-level message
  * Socket Mode dropped in a \listen channel or the owner DM needs its own pass.
  * Per-channel watermark: a missing one is seeded at now (nothing older replays);
- * live-handled messages already hold receipts and are skipped; "processing"/"retry"
- * (or unreadable replies) stop the channel so the next sweep retries from there.
+ * live-handled messages already hold receipts and are skipped; a prompt still "processing",
+ * a "retry" (or unreadable replies) stop the channel so the next sweep retries from there,
+ * while a command still running live is stepped past.
  * A root whose thread already holds a later owner command (\stop, \cd, ...) is
  * superseded: it is skipped, never started, like the bound-thread sweep does.
  */
@@ -287,10 +298,10 @@ export async function sweepTopLevelMessages(deps: TopLevelCatchupDeps): Promise<
     }
     let advanced = mark;
     for (const m of newer) {
-      const isOwnerPrompt = !m.bot_id && (!m.subtype || m.subtype === "file_share") && m.user === ownerSlackUserId
-        && (!m.thread_ts || m.thread_ts === m.ts);
+      const isOwnerPrompt = isOwnerInput(m, ownerSlackUserId) && (!m.thread_ts || m.thread_ts === m.ts);
       const receipt = isOwnerPrompt ? state.getReceipt(state.threadKey(channel, m.ts), m.ts) : undefined;
-      if (receipt?.disposition === "processing") break; // live delivery is mid-flight
+      // A prompt (or `\run`) mid-flight live stops the channel; a running command (e.g. `\!`) is stepped past.
+      if (receipt?.disposition === "processing" && [undefined, "run"].includes(historyCommand(m))) break;
       // A bound root belongs to the thread sweep, which may already have confirmed it and dropped its receipt (#51).
       if (isOwnerPrompt && !receipt && !state.getThread(state.threadKey(channel, m.ts))) {
         let later: RecoveryDecision | undefined;
@@ -329,7 +340,7 @@ async function laterOwnerIntent(deps: TopLevelCatchupDeps, channel: string, root
   if (page.hasMore) return { decision: "held", reason: "pagination_incomplete" };
   let later: RecoveryDecision | undefined;
   for (const m of page.messages) {
-    if (compareTs(m.ts, root.ts) <= 0 || m.bot_id || (m.subtype && m.subtype !== "file_share") || m.user !== deps.ownerSlackUserId) continue;
+    if (compareTs(m.ts, root.ts) <= 0 || !isOwnerInput(m, deps.ownerSlackUserId)) continue;
     const command = historyCommand(m);
     if (command && CANCELING_COMMANDS.includes(command)) return { decision: "canceled", reason: "owner_canceled" };
     if (command && !READ_ONLY_COMMANDS.includes(command)) later = { decision: "held", reason: "historical_command_context" };

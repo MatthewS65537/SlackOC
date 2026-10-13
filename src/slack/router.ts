@@ -3,10 +3,13 @@ import type { SlackocConfig } from "../config.js";
 import { randomBytes } from "node:crypto";
 import { promptAsync, sessionCreate } from "../opencode/client.js";
 import type { RequestLease, ServerPool } from "../opencode/server.js";
-import type { StateStore, ThreadState } from "../state.js";
+import { LAST_PROMPT_MAX, type StateStore, type ThreadState } from "../state.js";
 import { execute, getCommand, resolveCommandName, type CmdCtx, type PermissionCommands } from "../commands/registry.js";
 import { parseBackslash } from "../commands/parse.js";
 import "../commands/handlers.js"; // registers all commands on import
+import { expandSavedPrompt } from "../commands/prompts.js";
+import { isPreparingWorktree, STILL_PREPARING } from "../commands/worktrees.js";
+import type { PromptStore } from "../prompts.js";
 import { SessionView, getView, reactLogged, type RenderDeps } from "./render.js";
 import { slackToPlain, truncate } from "../util.js";
 import { canonicalDir } from "../paths.js";
@@ -67,6 +70,8 @@ export interface BridgeDeps {
   resumeQuestions?: CmdCtx["resumeQuestions"];
   schedules?: CmdCtx["schedules"];
   ownerDmChannel?: () => string | null;
+  /** Saved prompts (D1); `\run <name>` expands here into a normal prompt. */
+  prompts?: PromptStore;
 }
 
 function threadRootTs(msg: SlackMsg): string {
@@ -90,6 +95,17 @@ export function claimEvent(channel: string, ts: string): boolean {
     for (const [k, t] of claimedEvents) if (t <= now - 60_000) claimedEvents.delete(k);
   }
   return true;
+}
+
+/** Subtypes that are still plain owner input: attachments, and thread replies also sent to the channel (#53). */
+const INPUT_SUBTYPES = new Set(["file_share", "thread_broadcast"]);
+
+/**
+ * Owner-authored input the router acts on. Shared by live routing, both history sweeps and the
+ * ghost witness (#52), so live and history can't disagree on what counts as a message.
+ */
+export function isOwnerInput(m: Pick<SlackMsg, "user" | "subtype" | "bot_id">, owner: string): boolean {
+  return !m.bot_id && (!m.subtype || INPUT_SUBTYPES.has(m.subtype)) && !!m.user && m.user === owner;
 }
 
 /**
@@ -153,9 +169,7 @@ function checkSubmission(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingAttemp
 
 export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps, context: IncomingContext = { source: "live" }): Promise<IncomingOutcome> {
   if (d.isStopping?.()) return "retry";
-  // file_share is the only subtype we let through — it carries user attachments.
-  if ((msg.subtype && msg.subtype !== "file_share") || msg.bot_id) return "ignored";
-  if (!msg.user || msg.user !== d.config.ownerSlackUserId) return "ignored";
+  if (!isOwnerInput(msg, d.config.ownerSlackUserId)) return "ignored";
 
   const threadKey = d.state.threadKey(msg.channel, threadRootTs(msg));
   const parsed = parseBackslash(cleanMentionText(slackToPlain(msg.text ?? "")));
@@ -186,7 +200,7 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps, contex
     generation: d.state.bindingGeneration(threadKey) } };
   try {
     d.state.markThreadSeen(threadKey, msg.ts);
-    if (context.source === "live" && !parsed) d.state.noteLiveIntent(threadKey);
+    if (context.source === "live" && (!parsed || cmd === "run")) d.state.noteLiveIntent(threadKey);
     const outcome = await processMessage(msg, d, attempt);
     d.state.initializeHistory(threadKey, msg.ts === threadRootTs(msg) ? prevTs(msg.ts) : threadRootTs(msg));
     d.state.markThreadSeen(threadKey, msg.ts);
@@ -218,6 +232,11 @@ export async function handleIncomingMessage(msg: SlackMsg, d: BridgeDeps, contex
 
 async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingAttempt): Promise<"accepted" | "uncertain" | "retry"> {
   const threadKey = d.state.threadKey(msg.channel, threadRootTs(msg));
+  const { retryText } = attempt.context;
+  if (retryText) { // ↻ Retry: already-plain stored text; the button tap is the owner's explicit intent
+    void reactLogged(d.render, msg.channel, msg.ts, "eyes");
+    return runPrompt(retryText, msg, d, attempt);
+  }
 
   const raw = msg.text ?? "";
   const explicitMention = raw.includes(`<@${d.botUserId}>`);
@@ -280,7 +299,9 @@ async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingA
     d.state.setThread(threadKey, { ...thread, hushed: false });
   }
 
-  if (parsed) {
+  // \run (D1): a known saved prompt leaves the command path for the prompt path below.
+  const saved = cmd === "run" && d.prompts ? expandSavedPrompt(d.prompts, parsed!.args) : undefined;
+  if (parsed && saved === undefined) {
     checkSubmission(msg, d, attempt);
     const rebinds = getCommand(cmd!)?.rebinds;
     const replacement = rebinds === "always" || (!!parsed.args && rebinds === "withArgs");
@@ -303,12 +324,18 @@ async function processMessage(msg: SlackMsg, d: BridgeDeps, attempt: ProcessingA
     }
     return "accepted";
   }
+  // \new --wt / \fork --wt: no prompt runs until the thread is bound to its new worktree.
+  if (isPreparingWorktree(threadKey)) {
+    attempt.effectsStarted = true;
+    await d.render.post(msg.channel, threadRootTs(msg), STILL_PREPARING, undefined, { unfurl: false, lane: "interactive" });
+    return "accepted";
+  }
    if (!thread?.watchOnly) void reactLogged(d.render, msg.channel, msg.ts, "eyes");
    const fileParts = await downloadAttachments(attachments, msg, d);
   // Every attachment failed to download AND there's no real caption — warnings
   // already posted; a text-only "look at this file" prompt would mislead.
   if (attachments.length && !fileParts.length && !cleanMentionText(slackToPlain(raw)).trim()) return "accepted";
-  return runPrompt(text, msg, d, attempt, fileParts);
+  return runPrompt(saved ?? text, msg, d, attempt, fileParts);
 }
 
 /**
@@ -328,6 +355,16 @@ export async function runPickedCommand(d: BridgeDeps, channel: string, threadTs:
   }
   if (def?.rebinds) d.state.cancelRecovery(threadKey, cardTs, true);
   await execute(parsed, ctx);
+}
+
+/**
+ * ↻ Retry (D3): resend a thread's stored prompt text through the normal admission
+ * path. The clicked card's `cardTs` stands in for the owner's message: its receipt
+ * dedupes repeat taps and the run's 👀/✅ land on it. Attachments are never re-sent.
+ */
+export function retryPrompt(d: BridgeDeps, channel: string, threadTs: string, cardTs: string, text: string): Promise<IncomingOutcome> {
+  return handleIncomingMessage({ channel, ts: cardTs, thread_ts: threadTs, user: d.config.ownerSlackUserId },
+    d, { source: "live", retryText: text });
 }
 
 /** Download Slack file attachments and convert to OpenCode data-URI file parts.
@@ -396,6 +433,7 @@ function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = nul
     threadTs,
     threadKey,
     permissions: d.permissions,
+    prompts: d.prompts,
     questions: d.questions,
     resumeQuestions: d.resumeQuestions,
     ownerDm: msg.channel === d.ownerDmChannel?.(),
@@ -412,8 +450,9 @@ function buildCtx(msg: SlackMsg, d: BridgeDeps, thread: ThreadState | null = nul
       // for — they jump ahead of queued background stream traffic (issue #5).
       await d.render.post(msg.channel, threadTs, extra, blocks, { unfurl: false, lane: "interactive" });
     },
-    uploadToThread: async (filename, content) => {
-      await d.render.upload({ channelId: msg.channel, threadTs, filename, content, lane: "interactive" });
+    uploadToThread: async (filename, content, comment) => {
+      await d.render.upload({ channelId: msg.channel, threadTs, filename,
+        ...(typeof content === "string" ? { content } : { file: content }), comment, lane: "interactive" });
     },
     react: async (name, add = true) => {
       await reactLogged(d.render, msg.channel, msg.ts, name, add);
@@ -558,9 +597,19 @@ async function runPrompt(text: string, msg: SlackMsg, d: BridgeDeps, attempt: Pr
         threadState: thread,
       });
     }
-    await view.beginPrompt(msg.ts);
+    const queued = view.isActive; // read before beginPrompt, which marks the view active
+    // Same title a fresh OpenCode session gets above; names a new native Slack session.
+    await view.beginPrompt(msg.ts, truncate(text, 60));
     if (d.isStopping?.()) return "retry";
     checkSubmission(msg, d, attempt);
+    // D3: what ↻ Retry resends if this run fails (text only, capped). A prompt queued behind the
+    // active run is parked on the view until OpenCode delivers it, so it can't take over the
+    // running prompt's Retry.
+    const cur = d.state.getThread(threadKey);
+    const lastPrompt = cur && { text: text.slice(0, LAST_PROMPT_MAX), ts: msg.ts, sessionId: cur.sessionId,
+      ...(text.length > LAST_PROMPT_MAX ? { cut: true as const } : {}), ...(msg.files?.length ? { files: true as const } : {}) };
+    if (lastPrompt && queued) view.parkPrompt(lastPrompt);
+    else if (lastPrompt) d.state.setThread(threadKey, { ...cur, lastPrompt });
     return await sendPrompt(d, thread, text, entry.client!, threadKey, msg, attempt, fileParts);
   } finally { lease.release(); }
 }

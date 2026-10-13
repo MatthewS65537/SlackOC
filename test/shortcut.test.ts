@@ -53,11 +53,12 @@ describe("Send to OpenCode: chosen project vs. a bound source thread (#11)", () 
     };
     registerShortcut(app as never, { bridge: bridge as never, ownerSlackUserId: "U1", dmChannel: () => "D", isStopping: () => false });
     const acks: unknown[] = [];
-    const send = async (project: string, dest: "thread" | "dm") => {
+    /** `metadata` overrides the modal's pending id, e.g. one minted by a previous process. */
+    const send = async (project: string, dest: "thread" | "dm", metadata?: string) => {
       if (!view) await open({ ack: async () => {}, respond: async () => {}, shortcut: { type: "message_action", user: { id: "U1" },
         channel: { id: "C" }, trigger_id: "t", message: { ts: root, text: "Change the source file" } } });
       await submit({ ack: async (r?: unknown) => { acks.push(r); }, body: { user: { id: "U1" } }, view: {
-        private_metadata: view.private_metadata, state: { values: { project: { v: { selected_option: { value: project } } },
+        private_metadata: metadata ?? view.private_metadata, state: { values: { project: { v: { selected_option: { value: project } } },
           instructions: { v: { value: "Edit it" } }, dest: { v: { selected_option: { value: dest } } } } } } });
     };
     const bind = () => state.setThread(key, { sessionId: "ses_A", projectDir: "/proj/a", verbose: "on", createdAt: 1, lastUsedAt: 1,
@@ -93,6 +94,14 @@ describe("Send to OpenCode: chosen project vs. a bound source thread (#11)", () 
     expect(acks).toEqual([{ response_action: "errors", errors: { project: expect.stringContaining("pinned to /proj/b") } }]);
     await send("/proj/b", "thread");
     expect(submissions).toEqual([{ dir: "/proj/b", session: "ses_new" }]);
+  });
+
+  it("a submission whose source was lost (restart) keeps the modal open with a visible error (#44)", async () => {
+    const { submissions, posts, acks, send } = rig("lost");
+    await send("/proj/a", "thread", "id-from-previous-process");
+    expect(acks).toEqual([{ response_action: "errors", errors: { instructions: expect.stringMatching(/expired/) } }]);
+    expect(posts).toEqual([]);
+    expect(submissions).toEqual([]);
   });
 
   it("a DM destination still creates a fresh session in the chosen project", async () => {

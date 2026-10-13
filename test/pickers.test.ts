@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerModelSearch, registerPickerActions } from "../src/slack/pickers.js";
 import { runPickedCommand } from "../src/slack/router.js";
-import { configProviders } from "../src/opencode/client.js";
+import { retryAfterModelPick } from "../src/slack/retry.js";
+import { modelCatalog } from "../src/opencode/client.js";
 import { _resetQueueForTests } from "../src/slack/queue.js";
 
 vi.mock("../src/slack/router.js", () => ({ runPickedCommand: vi.fn(async () => {}) }));
+vi.mock("../src/slack/retry.js", () => ({ retryAfterModelPick: vi.fn(async () => null) }));
 vi.mock("../src/opencode/client.js", () => ({
-  configProviders: vi.fn(async (c: { dir: string }) => ({ default: {}, providers: [{ id: c.dir.slice(1), name: c.dir,
+  modelCatalog: vi.fn(async (c: { dir: string }) => ({ default: {}, providers: [{ id: c.dir.slice(1), name: c.dir,
     models: { [`only-in-${c.dir.slice(1)}`]: { id: `only-in-${c.dir.slice(1)}`, name: `Model for ${c.dir}` } } }] })),
 }));
 vi.mock("../src/opencode/favorites.js", async importOriginal => ({
@@ -65,7 +67,7 @@ function harness(bindings: Record<string, string> = {}) {
 const optionValues = (response: any): string[] =>
   (response.option_groups ?? [{ options: response.options }]).flatMap((g: any) => g.options.map((o: any) => o.value));
 
-beforeEach(() => { vi.mocked(runPickedCommand).mockClear(); vi.mocked(configProviders).mockClear(); });
+beforeEach(() => { vi.mocked(runPickedCommand).mockClear(); vi.mocked(modelCatalog).mockClear(); vi.mocked(retryAfterModelPick).mockClear(); });
 
 describe("picker selections (#15)", () => {
   it.each(["\\model prov/m", "\\agent build", "\\cd /work/b", "\\resume ses_9"])("runs %s against the parent thread root, not the card", async value => {
@@ -73,6 +75,17 @@ describe("picker selections (#15)", () => {
     await h.select(pickAction("C1", { ts: CARD, thread_ts: ROOT }, value));
     expect(h.updates).toEqual([expect.objectContaining({ channel: "C1", ts: CARD, blocks: [] })]);
     expect(runPickedCommand).toHaveBeenCalledWith(h.bridge, "C1", ROOT, CARD, value);
+  });
+
+  it("a Switch-model card (D3) sets the model, then reruns the failed prompt it carries", async () => {
+    const h = harness();
+    const payload = pickAction("C1", { ts: CARD, thread_ts: ROOT }, "\\model prov/m");
+    payload.actions[0] = { ...payload.actions[0]!, action_id: "pick_model", block_id: "model_retry:P1" };
+    await h.select(payload);
+    expect(runPickedCommand).toHaveBeenCalledWith(h.bridge, "C1", ROOT, CARD, "\\model prov/m");
+    expect(retryAfterModelPick).toHaveBeenCalledWith(h.bridge, "C1", ROOT, CARD, "P1", "\\model prov/m");
+    await h.select(pickAction("C1", { ts: CARD, thread_ts: ROOT }, "\\model prov/m")); // a plain \model card
+    expect(retryAfterModelPick).toHaveBeenCalledTimes(1);
   });
 
   it("routes a top-level card to its own timestamp", async () => {
@@ -115,11 +128,11 @@ describe("model search suggestions (#15)", () => {
       thread_ts: args.channel === "C3" ? ROOT : otherRoot }], has_more: false }));
     const c = await h.search(suggestion("C3", ""));
     const d = await h.search(suggestion("C4", ""));
-    await h.search(suggestion("C3", "only")); // cached root and catalog
+    await h.search(suggestion("C3", "only")); // cached root; the catalog cache lives in the client layer
     expect(optionValues(c)).toEqual(["\\model proj-c/only-in-proj-c"]);
     expect(optionValues(d)).toEqual(["\\model proj-d/only-in-proj-d"]);
     expect(h.replies.mock.calls.map(([a]) => [a.channel, a.ts])).toEqual([["C3", CARD], ["C4", CARD]]);
-    expect(configProviders).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(modelCatalog).mock.calls.map(([c]) => (c as unknown as { dir: string }).dir)).toEqual(["/proj-c", "/proj-d", "/proj-c"]);
   });
 
   it("falls back like \\model only for a known-but-unbound thread", async () => {

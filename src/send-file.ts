@@ -7,9 +7,12 @@ import { CONFIG_DIR, CONFIG_PATH, OWNER_ID_RE, STATE_PATH } from "./config.js";
 import { withDeadline, type RequestOptions } from "./http.js";
 import { slackWebClientOptions, SLACK_UPLOAD_TIMEOUT_MS, withSlackOperation } from "./slack/transport.js";
 import { safePayload } from "./slack/tool-format.js";
+import { esc } from "./util.js";
+import { HeadlessError, htmlToPdf, withServedHtml, withTempDir, type HeadlessOptions } from "./headless.js";
 
 export const MAX_SEND_FILE_BYTES = 50 * 1024 * 1024;
-export interface SendFileOptions { file: string; session: string; comment?: string }
+/** `noPdf` (`--no-pdf`) sends .html/.htm source only, without the rendered PDF. */
+export interface SendFileOptions { file: string; session: string; comment?: string; noPdf?: boolean }
 export interface FileReceipt {
   ok: true;
   sessionId: string;
@@ -18,9 +21,13 @@ export interface FileReceipt {
   fileId: string;
   filename: string;
   bytes: number;
+  /** PDF rendered from an .html/.htm send, posted in the same message. */
+  pdf?: { fileId: string; filename: string; bytes: number };
+  /** Why an .html/.htm send went out without its PDF (the send itself succeeded). */
+  pdfSkipped?: string;
 }
 interface Binding { key: string; session: string; channel: string; threadTs: string; project: string; generation: number; intent: number }
-interface SendFileDeps extends RequestOptions { configPath?: string; statePath?: string }
+interface SendFileDeps extends RequestOptions { configPath?: string; statePath?: string; headless?: Omit<HeadlessOptions, "signal"> }
 class FileSendError extends Error {}
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -30,10 +37,16 @@ function record(value: unknown): value is Record<string, unknown> {
 /** This command deliberately has no implicit destination or permissive positional arguments. */
 export function parseSendFileArgs(argv: string[]): SendFileOptions {
   const flags: Record<string, string> = {};
+  let noPdf = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
+    if (arg === "--no-pdf") {
+      if (noPdf) throw new FileSendError("duplicate flag --no-pdf");
+      noPdf = true;
+      continue;
+    }
     const match = /^--(file|session|comment)(?:=(.*))?$/s.exec(arg);
-    if (!match) throw new FileSendError("usage: slackoc send-file --file </absolute/path> --session <session-id> [--comment <text>]");
+    if (!match) throw new FileSendError("usage: slackoc send-file --file </absolute/path> --session <session-id> [--comment <text>] [--no-pdf]");
     const name = match[1]!;
     if (name in flags) throw new FileSendError(`duplicate flag --${name}`);
     const value = match[2] ?? argv[++i];
@@ -41,7 +54,7 @@ export function parseSendFileArgs(argv: string[]): SendFileOptions {
     flags[name] = value;
   }
   if (!flags.file || !flags.session) throw new FileSendError("--file and --session are required; files are sent only to the session's existing Slack thread");
-  return { file: flags.file, session: flags.session, ...(flags.comment === undefined ? {} : { comment: flags.comment }) };
+  return { file: flags.file, session: flags.session, ...(flags.comment === undefined ? {} : { comment: flags.comment }), ...(noPdf ? { noPdf } : {}) };
 }
 
 function validateOptions(opts: SendFileOptions): void {
@@ -93,7 +106,8 @@ const SECRET_DIRS = [".ssh", ".aws", ".gnupg", ".kube", ".docker", join(".config
 const SECRET_FILES = /^(id_[a-z0-9]+(\.pub)?|.*\.(pem|p12|pfx)|\.env(\..+)?|\.netrc|\.npmrc|\.pypirc|credentials(\.json)?)$/i;
 
 /** Refuse SlackOC's own token file/dir and common credential stores (symlinks resolved). */
-async function assertNotSecret(file: string, configPath: string): Promise<void> {
+/** Refuses SlackOC config/state, credential dirs and secret-named files (also render.ts postFilePart). */
+export async function assertNotSecret(file: string, configPath: string = CONFIG_PATH): Promise<void> {
   let resolved: string;
   try { resolved = await realpath(file); } catch { throw new FileSendError("File is missing or unreadable"); }
   const home = homedir();
@@ -106,8 +120,9 @@ async function assertNotSecret(file: string, configPath: string): Promise<void> 
   }
 }
 
-/** Nonblocking open rejects FIFOs/devices; descriptor checks and one extra byte bound growth. */
-async function fileBytes(path: string, signal?: AbortSignal): Promise<Buffer> {
+/** Nonblocking open rejects FIFOs/devices; descriptor checks and one extra byte bound growth.
+ * Also the bounded reader for model-produced `file:` parts (render.ts postFilePart). */
+export async function fileBytes(path: string, signal?: AbortSignal): Promise<Buffer> {
   let handle;
   try { handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK); }
   catch { throw new FileSendError("File is missing or unreadable"); }
@@ -136,17 +151,37 @@ async function fileBytes(path: string, signal?: AbortSignal): Promise<Buffer> {
   } finally { await handle.close(); }
 }
 
-function completedFile(response: unknown): string {
-  // filesUploadV2 wraps completeUploadExternal responses, not the files themselves.
+function completedFiles(response: unknown, count: number): string[] {
+  // filesUploadV2 wraps completeUploadExternal responses, not the files themselves. One
+  // destination + comment means one completion listing every file in upload order.
   if (!record(response) || response.ok !== true || !Array.isArray(response.files) || response.files.length !== 1) {
     throw new FileSendError("Slack upload completion was not confirmed; delivery may already have occurred. Check the thread before retrying");
   }
   const completion = response.files[0];
-  const file = record(completion) && completion.ok === true && Array.isArray(completion.files) && completion.files.length === 1 ? completion.files[0] : undefined;
-  if (!record(file) || typeof file.id !== "string" || !/^F[A-Z0-9]+$/.test(file.id)) {
+  const files = record(completion) && completion.ok === true && Array.isArray(completion.files) && completion.files.length === count ? completion.files : [];
+  const ids = files.map(file => record(file) && typeof file.id === "string" && /^F[A-Z0-9]+$/.test(file.id) ? file.id : "");
+  if (!ids.length || ids.includes("")) {
     throw new FileSendError("Slack did not return a confirmed file ID; delivery may already have occurred. Check the thread before retrying");
   }
-  return file.id;
+  return ids;
+}
+
+/**
+ * Render an .html/.htm send to PDF with headless Chrome. Never fails the send: problems become a skip reason.
+ * Renders the already-checked bytes over loopback, never the file path (see withServedHtml).
+ */
+async function renderPdf(html: Buffer, deps: SendFileDeps): Promise<{ data: Buffer } | { skipped: string }> {
+  try {
+    return { data: await withTempDir(async dir => {
+      const out = join(dir, "render.pdf");
+      await withServedHtml(html, url => htmlToPdf(url, out, { ...deps.headless, signal: deps.signal }));
+      return fileBytes(out, deps.signal); // same 50 MiB/regular-file guards as the source
+    }) };
+  } catch (error) {
+    deps.signal?.throwIfAborted();
+    if (error instanceof HeadlessError) return { skipped: error.message };
+    return { skipped: error instanceof FileSendError ? `rendered PDF rejected: ${error.message}` : "PDF rendering failed" };
+  }
 }
 
 function uploadError(error: unknown): Error {
@@ -181,9 +216,17 @@ export async function sendFile(opts: SendFileOptions, deps: SendFileDeps = {}): 
     throw new FileSendError("SlackOC configuration is invalid; run slackoc init first");
   }
   const filename = basename(opts.file);
+  const started = Date.now();
+  // HTML goes out with a PDF rendering first in the same message (readable on a phone); --no-pdf opts out.
+  const pdf = /\.html?$/i.test(filename) && !opts.noPdf ? await renderPdf(data, deps) : undefined;
+  const pdfName = filename.replace(/\.html?$/i, ".pdf");
+  const uploads = [...(pdf && "data" in pdf ? [{ file: pdf.data, filename: pdfName, title: pdfName }] : []), { file: data, filename, title: filename }];
+  const comment = [opts.comment ? safePayload(opts.comment) : "", pdf && "skipped" in pdf ? `No PDF: ${esc(pdf.skipped)}.` : ""].filter(Boolean).join("\n");
+  // Rendering spends from the same budget, keeping the whole CLI inside the plugin's 125 s deadline.
+  const timeoutMs = Math.max(1, (deps.timeoutMs ?? SLACK_UPLOAD_TIMEOUT_MS) - (Date.now() - started));
   let bindingFailure: FileSendError | undefined;
   try {
-    return await withDeadline(signal => withSlackOperation(signal, deps.timeoutMs ?? SLACK_UPLOAD_TIMEOUT_MS, async () => {
+    return await withDeadline(signal => withSlackOperation(signal, timeoutMs, async () => {
       await assertBinding(statePath, binding);
       const client = new WebClient(config.slackBotToken as string, {
         ...slackWebClientOptions,
@@ -200,11 +243,15 @@ export async function sendFile(opts: SendFileOptions, deps: SendFileDeps = {}): 
         },
       });
       const response = await client.filesUploadV2({ channel_id: binding.channel, thread_ts: binding.threadTs,
-        filename, title: filename, file: data, ...(opts.comment ? { initial_comment: safePayload(opts.comment) } : {}) });
+        file_uploads: uploads, ...(comment ? { initial_comment: comment } : {}) });
       signal.throwIfAborted();
-      return { ok: true, sessionId: opts.session, channelId: binding.channel, threadTs: binding.threadTs,
-        fileId: completedFile(response), filename, bytes: data.length };
-    }), { signal: deps.signal, timeoutMs: deps.timeoutMs ?? SLACK_UPLOAD_TIMEOUT_MS }, "file upload");
+      const ids = completedFiles(response, uploads.length);
+      const receipt: FileReceipt = { ok: true, sessionId: opts.session, channelId: binding.channel, threadTs: binding.threadTs,
+        fileId: ids.at(-1)!, filename, bytes: data.length };
+      if (pdf && "data" in pdf) receipt.pdf = { fileId: ids[0]!, filename: pdfName, bytes: pdf.data.length };
+      if (pdf && "skipped" in pdf) receipt.pdfSkipped = pdf.skipped;
+      return receipt;
+    }), { signal: deps.signal, timeoutMs }, "file upload");
   } catch (error) { throw uploadError(bindingFailure ?? error); }
 }
 

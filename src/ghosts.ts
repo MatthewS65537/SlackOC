@@ -6,7 +6,9 @@
  * instance (or a zombie connection Slack hasn't reaped) sharing the token is
  * invisible by query. It is NOT invisible by behavior: every message the
  * catch-up sweep replays is proof an envelope failed to arrive live, while
- * the socket listeners count what DID arrive. A zombie steals everything
+ * the socket listener counts the owner messages that DID arrive (start.ts
+ * filters with router's isOwnerInput, the same rule the sweeps use, so bot
+ * echoes and edits can't outvote the replays). A zombie steals everything
  * (live = 0); a competing instance steals a share (live > 0 but replays > 0).
  * A healthy bridge replays ~nothing but benign races.
  *
@@ -29,7 +31,7 @@ export class GhostDetector {
   private replays: number[] = [];
   private lastWarnAt = 0;
 
-  /** The socket delivered an envelope live. */
+  /** The socket delivered an owner message live. */
   noteLive(now = Date.now()): void {
     this.live.push(now);
   }

@@ -3,9 +3,9 @@
  * requests use @opencode/client with service authentication and locations.
  */
 
-import { OpenCode, type OpenCodeClient, type SessionMessageInfo, type SessionStatsInfo, type SessionStatsInput } from "@opencode/client";
+import { OpenCode, type OpenCodeClient, type SessionMessageInfo, type SessionMessageShell, type SessionStatsInfo, type SessionStatsInput, type V2Event, type WorktreeDirectory } from "@opencode/client";
 import { normalizeForm, formAnswer, normalizeMessages, V2Events } from "./v2.js";
-import { abortableFetch, COMMAND_TIMEOUT_MS, type RequestOptions } from "../http.js";
+import { abortableFetch, COMMAND_TIMEOUT_MS, SLOW_REQUEST_TIMEOUT_MS, type RequestOptions } from "../http.js";
 import { normalizePermission } from "./api.js";
 import type {
   OCClient,
@@ -48,6 +48,32 @@ export interface ClientOptions extends RequestOptions {
   onRequest?: () => () => void;
 }
 
+/**
+ * sessionID → the model ("provider/id[#variant]") and agent promptAsync last
+ * switched it to, so unchanged overrides skip the switch call. Module-level so
+ * the shared event stream can invalidate it (noteSelection): the TUI or another
+ * client may switch the session in between (#46).
+ */
+const modelSettings = new Map<string, { model?: string; agent?: string }>();
+
+/**
+ * Forget a cached selection that a session.model/agent.selected event contradicts.
+ * Our own switch's echo matches and keeps the cache (else every prompt would switch);
+ * an echo that only adds a variant to a variant-less override counts as a match.
+ */
+function noteSelection(event: V2Event): void {
+  if (event.type !== "session.model.selected" && event.type !== "session.agent.selected") return;
+  const known = modelSettings.get(event.data.sessionID);
+  if (!known) return;
+  if (event.type === "session.agent.selected") {
+    if (known.agent !== event.data.agent) known.agent = undefined;
+    return;
+  }
+  const { providerID, id, variant } = event.data.model;
+  const base = `${providerID}/${id}`;
+  if (known.model !== base && known.model !== `${base}#${variant}`) known.model = undefined;
+}
+
 export function makeClient(baseUrl: string, options: ClientOptions = {}): OCClient {
   const native = readableErrors(OpenCode.make({ baseUrl, headers: options.headers, fetch: async (input, init) => {
     let request = new Request(input, init);
@@ -64,7 +90,10 @@ export function makeClient(baseUrl: string, options: ClientOptions = {}): OCClie
     }
     if (new URL(request.url).pathname === "/api/event") return fetchHeaders(request, EVENT_CONNECT_TIMEOUT_MS);
     const release = options.onRequest?.();
-    const timeoutMs = new URL(request.url).pathname.endsWith("/command") ? COMMAND_TIMEOUT_MS : options.timeoutMs;
+    const path = new URL(request.url).pathname;
+    // A session shell (\!) or a worktree's setup script may hold the request for minutes.
+    const timeoutMs = path.endsWith("/command") ? COMMAND_TIMEOUT_MS
+      : path.endsWith("/shell") || path.startsWith("/api/worktree") ? SLOW_REQUEST_TIMEOUT_MS : options.timeoutMs;
     try {
       const response = await abortableFetch(request, {}, { ...options, timeoutMs });
       // Only a credential/endpoint change warrants rediscovery. A 5xx or a slow
@@ -80,7 +109,6 @@ export function makeClient(baseUrl: string, options: ClientOptions = {}): OCClie
   const location = options.directory ? { directory: options.directory } : undefined;
   const normalizeSession = (s: Awaited<ReturnType<OpenCodeClient["session"]["get"]>>): OcSession =>
     ({ ...s, directory: s.location.directory, title: s.title ?? "" });
-  const modelSettings = new Map<string, { model?: string; agent?: string }>();
   return { v2: native, directory: options.directory,
     session: {
       create: async ({ body, signal } = {}) => normalizeSession(await native.session.create({ title: body?.title, location }, { signal })),
@@ -329,12 +357,37 @@ export async function permRespond(
 }
 
 export interface ProvidersInfo {
-  providers: Array<{ id: string; name: string; models: Record<string, { id: string; name: string; capabilities?: { reasoning?: boolean } }> }>;
+  providers: Array<{ id: string; name: string; models: Record<string, { id: string; name: string; capabilities?: { reasoning?: boolean }; limit?: { context?: number } }> }>;
   default: Record<string, string>;
 }
 
 export async function configProviders(c: OCClient, signal?: AbortSignal): Promise<ProvidersInfo> {
   return data(c.config.providers({ signal }));
+}
+
+/**
+ * Per-directory model catalog cache (60 s): the `\model` search card asks on every
+ * keystroke and Slack drops an options response after 3 s; render.ts reads each
+ * step's `limit.context` from it (E3). Concurrent callers share one fetch; a failed
+ * fetch is not cached.
+ */
+const CATALOG_TTL_MS = 60_000;
+const catalogs = new Map<string, { info: Promise<ProvidersInfo>; at: number }>();
+
+export function modelCatalog(c: OCClient): Promise<ProvidersInfo> {
+  const key = c.directory ?? "";
+  const hit = catalogs.get(key);
+  if (hit && Date.now() - hit.at <= CATALOG_TTL_MS) return hit.info;
+  const info = configProviders(c);
+  catalogs.set(key, { info, at: Date.now() });
+  info.catch(() => { if (catalogs.get(key)?.info === info) catalogs.delete(key); });
+  return info;
+}
+
+/** A model's context window (tokens) from the catalog; undefined when unlisted or unset. */
+export function contextLimit(info: ProvidersInfo, providerID: string, modelID: string): number | undefined {
+  const limit = info.providers.find((p) => p.id === providerID)?.models[modelID]?.limit?.context;
+  return typeof limit === "number" && limit > 0 ? limit : undefined;
 }
 
 /** Raw server config — `model` is the configured default ("provider/model") when set. */
@@ -372,6 +425,51 @@ export async function sessionStats(c: OCClient, input: SessionStatsInput & { sig
 
 export async function projectId(c: OCClient, signal?: AbortSignal): Promise<string> {
   return data(c.projectId({ signal }));
+}
+
+/** V2 `vcs.get`: the location's checked-out branch (undefined when OpenCode reports none). */
+export async function vcsBranch(c: OCClient, signal?: AbortSignal): Promise<string | undefined> {
+  return (await c.v2!.vcs.get({ location: c.directory ? { directory: c.directory } : undefined }, { signal })).data.branch.current;
+}
+
+/**
+ * Run one shell command in the session's folder, no model (`\!`). Output arrives
+ * as `session.shell.ended` (v2.ts → "session.shell") and joins the session's context.
+ */
+export async function sessionShell(c: OCClient, id: string, command: string, signal?: AbortSignal): Promise<void> {
+  await c.v2!.session.shell({ sessionID: id, command }, { signal });
+}
+
+/** The session's newest shell messages (newest first): `\!`'s fallback when the ended event was lost. */
+export async function shellMessages(c: OCClient, id: string, signal?: AbortSignal): Promise<SessionMessageShell[]> {
+  const page = await c.v2!.message.list({ sessionID: id, type: "shell", order: "desc", limit: 5 }, { signal });
+  return page.data.filter((m): m is SessionMessageShell => m.type === "shell");
+}
+
+/** Point a session at another directory of its project (a worktree); applies at OpenCode's next delivery boundary. */
+export async function sessionMove(c: OCClient, id: string, directory: string, signal?: AbortSignal): Promise<void> {
+  await c.v2!.session.move({ sessionID: id, directory }, { signal });
+}
+
+/** Declared worktree failures arrive as plain `{ name: "WorktreeError", data }` bodies: make them Errors. */
+function worktreeFailure(err: unknown): never {
+  const d = (err as { name?: unknown; data?: { message?: string; forceRequired?: boolean } })?.data;
+  if (!(err instanceof Error) && d?.message) throw Object.assign(new Error(d.message), { forceRequired: d.forceRequired === true });
+  throw err;
+}
+
+export async function worktreeList(c: OCClient, projectID: string, signal?: AbortSignal): Promise<WorktreeDirectory[]> {
+  return c.v2!.worktree.list({ projectID }, { signal }).catch(worktreeFailure);
+}
+
+/** Isolated checkout via the project's canonical strategy; runs its setup script, so it can take minutes. */
+export async function worktreeCreate(c: OCClient, projectID: string, branch?: string, signal?: AbortSignal): Promise<string> {
+  return (await c.v2!.worktree.create({ projectID, ...(branch ? { branch } : {}) }, { signal }).catch(worktreeFailure)).directory;
+}
+
+/** Rejects with `forceRequired` when OpenCode wants `force` (e.g. uncommitted changes). */
+export async function worktreeRemove(c: OCClient, projectID: string, directory: string, force: boolean, signal?: AbortSignal): Promise<void> {
+  await c.v2!.worktree.remove({ projectID, directory, force }, { signal }).catch(worktreeFailure);
 }
 
 /** GET /api/permission/request — pending permissions in this location. */
@@ -424,11 +522,13 @@ async function fetchHeaders(request: Request, timeoutMs: number): Promise<Respon
 /** V2 subscriptions are live-only. The pool owns resubscription and reconciliation.
  * One adapter per subscription is safe: it only streams parts whose `*.started` it saw,
  * so a part already in flight at (re)subscribe waits for its full-text `*.ended` (#27).
+ * Step parents and step.started info (model) outlive the adapter (shared in v2.ts), so they survive a resubscribe.
  * `onActivity` fires for every transport read, keepalives included — the pool's idle watchdog. */
 export async function* clientEvents(client: OCClient, signal: AbortSignal, onActivity?: () => void): AsyncGenerator<OcEvent> {
   const adapter = new V2Events();
   for await (const event of client.v2!.event.subscribe({ signal, onActivity })) {
     onActivity?.();
+    noteSelection(event);
     for (const mapped of adapter.translate(event)) yield { ...mapped, directory: event.location?.directory };
   }
 }

@@ -81,7 +81,9 @@ export class Scheduler {
         const existing = store.run(id);
         if (!existing) {
           if (now - latest > SCHEDULE_GRACE_MS) store.skipOccurrence(job.id, latest, "Missed occurrence outside the 2-hour grace window.");
-          else if (store.runs().some(r => isGenerationActive(r, now))) store.skipOccurrence(job.id, latest, "Skipped overlap with another generating or uncertain scheduled report.");
+          // Defer (#34): no record and the pointer stays put, so a later poll claims this occurrence once
+          // the active report ends (still within grace). One report generates at a time; past grace it skips above.
+          else if (store.runs().some(r => isGenerationActive(r, now))) continue;
           else store.claim(job.id, latest);
         }
         // Claims precede advancing the pointer; their stable keys survive a crash between commits.

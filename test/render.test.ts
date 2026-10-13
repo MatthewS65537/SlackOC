@@ -10,11 +10,16 @@ import {
   getView,
   hasActiveViewForProject,
   reconcileStaleViews,
+  contextPercent,
+  sessionContextPct,
   type RenderDeps,
 } from "../src/slack/render.js";
-import { StateStore } from "../src/state.js";
+import { StateStore, type ThreadState } from "../src/state.js";
 import type { OCClient } from "../src/opencode/api.js";
 import { enqueue, queueDepth, _resetQueueForTests } from "../src/slack/queue.js";
+import { mkdirSync, rmSync as rmFixture, truncateSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+import { MAX_SEND_FILE_BYTES } from "../src/send-file.js";
 
 interface CallLog {
   posted: string[];
@@ -497,6 +502,82 @@ describe("SessionView section dividers", () => {
     expect(log.posted).toEqual(["⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 `ls`", "⎯⎯⎯ response ⎯⎯⎯"]);
     expect(log.uploads.length).toBe(2);
     deleteView("sess-div-g");
+  });
+});
+
+describe("model file parts are bounded like send-file (#42)", () => {
+  const filePart = (url: string) => ({ type: "message.part.updated",
+    properties: { part: { id: `f-${url.length}`, messageID: "fm", type: "file", mime: "image/png", filename: "huge.png", url } } }) as never;
+
+  it("refuses a file: part over 50 MiB without reading it", async () => {
+    const dir = join(import.meta.dirname, ".fixtures", "render-file-guard");
+    const big = join(dir, "huge.png");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(big, "");
+    truncateSync(big, MAX_SEND_FILE_BYTES + 1); // sparse: no real disk use
+    const log = blank();
+    const v = makeView(log, "sess-file-big", { verbose: "on" });
+    try {
+      await v.handle(filePart(pathToFileURL(big).href));
+      expect(log.uploads).toEqual([]);
+      expect(log.posted.at(-1)).toMatch(/couldn't display huge\.png .*50 MiB/);
+    } finally {
+      deleteView("sess-file-big");
+      rmFixture(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a file: part pointing at a secret, like slackoc_send_file does", async () => {
+    const dir = join(import.meta.dirname, ".fixtures", "render-file-secret");
+    const secret = join(dir, ".env");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(secret, "API_KEY=x");
+    const log = blank();
+    const v = makeView(log, "sess-file-secret", { verbose: "on" });
+    try {
+      await v.handle(filePart(pathToFileURL(secret).href));
+      expect(log.uploads).toEqual([]);
+      expect(log.posted.at(-1)).toMatch(/couldn't display huge\.png .*credentials/);
+    } finally {
+      deleteView("sess-file-secret");
+      rmFixture(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("cuts off an http part that streams past the cap instead of buffering it", async () => {
+    let pulls = 0;
+    const chunk = new Uint8Array(1024 * 1024);
+    vi.stubGlobal("fetch", async () => new Response(new ReadableStream({ pull: (c) => { pulls++; c.enqueue(chunk); } })));
+    const log = blank();
+    const v = makeView(log, "sess-file-http", { verbose: "on" });
+    try {
+      await v.handle(filePart("https://files.example/huge.png"));
+      expect(log.uploads).toEqual([]);
+      expect(log.posted.at(-1)).toContain("50 MiB");
+      expect(pulls).toBeLessThan(60); // stopped at the cap, not at end of stream
+    } finally {
+      vi.unstubAllGlobals();
+      deleteView("sess-file-http");
+    }
+  });
+});
+
+describe("finalize diffstat from the session diff (0.2a)", () => {
+  it("totals session.diff into the finalize line and offers 📄 View changes", async () => {
+    const log = blank();
+    const blocks: Array<unknown[] | undefined> = [];
+    const deps = fakeDeps(log);
+    const post = deps.post;
+    deps.post = (c, t, text, b, o) => { blocks.push(b); return post(c, t, text, b, o); };
+    const client = { session: { ...stubClient().session, diff: async () => ({ data: [
+      { file: "a.ts", patch: "", additions: 3, deletions: 1 },
+      { file: "b.ts", patch: "", additions: 2, deletions: 0 },
+    ] }) } } as never;
+    const v = makeView(log, "sess-diffstat", { client, deps });
+    await v.finalize();
+    expect(log.posted.at(-1)).toMatch(/^\*p\* · \+5\/−1 across 2 file\(s\) · /);
+    expect(JSON.stringify(blocks.at(-1))).toContain("View changes");
+    deleteView("sess-diffstat");
   });
 });
 
@@ -1338,7 +1419,7 @@ describe("active-run snapshot (RQ1)", () => {
     await getView("sess-runs-a")!.beginPrompt("111.702"); // queued behind the first
     const runs = describeActiveRuns();
     expect(runs).toEqual([
-      { projectDir: "/p", sessionId: "sess-runs-a", threadKey: "C1:T1", elapsedMs: expect.any(Number), queued: 1 },
+      { projectDir: "/p", sessionId: "sess-runs-a", threadKey: "C1:T1", elapsedMs: expect.any(Number), queued: 1, watching: false },
     ]);
     deleteView("sess-runs-a");
   });
@@ -1588,8 +1669,12 @@ describe("SessionView strict-bottom progress message (#6)", () => {
 // \watch mode: SessionView.attach()
 
 import { join } from "node:path";
+import { rmSync } from "node:fs";
+import { afterAll } from "vitest";
 
 const WATCH_FIXTURES = join(import.meta.dirname ?? __dirname, ".fixtures", "watch");
+// Each watchView() gets a random state dir; drop them all once the file is done.
+afterAll(() => rmSync(WATCH_FIXTURES, { recursive: true, force: true }));
 
 function watchView(
   log: CallLog,
@@ -1862,5 +1947,151 @@ describe("SessionView.settle (barrier before interaction cards)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("native Slack agent-session status (A1)", () => {
+  /** fakeDeps plus a sessionStatus recorder: "status" or "status:title". */
+  function nativeDeps(log: CallLog, calls: string[]): RenderDeps {
+    return { ...fakeDeps(log), sessionStatus: async (_c, _t, status, opts) => void calls.push(opts?.title ? `${status}:${opts.title}` : status) };
+  }
+  const tool = { type: "message.part.updated", properties: { part: { id: "nt1", type: "tool", tool: "bash", callID: "nc1", state: { status: "running", input: { command: "npm test" } } } } };
+  const answer = { type: "message.part.updated", properties: { part: { id: "nx1", messageID: "nm", type: "text", text: "All green.", time: { end: 1 } } } };
+
+  it("sends exactly processing → suspended → processing → active for prompt → question → answer → finish", async () => {
+    const log = blank();
+    const calls: string[] = [];
+    const v = makeView(log, "sess-native-a", { verbose: "on", deps: nativeDeps(log, calls) });
+    await v.beginPrompt("111.n1", "Fix the login bug");
+    await v.handle({ type: "session.status", properties: { status: { type: "busy" } } } as never);
+    await v.handle(tool as never);
+    expect(calls).toEqual(["processing:Fix the login bug"]);
+    v.setWaiting("q1", "question", true);
+    v.setWaiting("p1", "permission", true); // a second ask while already waiting
+    v.setWaiting("q1", "question", false); // the approval still waits
+    expect(calls).toEqual(["processing:Fix the login bug", "suspended"]);
+    v.setWaiting("p1", "permission", false);
+    await v.handle(answer as never);
+    expect(calls).toEqual(["processing:Fix the login bug", "suspended", "processing"]);
+    await v.handle({ type: "session.idle", properties: {} } as never);
+    expect(calls).toEqual(["processing:Fix the login bug", "suspended", "processing", "active"]);
+    expect(log.posted.some((p) => p.includes("All green."))).toBe(true);
+  });
+
+  it("re-sends processing every 50 min during a long run, and not after it ends", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = blank();
+      const calls: string[] = [];
+      const v = makeView(log, "sess-native-b", { deps: nativeDeps(log, calls) });
+      await v.beginPrompt("111.n2");
+      await vi.advanceTimersByTimeAsync(2 * 50 * 60_000 + 1_000); // Slack times processing out after 1 h
+      expect(calls).toEqual(["processing", "processing", "processing"]);
+      await v.finalize();
+      await vi.advanceTimersByTimeAsync(2 * 50 * 60_000);
+      expect(calls).toEqual(["processing", "processing", "processing", "active"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a run torn down without finalize (rebind) still ends Working…", async () => {
+    const log = blank();
+    const calls: string[] = [];
+    makeView(log, "sess-native-c", { deps: nativeDeps(log, calls) });
+    await getView("sess-native-c")!.beginPrompt("111.n3");
+    deleteView("sess-native-c");
+    expect(calls).toEqual(["processing", "active"]);
+  });
+});
+
+describe("context meter (E3) and failure retry buttons (D3)", () => {
+  const catalog = { default: {}, providers: [{ id: "anthropic", name: "anthropic", models: {
+    sonnet: { id: "sonnet", name: "Sonnet", limit: { context: 200_000 } }, bare: { id: "bare", name: "Bare" } } }] };
+  /** A view whose client serves `catalog` (unique dir: the catalog cache is per directory) and whose posts keep their blocks. */
+  function setup(sessionId: string, thread: Partial<ThreadState> = {}) {
+    const log = blank();
+    const posts: Array<{ text: string; blocks?: any[] }> = [];
+    const base = fakeDeps(log);
+    const deps: RenderDeps = { ...base, post: async (c, t, text, blocks, opts) => {
+      posts.push({ text, blocks: blocks as any[] | undefined });
+      return base.post(c, t, text, blocks, opts);
+    } };
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/render-${sessionId}/state.json`);
+    state.setThread("C1:T1", { sessionId, projectDir: "/p", verbose: "off", createdAt: 1, lastUsedAt: 1, ...thread });
+    const client = { directory: `/ctx-${sessionId}`, config: { providers: async () => ({ data: catalog }) } } as never;
+    const view = new SessionView({ sessionId, projectDir: "/p", channel: "C1", threadTs: "T1", threadKey: "C1:T1",
+      client, deps, state, threadState: state.getThread("C1:T1")! });
+    return { log, posts, view };
+  }
+  const step = (modelID: string, tokens: object) => ({ type: "message.updated",
+    properties: { info: { id: `m-${modelID}`, role: "assistant", providerID: "anthropic", modelID, tokens } } }) as never;
+  const failure = (name: string) => ({ type: "message.updated", properties: { info: { id: "m-fail", role: "assistant",
+    error: { name, data: { message: "upstream closed the socket" } }, time: { completed: 2 } } } }) as never;
+  const actions = (blocks?: any[]) => blocks?.find((b) => b.type === "actions")?.elements.map((e: any) => [e.action_id, e.value]);
+
+  it("contextPercent is (input + cache.read + cache.write) ÷ the window, unknown when either side is", () => {
+    expect(contextPercent({ input: 20_000, cache: { read: 64_000 } }, 200_000)).toBe(42);
+    expect(contextPercent({ input: 10, cache: { write: 50_000 } }, 200_000)).toBe(25); // a first step caching its prompt
+    expect(contextPercent({ input: 1_000 }, 4_000)).toBe(25);
+    expect(contextPercent({ input: 1_000 }, undefined)).toBeUndefined();
+    expect(contextPercent(undefined, 200_000)).toBeUndefined();
+  });
+
+  it("the finalize line always carries ctx %, and omits it for a model without a known window", async () => {
+    const known = setup("sess-ctx-a");
+    await known.view.handle(step("sonnet", { input: 20_000, output: 900, cache: { read: 64_000 } }));
+    await known.view.finalize();
+    expect(known.log.posted.at(-1)).toMatch(/↓ · ctx 42% · Silent Tools$/);
+    const unknown = setup("sess-ctx-b");
+    await unknown.view.handle(step("bare", { input: 20_000, output: 900, cache: { read: 64_000 } }));
+    await unknown.view.finalize();
+    expect(unknown.log.posted.at(-1)).not.toContain("ctx");
+    expect(sessionContextPct("sess-ctx-a")).toBe(42); // \status reads it after the run
+    expect(sessionContextPct("sess-ctx-b")).toBeUndefined();
+  });
+
+  it("the ⏳ status line shows ctx only once it reaches 80%", async () => {
+    const low = setup("sess-ctx-low");
+    const high = setup("sess-ctx-high");
+    for (const [v, read] of [[low.view, 64_000], [high.view, 150_000]] as const) {
+      await v.beginPrompt("111.ctx");
+      await v.handle(step("sonnet", { input: 20_000, output: 10, cache: { read } }));
+    }
+    await new Promise((r) => setTimeout(r, 1300)); // let the 1s status ticker fire
+    expect(low.log.updates.at(-1)).not.toContain("ctx");
+    expect(high.log.updates.at(-1)).toMatch(/[⏳⌛] .*\(\d+s\) · ctx 85%$/);
+    deleteView("sess-ctx-low");
+    deleteView("sess-ctx-high");
+  });
+
+  it("a provider failure offers ↻ Retry and Switch model…, keyed to the failed prompt", async () => {
+    const { posts, view } = setup("sess-retry-a", { lastPrompt: { text: "fix it", sessionId: "sess-retry-a", ts: "111.r1" } });
+    await view.beginPrompt("111.r1");
+    await view.handle(failure("provider.transport"));
+    const last = posts.at(-1)!;
+    expect(last.text).toBe(":x: upstream closed the socket");
+    expect(actions(last.blocks)).toEqual([["run_retry", "111.r1"], ["pick_model_retry", "111.r1"]]);
+    expect(last.blocks!.some((b) => b.type === "context")).toBe(false);
+  });
+
+  it("other failures offer Retry only, with the attachments note when the prompt had files", async () => {
+    const { posts, view } = setup("sess-retry-b", { lastPrompt: { text: "see screenshot", sessionId: "sess-retry-b", ts: "111.r2", files: true } });
+    await view.beginPrompt("111.r2");
+    await view.handle({ type: "session.error", properties: { sessionID: "sess-retry-b", error: "Run interrupted" } } as never);
+    const last = posts.at(-1)!;
+    expect(actions(last.blocks)).toEqual([["run_retry", "111.r2"]]);
+    expect(last.blocks!.at(-1)).toEqual({ type: "context", elements: [{ type: "mrkdwn", text: "Retry resends the text only — attachments aren't re-sent." }] });
+  });
+
+  it("no buttons without a stored prompt for this run (older state, or a different prompt)", async () => {
+    const none = setup("sess-retry-c");
+    await none.view.beginPrompt("111.r3");
+    await none.view.handle(failure("provider.transport"));
+    expect(none.posts.at(-1)).toEqual({ text: ":x: upstream closed the socket", blocks: undefined });
+    const other = setup("sess-retry-d", { lastPrompt: { text: "older", sessionId: "sess-retry-d", ts: "111.r0" } });
+    await other.view.beginPrompt("111.r4");
+    await other.view.handle(failure("provider.transport"));
+    expect(other.posts.at(-1)!.blocks).toBeUndefined();
   });
 });

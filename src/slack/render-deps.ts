@@ -4,6 +4,7 @@ import { unicodeEmoji } from "./emoji.js";
 import { enqueue } from "./queue.js";
 import { SLACK_UPLOAD_TIMEOUT_MS } from "./transport.js";
 import type { RenderDeps } from "./render.js";
+import { createSessionDeps } from "./agent-session.js";
 
 /**
  * The renderer's Slack adapter. All outbound calls go through the per-channel,
@@ -16,10 +17,13 @@ export function createRenderDeps(app: App, opts: {
   isStopping: () => boolean;
   dmChannel: () => string | null;
   viewThread: (channel: string, threadTs: string) => string;
+  /** Owner user id: the initiator of native agent sessions (agent-session.ts). */
+  owner?: string;
 }): RenderDeps {
   const { isStopping, viewThread } = opts;
   const dmChannelId = opts.dmChannel;
   return {
+    ...createSessionDeps(app, { owner: opts.owner, isStopping }),
     post: async (channel, threadTs, text, blocks, opts) => {
       if (isStopping()) throw new Error("bridge isStopping()");
       const r = await enqueue(
@@ -33,6 +37,7 @@ export function createRenderDeps(app: App, opts: {
             // System chatter (tool lines, status, summaries) stays compact —
             // no big link preview cards. Answer text keeps previews (default).
             ...(opts?.unfurl === false ? { unfurl_links: false, unfurl_media: false } : {}),
+            ...(opts?.metadata ? { metadata: opts.metadata } : {}),
           }),
         { channel, lane: opts?.lane, thread: threadTs },
       );
@@ -81,6 +86,7 @@ export function createRenderDeps(app: App, opts: {
             text: unicodeEmoji(`${text}${link}`),
             mrkdwn: true,
             ...(outBlocks ? { blocks: outBlocks } : {}),
+            ...(opts?.metadata ? { metadata: opts.metadata } : {}),
           }),
         { channel: dmChannelId()!, lane: opts?.lane, thread: "" },
       );

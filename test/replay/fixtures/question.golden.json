@@ -1,0 +1,12 @@
+[
+  "react U1 :eyes:",
+  "post M1: There are two reasonable ways to do this.",
+  "post M2: ⎯⎯⎯ tools ⎯⎯⎯\n\n❓ question",
+  "post M3 +blocks: ❓ *OpenCode has a question* — 1 to answer",
+  "update M3: ✅ Answer confirmed.",
+  "post M4: ⎯⎯⎯ response ⎯⎯⎯\n\nPatching in place, then.",
+  "post M5: The loader now reads `config.json` once and caches it.",
+  "unreact U1 :eyes:",
+  "react U1 :white_check_mark:",
+  "post M6: *project* · `anthropic/claude-sonnet-4-5` · 14s · $0.0080 · 1.8k↑/240↓ · Verbose Tools"
+]

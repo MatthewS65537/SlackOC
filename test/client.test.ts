@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { makeClient, configGet, pendingPermissions, pendingQuestions, questionReply, questionReject,
-  sessionIdle, sessionMessages, sessionStatus, promptAsync, permRespond } from "../src/opencode/client.js";
+  sessionIdle, sessionMessages, sessionStatus, promptAsync, permRespond, clientEvents, modelCatalog, contextLimit } from "../src/opencode/client.js";
 import { formAnswer, visibleQuestions, normalizeForm, normalizeMessages, V2Events } from "../src/opencode/v2.js";
 import type { FormInfo, V2Event } from "@opencode/client";
 
@@ -102,6 +102,65 @@ describe("idle evidence", () => {
   });
 });
 
+describe("model/agent override cache (#46)", () => {
+  const selected = async (type: string, data: object) => {
+    const v2 = { event: { subscribe: async function* () { yield { type, data: { sessionID: "ses_sel", ...data } }; } } };
+    for await (const _ of clientEvents({ v2 } as never, new AbortController().signal)) { /* selections map to no view event */ }
+  };
+  it("re-applies a thread's override only after the session's selection changed elsewhere", async () => {
+    const calls: string[] = [];
+    wire(r => {
+      const call = new URL(r.url).pathname.split("/").pop()!;
+      calls.push(call);
+      return call === "prompt" ? Response.json({ data: { id: "msg", sessionID: "ses_sel" } }) : new Response(null, { status: 204 });
+    });
+    const client = makeClient("http://fixture");
+    const prompt = () => promptAsync(client, "ses_sel", "hi", { model: "a/x", agent: "build" });
+    await prompt();
+    await selected("session.model.selected", { model: { providerID: "a", id: "x" } }); // our own switch's echo
+    await selected("session.agent.selected", { agent: "build" });
+    await prompt();
+    await selected("session.model.selected", { model: { providerID: "b", id: "y" } }); // switched in the TUI
+    await selected("session.agent.selected", { agent: "plan" });
+    await prompt();
+    expect(calls.filter(c => c !== "prompt")).toEqual(["agent", "model", "agent", "model"]);
+  });
+});
+
+describe("model catalog cache (E3: moved from the picker into the client layer)", () => {
+  const catalog = { default: {}, providers: [{ id: "anthropic", name: "anthropic",
+    models: { sonnet: { id: "sonnet", name: "Sonnet", limit: { context: 200_000 } }, bare: { id: "bare", name: "Bare" } } }] };
+  const fake = (directory: string, providers: () => Promise<unknown>) => ({ directory, config: { providers: vi.fn(providers) } });
+  afterEach(() => vi.useRealTimers());
+
+  it("shares one fetch per directory for 60 s, then refetches; directories never share a catalog", async () => {
+    vi.useFakeTimers();
+    const a = fake("/cat-a", async () => ({ data: catalog }));
+    const b = fake("/cat-b", async () => ({ data: { default: {}, providers: [] } }));
+    const [first, again] = await Promise.all([modelCatalog(a as never), modelCatalog(a as never)]);
+    expect(first).toBe(again);
+    expect((await modelCatalog(b as never)).providers).toEqual([]);
+    vi.advanceTimersByTime(60_001);
+    await modelCatalog(a as never);
+    expect(a.config.providers).toHaveBeenCalledTimes(2);
+    expect(b.config.providers).toHaveBeenCalledTimes(1);
+  });
+
+  it("doesn't cache a failed fetch", async () => {
+    let fail = true;
+    const c = fake("/cat-fail", async () => { if (fail) throw new Error("offline"); return { data: catalog }; });
+    await expect(modelCatalog(c as never)).rejects.toThrow("offline");
+    fail = false;
+    expect(contextLimit(await modelCatalog(c as never), "anthropic", "sonnet")).toBe(200_000);
+  });
+
+  it("reads limit.context; an unlisted model or one without a limit is unknown", () => {
+    expect(contextLimit(catalog, "anthropic", "sonnet")).toBe(200_000);
+    expect(contextLimit(catalog, "anthropic", "bare")).toBeUndefined();
+    expect(contextLimit(catalog, "openai", "sonnet")).toBeUndefined();
+  });
+});
+
 describe("native V2 event translation", () => {
   it("does not offer custom input for fixed options and preserves conditional defaults", () => {
     expect(normalizeForm(form).questions[0]?.custom).toBe(false);
@@ -155,6 +214,13 @@ describe("native V2 event translation", () => {
     const [row] = normalizeMessages([{ type: "assistant", id: "m", time: { created: 0, completed: 2_000 }, model: { id: "x", providerID: "p" },
       content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hey! Rex here." }] }] as never, "s");
     expect(row?.parts.map(p => p.id)).toEqual(["m:reasoning:0", "m:text:0"]);
+  });
+
+  it("a fresh adapter after a resubscribe still gives new steps their parentID (0.2c)", () => {
+    const step = (events: V2Events) => events.translate({ type: "session.step.started", created: 5, data: { sessionID: "ses_resub",
+      assistantMessageID: "msg_a2", started: 5, model: { id: "m", providerID: "p" } } } as V2Event)[0];
+    new V2Events().translate({ type: "session.inbox.delivered", data: { sessionID: "ses_resub", inboxID: "msg_u1" } } as V2Event);
+    expect(step(new V2Events())?.properties).toMatchObject({ info: { id: "msg_a2", parentID: "msg_u1" } });
   });
 
   it("stays silent on deltas for a part started before this subscription (#27)", () => {

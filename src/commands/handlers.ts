@@ -19,6 +19,7 @@ import {
   sessionFork,
   sessionGet,
   sessionMessages,
+  sessionMove,
   sessionStats,
   projectId,
 } from "../opencode/client.js";
@@ -28,15 +29,20 @@ import { cacheProjectList, projectListSnapshot, invalidateProjectList, invalidat
 import { canonicalDir, expandHome } from "../paths.js";
 import { chunkText, dur, esc, mdToMrkdwn, partsText, shortId, shortPath, truncate } from "../util.js";
 import type { ThreadState, VerboseMode } from "../state.js";
-import { deleteView, getView, SessionView, describeActiveRuns, finalizeViewsForProject } from "../slack/render.js";
+import { deleteView, getView, SessionView, describeActiveRuns, finalizeViewsForProject, sessionContextPct } from "../slack/render.js";
 import { droppedOpCount, oldestPendingAgeMs, queueDepth } from "../slack/queue.js";
-import { fileLogPath, logCount, newLogsSince, recentLogs } from "../log.js";
+import { fileLogPath, logCount, logErr, newLogsSince, recentLogs } from "../log.js";
 import { parsePermissionCommand } from "../slack/permissions.js";
 import { SCHEDULE_USAGE } from "../schedules/controls.js";
 import { modelSearchBlocks, pickerBlocks, revertCardBlocks, viewDiffBlocks } from "../slack/blocks.js";
 import { modelOption, orderedModels, readFavorites } from "../opencode/favorites.js";
 import { buildUnifiedDiff, formatDiffSummary } from "../slack/diff-view.js";
 import { USAGE_RANGES, dayKeys, formatUsage, parseUsageArgs, rangeStart } from "./usage.js";
+import { shotCommand } from "./shot.js";
+import { shipCommand } from "./ship.js";
+import { shellCommand } from "./shell.js";
+import { prepareWorktree, sameProject, takeWtFlag, worktreesCommand } from "./worktrees.js";
+import { runCommand, saveCommand, savedCommand, unsaveCommand } from "./prompts.js";
 
 function requireThread(ctx: CmdCtx): NonNullable<CmdCtx["thread"]> {
   if (!ctx.thread) throw new Error("no session bound to this thread yet — send a prompt first");
@@ -49,10 +55,12 @@ async function withServerLease<T>(ctx: CmdCtx, dir: string, work: (entry: PoolEn
   finally { lease.release(); }
 }
 
+/** Absolute, `~`, or relative to this thread's project (not the bridge's launch dir); must be an existing directory (#48). */
 function requireDir(ctx: CmdCtx, dir: string): string {
-  const abs = resolve(ctx.cwd, expandHome(dir));
+  const base = ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
+  const abs = resolve(base, expandHome(dir));
   const st = statSync(abs, { throwIfNoEntry: false });
-  if (!st?.isDirectory()) throw new Error(`${abs} is not a directory (use an absolute path)`);
+  if (!st?.isDirectory()) throw new Error(`${abs} is not a directory`);
   return canonicalDir(abs);
 }
 
@@ -116,6 +124,8 @@ async function rebindThread(
       return;
     }
     ctx.state.setThread(ctx.threadKey, newThreadState(sess.id, dir, ctx.state.channelVerbose(ctx.channelId)));
+    // The old binding's native Slack session ends here; the next run reopens it.
+    void ctx.render?.sessionStatus?.(ctx.channelId, ctx.threadTs, "closed");
     const kept =
       opts.teardown === false && old
         ? ` Previous session \`${shortId(old.sessionId)}\` kept — \`\\resume\` brings it back.`
@@ -129,13 +139,15 @@ async function rebindThread(
 /** Grouping + order for `\help`; every registered command must appear here. */
 export const HELP_SECTIONS: Array<{ title: string; names: string[] }> = [
   { title: "Threads & replies", names: ["hush", "listen", "verbose", "stream"] },
-  { title: "Sessions", names: ["new", "sessions", "resume", "stop", "diff", "fork", "undo"] },
+  { title: "Sessions", names: ["new", "sessions", "resume", "stop", "diff", "ship", "fork", "undo"] },
   { title: "Monitoring", names: ["watch", "unwatch", "history", "summary", "usage"] },
+  { title: "Look", names: ["shot"] },
+  { title: "Saved prompts", names: ["save", "run", "saved", "unsave"] },
   { title: "Model & agent", names: ["model", "agent"] },
-  { title: "Projects", names: ["project", "cd", "pin", "unpin"] },
+  { title: "Projects", names: ["project", "cd", "pin", "unpin", "worktrees"] },
   { title: "Notifications", names: ["notify", "schedule"] },
   { title: "Approvals & questions", names: ["permissions", "permission", "questions"] },
-  { title: "Raw OpenCode", names: ["cmd"] },
+  { title: "Raw OpenCode", names: ["cmd", "!"] },
   { title: "Bridge", names: ["status", "logs", "restart", "help"] },
 ];
 
@@ -177,10 +189,11 @@ registerCommand({
   async run(ctx) {
     const pool = ctx.pool.list();
     const th = ctx.thread;
+    const ctxPct = th ? sessionContextPct(th.sessionId) : undefined; // E3: context window used (unknown after a restart)
     const lines = [
       `*Project:* \`${ctx.state.defaultDir(ctx.channelId, ctx.cwd)}\``,
       ...(ctx.state.channelProject(ctx.channelId) ? [`*Pinned:* \`${ctx.state.channelProject(ctx.channelId)}\``] : []),
-      `*Thread:* ${th ? `session \`${shortId(th.sessionId)}\` in \`${th.projectDir}\` · verbose=\`${th.verbose}\`${th.model ? ` · model=\`${th.model}\`` : ""}${th.agent ? ` · agent=\`${th.agent}\`` : ""}${th.hushed ? " · :mute: hushed" : ""}` : "no session bound (next message creates one)"}`,
+      `*Thread:* ${th ? `session \`${shortId(th.sessionId)}\` in \`${th.projectDir}\` · verbose=\`${th.verbose}\`${th.model ? ` · model=\`${th.model}\`` : ""}${th.agent ? ` · agent=\`${th.agent}\`` : ""}${ctxPct !== undefined ? ` · ctx ${ctxPct}%` : ""}${th.hushed ? " · :mute: hushed" : ""}` : "no session bound (next message creates one)"}`,
       `*Pool:* ${pool.length ? pool.map((s) => `\`${s.dir}\` (${s.status}${s.url ? ` ${s.url}` : ""})`).join(", ") : "no servers running yet (they spawn lazily on first use)"}`,
     ];
     if (ctx.bridgeInfo) {
@@ -540,10 +553,10 @@ async function resolveProject(ctx: CmdCtx, q: string, dirs: string[]): Promise<s
   return hits[0];
 }
 
-/** Hard pin: a pinned channel refuses every project other than its own. */
-function assertUnpinned(ctx: CmdCtx, dir: string): void {
+/** Hard pin: a pinned channel refuses every project other than its own (a worktree of it counts as its own). */
+async function assertUnpinned(ctx: CmdCtx, dir: string): Promise<void> {
   const pin = ctx.state.channelProject(ctx.channelId);
-  if (pin && pin !== canonicalDir(dir)) {
+  if (pin && pin !== canonicalDir(dir) && !(await sameProject(pin, dir))) {
     throw new Error(`📌 this channel is pinned to \`${projectName(pin)}\` — \`\\unpin\` first, or use another channel.`);
   }
 }
@@ -577,7 +590,8 @@ registerCommand({
     }
     const dir = await resolveProject(ctx, q, knownProjectDirs(ctx).filter((d) => d !== canonicalDir(ctx.state.defaultDir(ctx.channelId, ctx.cwd))));
     if (!dir) return;
-    assertUnpinned(ctx, dir);
+    requireDir(ctx, dir); // a remembered project may have moved: refuse before tearing down this thread's session (#48)
+    await assertUnpinned(ctx, dir);
     ctx.state.setCurrentProject(dir);
     await rebindThread(ctx, dir, `↔ Switched to \`${projectName(dir)}\`.`);
   },
@@ -585,13 +599,13 @@ registerCommand({
 
 registerCommand({
   name: "cd", rebinds: "withArgs",
-  usage: "\\cd /abs/path",
+  usage: "\\cd <path>",
   summary: "Switch project dir (fresh session)",
-  detail: "Accepts `~` paths. Old session + server are torn down so nothing leaks between projects.",
+  detail: "Accepts absolute, `~`, or paths relative to this thread's project. Old session + server are torn down so nothing leaks between projects.",
   async run(ctx, args) {
-    if (!args) throw new Error("usage: \\cd /abs/path");
+    if (!args) throw new Error("usage: \\cd <path>");
     const dir = requireDir(ctx, args);
-    assertUnpinned(ctx, dir);
+    await assertUnpinned(ctx, dir);
     ctx.state.setCurrentProject(dir);
     await rebindThread(ctx, dir, "↔ Switched project.");
   },
@@ -631,19 +645,25 @@ registerCommand({
 
 registerCommand({
   name: "new", rebinds: "always",
-  usage: "\\new [/abs/path]",
+  usage: "\\new [path] | \\new --wt [branch]",
   summary: "Fresh session in this thread",
-  detail: "Bare `\\new` stays in this thread's project; `\\new /abs/path` also switches the current project. Accepts `~` paths. The previous session is kept (\\resume recovers it).",
+  detail: "Bare `\\new` stays in this thread's project; `\\new <path>` also switches the current project. Accepts absolute, `~`, or paths relative to this thread's project. `\\new --wt [branch]` starts in a fresh worktree of this project (its own checkout and branch), so parallel threads don't share files. The previous session is kept (\\resume recovers it).",
   async run(ctx, args) {
-    if (args) {
+    const { wt, rest: branch } = takeWtFlag(args);
+    if (args && !wt) {
       const dir = requireDir(ctx, args);
-      assertUnpinned(ctx, dir);
+      await assertUnpinned(ctx, dir);
       ctx.state.setCurrentProject(dir);
       await rebindThread(ctx, dir, "✨ New project session.", { teardown: false });
       return;
     }
     // Same project as the thread (a channel pin still wins); unbound threads use the channel default.
     const dir = ctx.state.channelProject(ctx.channelId) ?? ctx.thread?.projectDir ?? ctx.state.defaultDir(ctx.channelId, ctx.cwd);
+    if (wt) {
+      await prepareWorktree({ pool: ctx.pool, state: ctx.state, threadKey: ctx.threadKey, baseDir: dir, branch: branch || undefined,
+        say: (text) => ctx.postToThread(text), bind: (wtDir) => rebindThread(ctx, wtDir, "🌳 New worktree session.", { teardown: false }) });
+      return;
+    }
     await rebindThread(ctx, dir, "✨", { teardown: false });
   },
 });
@@ -697,7 +717,7 @@ registerCommand({
     }
     const target = pick.ref.sessionId;
     const dir = pick.ref.projectDir;
-    assertUnpinned(ctx, dir);
+    await assertUnpinned(ctx, dir);
     const entry = await ctx.pool.ensure(dir);
     await sessionGet(entry.client!, target); // throws if gone
     // Sessions are exclusive to one thread: stealing it here would orphan the
@@ -884,12 +904,13 @@ const turnsWord = (n: number): string => `${n} turn${n === 1 ? "" : "s"}`;
 
 registerCommand({
   name: "fork",
-  usage: "\\fork [n]",
+  usage: "\\fork [--wt] [n]",
   summary: "Copy this session into a new thread, minus the last n turns",
-  detail: "Bare `\\fork` copies everything. The fork shares this thread's working directory, so edits from either thread land in the same files.",
+  detail: "Bare `\\fork` copies everything. The fork shares this thread's working directory, so edits from either thread land in the same files. `\\fork --wt` gives the fork its own worktree (checkout and branch) instead.",
   async run(ctx, args) {
     const th = requireThread(ctx);
-    const n = turnCount(args, 0, "\\fork [n]");
+    const { wt, rest } = takeWtFlag(args);
+    const n = turnCount(rest, 0, "\\fork [--wt] [n]");
     if (!ctx.render) throw new Error("\\fork needs the Slack render pipeline (unavailable here)");
     const fork = await withServerLease(ctx, th.projectDir, async (entry) => {
       let before: string | undefined;
@@ -908,12 +929,26 @@ registerCommand({
     const dropped = n ? `, last ${turnsWord(n)} dropped` : "";
     // "" threadTs posts top-level: the fork gets its own thread (a new DM root in DMs).
     const { ts } = await ctx.render.post(ctx.channelId, "",
-      `🔀 Fork of ${origin ? `<${origin}|this thread>` : "a thread"} (session \`${shortId(fork.id)}\`${dropped}) in \`${th.projectDir}\`. Reply here to drive it. Note: it shares the same working directory.`,
+      `🔀 Fork of ${origin ? `<${origin}|this thread>` : "a thread"} (session \`${shortId(fork.id)}\`${dropped}) ${wt ? "with its own worktree."
+        : `in \`${th.projectDir}\`. Reply here to drive it. Note: it shares the same working directory.`}`,
       undefined, { unfurl: false });
     const key = ctx.state.threadKey(ctx.channelId, ts);
-    ctx.state.setThread(key, { ...newThreadState(fork.id, th.projectDir, th.verbose), model: th.model, agent: th.agent, stream: th.stream });
+    const bind = (dir: string) => ctx.state.setThread(key, { ...newThreadState(fork.id, dir, th.verbose), model: th.model, agent: th.agent, stream: th.stream });
+    let dir = th.projectDir;
+    if (wt) {
+      // Create the worktree, move the forked session into it, then bind; a failure falls back to sharing this folder.
+      const render = ctx.render;
+      const say = (text: string) => render.post(ctx.channelId, ts, text, undefined, { unfurl: false });
+      const ready = await prepareWorktree({ pool: ctx.pool, state: ctx.state, threadKey: key, baseDir: th.projectDir, fallback: th.projectDir, say, bind: async (d) => {
+        if (d !== th.projectDir) await withServerLease(ctx, d, (entry) => sessionMove(entry.client!, fork.id, d));
+        bind(d);
+      } });
+      if (ready === null) return; // the new thread was rebound meanwhile; prepareWorktree said so there
+      dir = ready;
+      if (dir !== th.projectDir) await say(`🌳 Worktree ready: \`${dir}\`. Reply here to drive it.`);
+    } else bind(dir);
     const link = ctx.threadUrl?.(key);
-    await ctx.postToThread(`🔀 Forked${n ? ` without the last ${turnsWord(n)}` : ""} → ${link ? `<${link}|new thread>` : "new thread"}. This thread is unchanged.`);
+    await ctx.postToThread(`🔀 Forked${n ? ` without the last ${turnsWord(n)}` : ""} → ${link ? `<${link}|new thread>` : "new thread"}${dir !== th.projectDir ? " in its own worktree" : ""}. This thread is unchanged.`);
   },
 });
 
@@ -1142,20 +1177,63 @@ registerCommand({
   summary: "Abort the running task",
   detail: "Also cancels this thread's queued messages, so nothing runs after it.",
   async run(ctx) {
-    const th = requireThread(ctx);
-    ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs);
-    // Finalized views leave the registry, so an absent view = nothing in flight.
-    if (!getView(th.sessionId)) {
-      await ctx.postToThread("Nothing running in this thread.");
-      return;
-    }
-    const entry = await ctx.pool.ensure(th.projectDir);
-    // Cancel queued prompts first: interrupt alone leaves them parked in the inbox.
-    const cancelled = await cancelParkedPrompts(entry.client!, th.sessionId);
-    await sessionAbort(entry.client!, th.sessionId);
-    await ctx.postToThread(`🛑 Aborted.${cancelled ? ` Cancelled ${cancelled} queued message${cancelled === 1 ? "" : "s"}.` : ""}`);
+    await stopThread(ctx, requireThread(ctx));
   },
 });
+
+/**
+ * \stop's core, shared with the Stop buttons (stopThreadFromButton: Slack's
+ * native Stop and the Home tab): cancel parked prompts, interrupt the run, report.
+ */
+export async function stopThread(
+  ctx: Pick<CmdCtx, "state" | "pool" | "threadKey" | "messageTs" | "postToThread">,
+  th: ThreadState,
+): Promise<void> {
+  ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs);
+  // Cancel queued prompts first: interrupt alone leaves them parked in the inbox,
+  // and they can outlive the view (e.g. across a bridge restart), so always check.
+  let entry: PoolEntry, cancelled: number;
+  try {
+    entry = await ctx.pool.ensure(th.projectDir);
+    cancelled = await cancelParkedPrompts(entry.client!, th.sessionId);
+  } catch (err) {
+    // OpenCode unreachable: parked prompts can't be checked, and with no view no run is
+    // in flight, so an idle Stop isn't an error.
+    if (getView(th.sessionId)) throw err;
+    await ctx.postToThread("Nothing running in this thread.");
+    return;
+  }
+  const queued = cancelled ? ` Cancelled ${cancelled} queued message${cancelled === 1 ? "" : "s"}.` : "";
+  // Finalized views leave the registry, so an absent view = no run in flight.
+  if (!getView(th.sessionId)) {
+    await ctx.postToThread(cancelled ? `🛑${queued}` : "Nothing running in this thread.");
+    return;
+  }
+  await sessionAbort(entry.client!, th.sessionId);
+  await ctx.postToThread(`🛑 Aborted.${queued}`);
+}
+
+/**
+ * stopThread for a Stop button outside the thread (Slack's native Stop, the
+ * Home tab): the report, or the failure, is posted in the thread itself.
+ */
+export async function stopThreadFromButton(d: Pick<CmdCtx, "state" | "pool"> & { render: NonNullable<CmdCtx["render"]> }, threadKey: string): Promise<void> {
+  const sep = threadKey.indexOf(":");
+  const [channel, threadTs] = [threadKey.slice(0, sep), threadKey.slice(sep + 1)];
+  const postToThread = async (text: string) => { await d.render.post(channel, threadTs, text, undefined, { unfurl: false, lane: "interactive" }); };
+  try {
+    const th = d.state.getThread(threadKey);
+    // A Home card can outlive the switch to \watch; never interrupt a session driven from elsewhere.
+    if (th && getView(th.sessionId)?.isWatching) {
+      await postToThread("This session is mirrored with `\\watch` and driven elsewhere. Send `\\resume` here to take it over first.");
+      return;
+    }
+    if (th) await stopThread({ state: d.state, pool: d.pool, threadKey, postToThread }, th);
+  } catch (err) {
+    logErr(`stop failed (${threadKey}): ${String((err as Error)?.message ?? err)}`);
+    await postToThread(`:x: Stop failed: ${String((err as Error)?.message ?? err).slice(0, 200)}`).catch(() => {});
+  }
+}
 
 /** Per-file diffstat lines + a totals header — shared by `\diff` and the DM "View diff" button (RF1). */
 registerCommand({
@@ -1203,15 +1281,29 @@ registerCommand({
       return;
     }
     const th = requireThread(ctx);
+    if (th.watchOnly) throw new Error("this thread is watch-only — `\\resume` to take the session over first");
+    const { render, messageTs } = ctx;
+    if (!render || !messageTs) throw new Error("\\cmd needs the Slack render pipeline (unavailable here)");
     const space = args.indexOf(" ");
     const command = space < 0 ? args : args.slice(0, space);
     const commandArgs = space < 0 ? "" : args.slice(space + 1);
-    const result = (await withServerLease(ctx, th.projectDir, (entry) => sessionCommand(entry.client!, th.sessionId, command, commandArgs))) as {
-      parts?: Array<{ type: string; text?: string }>;
-    };
-    const texts = (result?.parts ?? []).filter((p) => p.type === "text" && p.text).map((p) => p.text!);
-    if (!texts.length) { await ctx.postToThread(`Command \`${command}\` executed (no text output).`); return; }
-    for (const chunk of chunkText(texts.join("\n\n"))) await ctx.postToThread(chunk);
+    // V2 only queues the command (no output in the reply); the run arrives as
+    // session events, which are dropped for view-less sessions. Attach a view
+    // exactly like a prompt (router runPrompt) so it streams and finalizes (#31).
+    await withServerLease(ctx, th.projectDir, async (entry) => {
+      const view = getView(th.sessionId) ?? new SessionView({
+        sessionId: th.sessionId, projectDir: th.projectDir, channel: ctx.channelId, threadTs: ctx.threadTs,
+        threadKey: ctx.threadKey, client: entry.client!, deps: render, state: ctx.state, threadState: th,
+      });
+      await view.beginPrompt(messageTs);
+      try {
+        await sessionCommand(entry.client!, th.sessionId, command, commandArgs);
+      } catch (err) {
+        await view.forgetUnsubmittedPrompt(messageTs); // never queued: drop the ⏳ (and the view if it was ours)
+        throw err;
+      }
+    });
+    return "view";
   },
 });
 
@@ -1226,5 +1318,11 @@ registerCommand({
     await ctx.schedules.run(ctx, args);
   },
 });
+
+registerCommand(shotCommand);
+registerCommand(shipCommand);
+registerCommand(shellCommand);
+registerCommand(worktreesCommand);
+for (const def of [saveCommand, runCommand, savedCommand, unsaveCommand]) registerCommand(def);
 
 export { newThreadState };

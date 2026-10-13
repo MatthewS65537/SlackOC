@@ -14,7 +14,7 @@ compatibility: OpenCode V2 with the SlackOC file-send plugin and installed slack
    ```
 
    If tools are exposed through Code Mode, discover the registered tool and use its exact catalog signature rather than guessing a namespace.
-3. Read the result. A successful receipt has `ok: true`, the current `sessionId`, `channelId`, parent `threadTs`, `fileId`, filename, and byte count. Only then say the file was sent in this thread. Do not return a native file-content part after sending: that can make SlackOC upload it a second time.
+3. Read the result. A successful receipt has `ok: true`, the current `sessionId`, `channelId`, parent `threadTs`, `fileId`, filename, and byte count. For HTML it may also have `pdf` (the rendered PDF's `fileId`, filename, bytes) or `pdfSkipped` (why no PDF was attached). Only then say the file was sent in this thread. Do not return a native file-content part after sending: that can make SlackOC upload it a second time.
 
 ## Routing and permissions
 
@@ -25,7 +25,7 @@ Do not guess a session from recent activity or search unrelated conversations. D
 ## Limits and failures
 
 - One readable, nonempty regular local file per call, at most **50 MiB**. Paths must be absolute; URLs and directories are not accepted. Finish writing before sending; files changed during the read are rejected.
-- Files are sent unchanged. HTML remains an HTML attachment, not an interactive Slack page or automatically converted PDF. If a PDF is requested, create the PDF first using the PDF skill, then send it.
+- Files are sent unchanged. **HTML (`.html`/`.htm`) is also delivered as a PDF**: SlackOC prints it with headless Chrome and posts the PDF next to the HTML in the same message, because Slack can't render HTML and phones can't open it usefully. Pass `"pdf": false` to send only the source. The PDF is rendered from the HTML alone, so local images and stylesheets referenced by relative path don't appear in it: inline CSS and embed images as `data:` URIs (remote `https:` assets still load). If Chrome is missing or rendering fails, the HTML is still sent and the receipt's `pdfSkipped` says why; mention that to the user. For a polished PDF deliverable, create it with the PDF skill and send that instead.
 - Comments are optional and limited to 2000 characters. SlackOC escapes Slack formatting/mentions in them.
 - If delivery times out, is canceled, or has an uncertain completion, **do not automatically resend**. The file may already be in the thread. Explain the uncertainty and ask the user to check before authorizing another attempt.
 - Missing/ambiguous/changed/stopped thread bindings fail closed. Reestablish the intended Slack session explicitly rather than editing saved state or falling back to a DM.
@@ -43,7 +43,9 @@ The OpenCode service must find the installed `slackoc` command on its PATH and u
 The internal upload command is:
 
 ```sh
-slackoc send-file --file "/absolute/path/report.pdf" --session "<native-current-session-id>"
+slackoc send-file --file "/absolute/path/report.pdf" --session "<native-current-session-id>" [--comment "<text>"] [--no-pdf]
 ```
+
+HTML-to-PDF rendering uses Google Chrome/Chromium (also Edge or Brave). If it isn't in a standard location, set `SLACKOC_CHROME` to the browser binary for the OpenCode service.
 
 The plugin supplies this ID automatically. This example is for setup/debugging, not a reason for the agent to infer an ID or bypass the native tool.
