@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { QuestionsStore, type QuestionSnapshot } from "../src/slack/questions-store.js";
 import { QuestionUiReconciler, questionPresentationMarker } from "../src/slack/question-ui.js";
+import type { MarkerMetadata } from "../src/slack/markers.js";
 
 let dir: string;
 let store: QuestionsStore;
@@ -91,7 +92,9 @@ it("silently deletes retired copies without touching a reused current message", 
   expect(store.get("form")?.retiredCopies).toEqual([]);
 });
 
-type Card = { text: string; blocks: unknown[] };
+type Card = { text: string; blocks: unknown[]; metadata?: MarkerMetadata };
+/** The copy's invisible placement marker; production render (like this one) never writes it into text. */
+const markerOf = (card: Card | undefined) => card?.metadata?.event_payload.marker;
 function movingSnapshot(): QuestionSnapshot {
   return { ...snapshot(), presentation: 1, threadPresentation: 0, dmPresentation: 0,
     ui: { revision: 2, threadApplied: 1, dmApplied: 1 } };
@@ -119,7 +122,7 @@ function movingHarness() {
   const errors = vi.fn();
   const adopted = vi.fn();
   const ui = new QuestionUiReconciler({ store, dmChannel: () => "DM", eligible: () => state.eligible, stopping: () => state.stopping,
-    render: (r, destination) => ({ text: `${r.resolvedText ?? `Question ${r.presentation ?? 0}, revision ${r.ui?.revision}`}\n${questionPresentationMarker(r, destination)}`,
+    render: r => ({ text: r.resolvedText ?? `Question ${r.presentation ?? 0}, revision ${r.ui?.revision}`,
       blocks: r.response === "pending" ? [{ type: "actions", epoch: r.presentation ?? 0 }] :
         r.response === "uncertain" ? [{ type: "actions", retry: true, epoch: r.presentation ?? 0 }] : [] }),
     post, send, remove, find, rejectedPost: err => String(err).includes("platform rejected"), onAdopt: adopted, onError: errors });
@@ -141,7 +144,9 @@ it("posts a fresh next-step card per destination, adopts before silent old-card 
     const intent = store.get("form")?.relocation?.[channel === "C" ? "thread" : "dm"];
     expect(intent).toMatchObject({ epoch: 1, oldTs: channel === "C" ? "2" : "3", status: "in-flight", attempts: 1 });
     const card = build();
-    expect(card?.text).toContain(`slackoc-question:form:1:card:1:${channel === "C" ? "thread" : "dm"}`);
+    expect(markerOf(card)).toBe(marker(1, channel === "C" ? "thread" : "dm"));
+    expect(card?.metadata?.event_payload).toMatchObject({ kind: "question", id: "form" });
+    expect(JSON.stringify([card?.text, card?.blocks])).not.toContain("slackoc-");
     h.posts.push({ channel, threadTs, card: card! });
     return { ts: `new-${channel}` };
   });
@@ -230,8 +235,7 @@ it("singleflights relocation and catches a later epoch without adopting the obso
   expect(h.post).toHaveBeenCalledOnce();
   gate.release(); await Promise.all([first, second]);
   expect(h.post).toHaveBeenCalledTimes(2);
-  expect(h.posts.map(p => p.card.text.split("\n").at(-1))).toEqual([
-    marker(1), marker(2)]);
+  expect(h.posts.map(p => markerOf(p.card))).toEqual([marker(1), marker(2)]);
   expect(store.get("form")).toMatchObject({ askTs: "posted-2", threadPresentation: 2 });
   expect(h.adopted).toHaveBeenCalledOnce();
   expect(h.deleted.map(u => u.ts).sort()).toEqual(["2", "posted-1"]);
@@ -275,7 +279,7 @@ it("cancels a stale queued epoch rather than rendering the newest epoch under it
   store.update("form", r => { r.presentation = 2; r.ui!.revision = 3; });
   gate.release(); await pending;
   expect(h.posts).toHaveLength(1);
-  expect(h.posts[0]!.card.text).toContain("slackoc-question:form:1:card:2:thread");
+  expect(markerOf(h.posts[0]!.card)).toBe(marker(2));
   expect(store.get("form")?.threadPresentation).toBe(2);
 });
 it("cancels resolution before a queued build and updates the known copy in place", async () => {
@@ -388,7 +392,7 @@ it("cleans up exact old-epoch evidence after restart before posting the newer st
   const h = movingHarness(); h.find.mockResolvedValue({ ts: "old-epoch" });
   await h.ui.refresh("form");
   expect(h.find).toHaveBeenCalledWith("C", "1", marker(1), "2");
-  expect(h.posts[0]?.card.text).toContain("slackoc-question:form:1:card:2:thread");
+  expect(markerOf(h.posts[0]?.card)).toBe(marker(2));
   expect(h.adopted).toHaveBeenCalledOnce();
   expect(h.deleted.map(u => u.ts).sort()).toEqual(["2", "old-epoch"]);
 });
@@ -457,9 +461,9 @@ it("continues terminal-card updates while uncertain evidence is still missing", 
   const h = movingHarness(); await h.ui.refresh("form");
   expect(h.post).not.toHaveBeenCalled();
   expect(h.find).toHaveBeenCalledOnce();
-  expect(h.updates[0]?.card.text).toContain("Expired.");
-  expect(h.updates[0]?.card.text).toContain(marker(0));
-  expect(h.updates[0]?.card.text).not.toContain(marker(1));
+  expect(h.updates[0]?.card.text).toBe("Expired.");
+  // The edit re-sends metadata naming the known copy's own epoch, never the pending replacement's.
+  expect(markerOf(h.updates[0]?.card)).toBe(marker(0));
   expect(store.get("form")?.relocation?.thread?.status).toBe("uncertain");
 });
 it("keeps native retry controls current while the placement marker identifies the older known copy", async () => {
@@ -467,8 +471,7 @@ it("keeps native retry controls current while the placement marker identifies th
     relocation: { thread: { epoch: 1, oldTs: "2", status: "uncertain", attempts: 1 } } });
   const h = movingHarness(); await h.ui.refresh("form");
   expect(h.updates[0]?.card.blocks).toEqual([{ type: "actions", retry: true, epoch: 1 }]);
-  expect(h.updates[0]?.card.text).toContain(marker(0));
-  expect(h.updates[0]?.card.text).not.toContain(marker(1));
+  expect(markerOf(h.updates[0]?.card)).toBe(marker(0));
   expect(store.get("form")?.response).toBe("uncertain");
 });
 it("does not accept the original timestamp as evidence of a replacement", async () => {

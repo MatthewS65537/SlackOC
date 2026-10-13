@@ -5,8 +5,14 @@ import { createInteractions } from "../src/slack/interactions.js";
 import { PermissionDeliveryStore, permissionDeliveryMarker, type PermissionRecord } from "../src/slack/permissions-store.js";
 import { QuestionsStore, questionBindingToken, type QuestionSnapshot } from "../src/slack/questions-store.js";
 import { questionPresentationMarker } from "../src/slack/question-ui.js";
-import { _resetQueueForTests } from "../src/slack/queue.js";
+import { _resetQueueForTests, enqueue, laneDepth } from "../src/slack/queue.js";
 import { normalizeForm } from "../src/opencode/v2.js";
+import { markerMetadata } from "../src/slack/markers.js";
+
+/** A bot copy as Slack returns it: the marker in metadata (current posts) or in the text (posts from before). */
+const markedCopy = (via: "metadata" | "text", marker: string, ts: string, user = "U_BOT", kind: "question" | "permission" = "question") =>
+  via === "metadata" ? { user, ts, text: "Human notification line", metadata: markerMetadata(kind, "any", marker) }
+    : { user, ts, text: `Card\n${marker}` };
 
 const root = resolve("test/.fixtures/interactions");
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
@@ -29,9 +35,11 @@ function harness(name: string) {
   const posts: any[] = [];
   const histories: any[] = [];
   const replies = vi.fn(async (args: any): Promise<any> => { histories.push(args); return { messages: [] }; });
-  const app: any = { action() {}, view() {}, client: {
+  const actions: Array<{ id: string | RegExp; fn: any }> = [];
+  let postN = 1;
+  const app: any = { action(id: string | RegExp, fn: any) { actions.push({ id, fn }); }, view() {}, client: {
     chat: { update: async (args: any) => { updates.push(args); return {}; }, delete: async () => ({}),
-      postMessage: async (args: any) => { posts.push(args); return { ts: "1791400999.000001" }; } },
+      postMessage: async (args: any) => { posts.push(args); return { ts: `1791400999.${String(postN++).padStart(6, "0")}` }; } },
     conversations: { replies, history: async (args: any) => { histories.push(args); return { messages: [] }; },
       open: async () => ({ channel: { id: "D1" } }) } } };
   // Any native reply/answer would go through these; reconciliation must never call them.
@@ -53,7 +61,9 @@ function harness(name: string) {
     thread: { status: "delivered", format: "card", attempts: 1, channel: "C1", ts: "1791400000.000001" },
     dm: { status: "delivered", format: "card", attempts: 1, channel: "D1", ts: "1791400000.000002" },
     response: { status: "pending" } });
-  return { dir, thread, threadKey, rootTs, client, native, replies, updates, posts, histories, permissionStore, questionStore, start, permission };
+  /** Registered Bolt action handler for `actionId`. */
+  const action = (actionId: string) => actions.find(a => typeof a.id === "string" ? a.id === actionId : a.id.test(actionId))!.fn;
+  return { dir, app, thread, threadKey, rootTs, client, native, replies, updates, posts, histories, permissionStore, questionStore, start, permission, action };
 }
 
 const noControls = (u: any) => u.blocks.every((b: any) => b.type !== "actions");
@@ -114,13 +124,13 @@ describe("response-lost copies of resolved permissions (#22)", () => {
     dm: { status: "delivered", format: "card", attempts: 1, channel: "D1", ts: "1791400000.000002", collapsed: true },
     response: { status: "resolved", choice: "once", actor: "U_OWNER", confirmed: true, text: "Allow once confirmed." } });
 
-  it("adopts the accepted card by its exact bot marker after restart and collapses it with the confirmed text", async () => {
-    const h = harness("terminal");
+  it.each(["metadata", "text"] as const)("adopts the accepted card by its exact bot marker (%s) after restart and collapses it with the confirmed text", async via => {
+    const h = harness(`terminal-${via}`);
     const record = resolvedWithLostThreadCard(h);
     const marker = permissionDeliveryMarker(record, "thread");
     h.replies.mockImplementation(async (args: any) => { h.histories.push(args); return { messages: [
-      { user: "U_OTHER", ts: "1791400000.000004", text: `quoted\n${marker}` },
-      { user: "U_BOT", ts: "1791400000.000003", text: `Permission card\n${marker}` }], has_more: false }; });
+      markedCopy(via, marker, "1791400000.000004", "U_OTHER", "permission"), markedCopy(via, marker, "1791400000.000003", "U_BOT", "permission")],
+    has_more: false }; });
     h.permissionStore.put(record);
     const interactions = h.start();
     await interactions.refreshPermissions();
@@ -132,7 +142,7 @@ describe("response-lost copies of resolved permissions (#22)", () => {
     expect(h.updates[0]).toMatchObject({ channel: "C1", ts: "1791400000.000003", text: "Allow once confirmed." });
     expect(noControls(h.updates[0])).toBe(true);
     expect(h.histories).toHaveLength(1);
-    expect(h.histories[0]).toMatchObject({ channel: "C1", ts: h.rootTs });
+    expect(h.histories[0]).toMatchObject({ channel: "C1", ts: h.rootTs, include_all_metadata: true });
     expect(h.posts).toEqual([]);
     expect(h.native.permission).not.toHaveBeenCalled();
     interactions.close();
@@ -147,6 +157,64 @@ describe("response-lost copies of resolved permissions (#22)", () => {
     expect(h.permissionStore.list()[0]!.thread.status).toBe("uncertain");
     expect(h.posts).toEqual([]);
     expect(h.updates).toEqual([]);
+    interactions.close();
+  });
+});
+
+describe("permissions retired as ineligible (#32, #41)", () => {
+  // A \stop past the request's owner activity makes it ineligible, so the refresh retires it.
+  const cancel = (h: ReturnType<typeof harness>) => { h.thread.recovery.canceledThroughTs = `${Math.floor(Date.now() / 1000)}.000009`; };
+
+  it("collapses both delivered copies exactly once", async () => {
+    const h = harness("retired");
+    h.permissionStore.put(h.permission());
+    cancel(h);
+    const interactions = h.start();
+    await interactions.refreshPermissions();
+    await interactions.refreshPermissions();
+    const record = h.permissionStore.list()[0]!;
+    expect(record.response).toMatchObject({ status: "resolved", confirmed: false });
+    expect(h.updates.map(u => [u.channel, u.ts])).toEqual([["C1", "1791400000.000001"], ["D1", "1791400000.000002"]]);
+    expect(h.updates.every(noControls)).toBe(true);
+    expect(h.updates[0].text).toMatch(/retired/);
+    expect([record.thread.collapsed, record.dm.collapsed]).toEqual([true, true]);
+    expect(h.native.permission).not.toHaveBeenCalled();
+    interactions.close();
+  });
+
+  it("retries a failed collapse on the next refresh", async () => {
+    const h = harness("retired-retry");
+    h.permissionStore.put(h.permission());
+    cancel(h);
+    const update = h.app.client.chat.update;
+    h.app.client.chat.update = async () => { throw new Error("boom"); };
+    const interactions = h.start();
+    await interactions.refreshPermissions();
+    expect(h.permissionStore.list()[0]!.response.status).toBe("resolved");
+    expect(h.permissionStore.list()[0]!.thread.collapsed).toBeUndefined();
+    h.app.client.chat.update = update;
+    await interactions.refreshPermissions();
+    const record = h.permissionStore.list()[0]!;
+    expect([record.thread.collapsed, record.dm.collapsed]).toEqual([true, true]);
+    interactions.close();
+  });
+
+  it("orders the thread-copy collapse within its thread, ahead of other threads' background writes", async () => {
+    const h = harness("retired-lane");
+    h.permissionStore.put(h.permission());
+    cancel(h);
+    const interactions = h.start();
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const a1 = enqueue(() => gate, { channel: "C1", method: "chat.update", thread: "A" });
+    let seenBeforeA2: string[] = [];
+    const a2 = enqueue(async () => { seenBeforeA2 = h.updates.map(u => u.channel); }, { channel: "C1", method: "chat.update", thread: "A" });
+    const refresh = interactions.refreshPermissions();
+    await vi.waitFor(() => expect(laneDepth("C1")).toBe(2)); // A2 and the collapse wait behind the in-flight A1
+    release();
+    await Promise.all([a1, a2, refresh]);
+    // Untagged, the collapse was a barrier and ran after A2.
+    expect(seenBeforeA2).toContain("C1");
     interactions.close();
   });
 });
@@ -183,9 +251,9 @@ describe("question placement-marker recovery in long threads (#19)", () => {
     return { ...h, req, oldTs };
   }
 
-  it("adopts a page-two marker without reposting, then a same-session resume hydrates current-generation controls", async () => {
+  it.each(["metadata", "text"] as const)("adopts a page-two marker (%s) without reposting, then a same-session resume hydrates current-generation controls", async via => {
     const postedTs = "1791400000.000200";
-    const h = setup("pagination", marker => ({ messages: [{ user: "U_BOT", ts: postedTs, text: `OpenCode question\n${marker}` }], has_more: false }));
+    const h = setup(`pagination-${via}`, marker => ({ messages: [markedCopy(via, marker, postedTs)], has_more: false }));
     const interactions = h.start();
     await settle(interactions.onQuestion(h.req as any, true));
     const adopted = h.questionStore.get(h.req.id)!;
@@ -194,7 +262,7 @@ describe("question placement-marker recovery in long threads (#19)", () => {
     const threadSearches = h.histories.filter(a => a.channel === "C1");
     expect(threadSearches.map(a => a.cursor)).toEqual([undefined, "page-two"]);
     // Searched only from the copy being replaced onward.
-    expect(threadSearches.every(a => a.ts === h.rootTs && a.oldest === h.oldTs && a.inclusive)).toBe(true);
+    expect(threadSearches.every(a => a.ts === h.rootTs && a.oldest === h.oldTs && a.inclusive && a.include_all_metadata)).toBe(true);
     expect(h.posts).toEqual([]);
 
     h.thread.recovery.bindingGeneration = 2;
@@ -229,6 +297,63 @@ describe("question placement-marker recovery in long threads (#19)", () => {
     expect(h.histories.filter(a => a.channel === "C1")).toHaveLength(5);
     expect(h.questionStore.get(h.req.id)!.relocation?.thread?.status).toBe("uncertain");
     expect(h.posts).toEqual([]);
+    interactions.close();
+  });
+});
+
+describe("a required multiselect emptied after Back (#43)", () => {
+  const raw: any = { id: "frm_1", sessionID: "ses_1", title: "T", fields: [
+    { key: "langs", type: "multiselect", title: "Langs", required: true, options: [{ label: "A" }, { label: "B" }] },
+    { key: "pick", type: "string", title: "Pick", required: true, options: [{ label: "X" }, { label: "Y" }] }] };
+
+  /** Answers Q1 (A) and Q2 (X), goes Back to Q1 and untoggles A: answers [[], ["X"]], both still finalized. */
+  async function emptiedAfterBack(name: string) {
+    const h = harness(name);
+    h.client.v2.form.list.mockResolvedValue({ data: [raw] });
+    h.native.formReply.mockResolvedValue({ data: true });
+    const interactions = h.start();
+    await interactions.onQuestion(normalizeForm(raw) as any);
+    const ephemerals: string[] = [];
+    const click = async (actionId: string, extra: Record<string, unknown>) => {
+      const rec = h.questionStore.get("frm_1")!;
+      const value = JSON.stringify({ s: "ses_1", q: "frm_1", g: rec.generation, b: questionBindingToken(rec), c: rec.presentation ?? 0, ...extra });
+      await h.action(actionId)({ ack: async () => {}, action: { action_id: actionId, value }, respond: async (m: any) => { ephemerals.push(m.text); },
+        body: { user: { id: "U_OWNER" }, channel: { id: "C1" }, message: { thread_ts: h.rootTs } } });
+    };
+    await click("question_0_0", { i: 0, a: 0 });
+    await click("qsubmit", { i: 0 });
+    await click("question_1_0", { i: 1, a: 0 }); // review step
+    await click("qnav_prev", { i: 1 });
+    await click("qnav_prev", { i: 0 });
+    await click("question_0_0", { i: 0, a: 0 }); // untoggle A
+    expect(h.questionStore.get("frm_1")).toMatchObject({ answers: [[], ["X"]], finalized: [true, true], cursor: 0 });
+    return { h, interactions, click, ephemerals };
+  }
+
+  it("reopens it when Next enters the review step, and a stale Submit answers sends nothing", async () => {
+    const { h, interactions, click } = await emptiedAfterBack("ms-nav");
+    await click("qnav_next", { i: 1 });
+    await click("qnav_next", { i: 1, r: 1 }); // from the last question: review step entry
+    expect(h.questionStore.get("frm_1")).toMatchObject({ finalized: [false, true], cursor: undefined });
+    await click("qsubmit_all", { i: 0 });
+    expect(h.native.formReply).not.toHaveBeenCalled();
+    interactions.close();
+  });
+
+  it("reopens it when a later answer completes the form, then sends once it is reselected", async () => {
+    const { h, interactions, click, ephemerals } = await emptiedAfterBack("ms-answer");
+    await click("qnav_next", { i: 1 });
+    await click("question_1_0", { i: 1, a: 0 }); // re-pick X: would show the review step
+    expect(h.questionStore.get("frm_1")!.finalized).toEqual([false, true]);
+    await click("qsubmit_all", { i: 0 });
+    await click("qsubmit", { i: 0 });
+    expect(ephemerals).toContain("Pick at least one option before submitting.");
+    expect(h.native.formReply).not.toHaveBeenCalled();
+    await click("question_0_1", { i: 0, a: 1 }); // pick B
+    await click("qsubmit", { i: 0 });
+    await click("qsubmit_all", { i: 0 });
+    expect(h.native.formReply).toHaveBeenCalledOnce();
+    expect((h.native.formReply.mock.calls[0] as any)[0].answer).toEqual({ langs: ["B"], pick: "X" });
     interactions.close();
   });
 });

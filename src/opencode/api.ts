@@ -14,7 +14,6 @@ export interface OcSession {
   fork?: { sessionID: string };
   /** Staged (uncommitted) \undo boundary; its file edits are already applied. */
   revert?: { messageID: string; files?: OcFileDiff[] };
-  summary?: { additions: number; deletions: number; files: number };
   time: { created: number; updated: number };
 }
 
@@ -64,7 +63,7 @@ export interface OcMessageInfo {
   providerID?: string;
   error?: { name?: string; data?: Record<string, unknown> } | null;
   cost?: number;
-  tokens?: { input?: number; output?: number; reasoning?: number };
+  tokens?: { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } };
   time?: { created: number; completed?: number };
 }
 

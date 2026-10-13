@@ -10,6 +10,8 @@ export interface ParsedCmd {
  * untouched by design).
  */
 export function parseBackslash(text: string): ParsedCmd | null {
+  // `\!` (shell) is the one non-word name; its command may follow without a space (`\!ls`).
+  if (text.trim().startsWith("\\!")) return { name: "!", args: text.trim().slice(2).trim() };
   const m = text.trim().match(/^\\([A-Za-z][A-Za-z0-9_-]*)(?:\s+([\s\S]*))?$/);
   if (!m || !m[1]) return null;
   return { name: m[1].toLowerCase(), args: (m[2] ?? "").trim() };

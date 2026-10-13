@@ -8,6 +8,9 @@
  * activity map fed by `session.status` events, plus a recency fallback for
  * sessions whose busy state this bridge never observed (e.g. a run that
  * started before the bridge did).
+ *
+ * No per-row diffstat: V2 session info has no summary, and session.diff
+ * returns every file's full patch, too heavy to fetch for each listed row.
  */
 
 import { sessionList } from "../opencode/client.js";
@@ -23,7 +26,6 @@ export interface SessionRef {
   projectDir: string;
   title: string;
   updated: number;
-  summary?: { additions: number; deletions: number };
   /** Live busy signal from the SSE activity map (Slack-driven sessions). */
   running: boolean;
   /** Touched < RECENT_MS — shown as "active?" since TUI activity isn't visible here. */
@@ -117,9 +119,6 @@ function toRefs(ctx: CmdCtx, sessions: OcSession[], serverDir: string): SessionR
         projectDir: canonicalDir(s.directory ?? serverDir),
         title: s.title ?? "",
         updated: s.time.updated,
-        summary: s.summary
-          ? { additions: s.summary.additions, deletions: s.summary.deletions }
-          : undefined,
         running: !!act?.busy && now - act.at <= ACTIVITY_TTL_MS,
         recent: now - s.time.updated < RECENT_MS,
         boundThreadKey: bound?.key,
@@ -173,10 +172,9 @@ export function renderPickerList(refs: SessionRef[], opts: { heading: string; to
   }
   refs.forEach((r, i) => {
     const mark = r.running ? "▶ running" : r.recent ? "? active?" : "· idle";
-    const sum = r.summary ? ` +${r.summary.additions}/−${r.summary.deletions}` : "";
     const bound = r.mine ? " ← this thread" : r.boundThreadKey ? " · bound" : "";
     lines.push(
-      `${i + 1}) \`${shortId(r.sessionId)}\` ${truncate(esc(r.title || "(untitled)"), 40)}${sum} · ${age(r.updated)} · ${mark}${bound}`,
+      `${i + 1}) \`${shortId(r.sessionId)}\` ${truncate(esc(r.title || "(untitled)"), 40)} · ${age(r.updated)} · ${mark}${bound}`,
     );
   });
   if (hidden > 0) lines.push(`(+${hidden} older — narrow with \\sessions <filter>, or \\sessions all)`);

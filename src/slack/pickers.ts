@@ -1,11 +1,12 @@
 import type { App } from "@slack/bolt";
-import { PICK_ACTION_PATTERN } from "./blocks.js";
+import { MODEL_RETRY_BLOCK, PICK_ACTION_PATTERN } from "./blocks.js";
 import { runPickedCommand, type BridgeDeps } from "./router.js";
 import { enqueue } from "./queue.js";
 import { logErr } from "../log.js";
-import { configProviders, type ProvidersInfo } from "../opencode/client.js";
+import { modelCatalog } from "../opencode/client.js";
 import { modelOptionGroups, orderedModels, readFavorites } from "../opencode/favorites.js";
 import { sourceThreadTs } from "./source-thread.js";
+import { retryAfterModelPick } from "./retry.js";
 
 /** Commands a picker card may run; option values are checked against this. */
 const PICKED = /^\\(model|agent|cd|resume) \S/;
@@ -33,12 +34,15 @@ export function registerPickerActions(app: App, deps: { bridge: BridgeDeps; owne
       .catch(err => logErr(`picker card update failed: ${String(err)}`));
     await runPickedCommand(deps.bridge, channel, root, cardTs, value.value)
       .catch(err => logErr(`picked command failed (${value.value}): ${String(err)}`));
+    // D3: a Switch-model card (retry.ts) then reruns its failed prompt on the pick.
+    const promptTs = MODEL_RETRY_BLOCK.exec((action as { block_id?: string }).block_id ?? "")?.[1];
+    if (!promptTs) return;
+    const why = await retryAfterModelPick(deps.bridge, channel, root, cardTs, promptTs, value.value)
+      .catch(err => `Retry failed: ${String((err as Error)?.message ?? err).slice(0, 200)}`);
+    if (why) await respond({ text: why, response_type: "ephemeral", replace_original: false }).catch(() => {});
   });
 }
 
-/** Per-project catalog cache: Slack drops an options response after 3s, and every keystroke asks again. */
-const CATALOG_TTL_MS = 60_000;
-const catalogs = new Map<string, { info: ProvidersInfo; at: number }>();
 /** Card ts → thread root, for suggestion payloads that omit the source message. */
 const cardRoots = new Map<string, string>();
 
@@ -60,12 +64,9 @@ export function registerModelSearch(app: App, deps: { bridge: BridgeDeps; ownerS
       if (!root) return await ack({ options: [] });
       const thread = state.getThread(state.threadKey(c.channel_id, root));
       const dir = thread?.projectDir ?? state.defaultDir(c.channel_id, cwd);
-      let hit = catalogs.get(dir);
-      if (!hit || Date.now() - hit.at > CATALOG_TTL_MS) {
-        hit = { info: await configProviders((await pool.ensure(dir)).client!), at: Date.now() };
-        catalogs.set(dir, hit);
-      }
-      await ack({ option_groups: modelOptionGroups(orderedModels(hit.info, readFavorites()), body.value ?? "") } as never);
+      // Cached per project in the client layer (Slack drops an options response after 3s; every keystroke asks).
+      const info = await modelCatalog((await pool.ensure(dir)).client!);
+      await ack({ option_groups: modelOptionGroups(orderedModels(info, readFavorites()), body.value ?? "") } as never);
     } catch (err) {
       logErr(`model search failed: ${String(err)}`);
       await ack({ options: [] }).catch(() => {});

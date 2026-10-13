@@ -48,7 +48,7 @@ describe("diff actions", () => {
       filesUploadV2: vi.fn(async (_a: any) => ({})),
       chat: { postEphemeral: vi.fn(async (_a: any) => ({})) },
     };
-    const app: any = { action: (id: string, cb: any) => handlers.set(id, cb), client };
+    const app: any = { action: (id: string, cb: any) => handlers.set(id, cb), view: () => {}, client };
     registerDiffActions(app, { ownerSlackUserId: "U_OWNER", isStopping: () => false,
       state: { findThreadBySession: () => ({ key: `C_TEST:${ROOT}`, thread: { projectDir: "/p" } }) } as never,
       pool: { ensure: async () => ({ client: {} }) } as never });

@@ -47,6 +47,9 @@ export function bridgeInvocation(): { node: string; cli: string } {
   return { node: process.execPath, cli };
 }
 
+/** Text content of a plist <string>: escape the XML metacharacters. */
+const xmlEscape = (v: string) => v.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+
 /** Render the launchd plist. Pure — tested directly. */
 export function renderLaunchdPlist(opts: { node: string; cli: string; workdir: string; path: string }): string {
   const { node, cli, workdir, path: envPath } = opts;
@@ -59,26 +62,37 @@ export function renderLaunchdPlist(opts: { node: string; cli: string; workdir: s
   <key>Label</key><string>${LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${node}</string>
-    <string>${cli}</string>
+    <string>${xmlEscape(node)}</string>
+    <string>${xmlEscape(cli)}</string>
     <string>start</string>
   </array>
-  <key>WorkingDirectory</key><string>${workdir}</string>
+  <key>WorkingDirectory</key><string>${xmlEscape(workdir)}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>${envPath}</string>
+    <key>PATH</key><string>${xmlEscape(envPath)}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${out}</string>
-  <key>StandardErrorPath</key><string>${err}</string>
+  <key>StandardOutPath</key><string>${xmlEscape(out)}</string>
+  <key>StandardErrorPath</key><string>${xmlEscape(err)}</string>
 </dict>
 </plist>
 `;
 }
 
-/** One double-quoted systemd word: escape \ and ", and % (specifier expansion). */
-const unitWord = (v: string) => `"${v.replace(/[\\"]/g, "\\$&").replace(/%/g, "%%")}"`;
+/**
+ * A systemd value: `%` → `%%` (specifier expansion). Control characters can't
+ * be escaped and a newline would inject a directive, so they are rejected.
+ * Bare form for path settings (WorkingDirectory=, append:), which systemd
+ * does not unquote.
+ */
+function unitValue(v: string): string {
+  if (/[\x00-\x1f\x7f]/.test(v)) throw new Error(`control character in service unit value: ${JSON.stringify(v)}`);
+  return v.replace(/%/g, "%%");
+}
+
+/** One double-quoted systemd word (ExecStart argument, Environment= assignment): also escape \ and ". */
+const unitWord = (v: string) => `"${unitValue(v).replace(/[\\"]/g, "\\$&")}"`;
 
 /** Render the systemd user unit. Pure — tested directly. */
 export function renderSystemdUnit(opts: { node: string; cli: string; workdir: string; path: string }): string {
@@ -91,12 +105,12 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=${unitWord(node)} ${unitWord(cli)} start
-WorkingDirectory=${workdir}
+WorkingDirectory=${unitValue(workdir)}
 Environment=${unitWord(`PATH=${envPath}`)}
 Restart=always
 RestartSec=3
-StandardOutput=append:${join(CONFIG_DIR, "daemon-stdout.log")}
-StandardError=append:${err}
+StandardOutput=append:${unitValue(join(CONFIG_DIR, "daemon-stdout.log"))}
+StandardError=append:${unitValue(err)}
 
 [Install]
 WantedBy=default.target
@@ -224,5 +238,6 @@ export function installedWorkdir(): string | null {
   if (!p || !existsSync(p)) return null;
   const text = readFileSync(p, "utf8");
   const m = text.match(/(?:WorkingDirectory<\/key><string>|^WorkingDirectory=)(.*)$/m);
-  return m?.[1]?.trim() ?? null;
+  const wd = m?.[1]?.trim();
+  return wd === undefined ? null : platform === "linux" ? wd.replace(/%%/g, "%") : wd; // undo unitValue()
 }

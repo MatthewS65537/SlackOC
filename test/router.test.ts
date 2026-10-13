@@ -2,13 +2,13 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { Jimp, JimpMime } from "jimp";
-import { claimEvent, hushAction, handleIncomingMessage, runPickedCommand, shouldRouteMessage, type BridgeDeps, type SlackMsg } from "../src/slack/router.js";
+import { claimEvent, hushAction, handleIncomingMessage, isOwnerInput, retryPrompt, runPickedCommand, shouldRouteMessage, type BridgeDeps, type SlackMsg } from "../src/slack/router.js";
 import type { RenderDeps } from "../src/slack/render.js";
 import type { ServerPool } from "../src/opencode/server.js";
 import type { SlackocConfig } from "../src/config.js";
-import { MAX_MESSAGE_RECEIPTS, RECOVERY_RECEIPT_RESERVE, StateStore } from "../src/state.js";
+import { LAST_PROMPT_MAX, MAX_MESSAGE_RECEIPTS, RECOVERY_RECEIPT_RESERVE, StateStore } from "../src/state.js";
 import { MAX_ATTACHMENT_BYTES, MAX_IMAGE_EDGE, TARGET_IMAGE_BYTES } from "../src/image.js";
-import { SessionView, deleteView } from "../src/slack/render.js";
+import { SessionView, deleteView, getView } from "../src/slack/render.js";
 import { LIVE_GRACE_MS, sweepMissedMessages, sweepTopLevelMessages, type CatchupDeps } from "../src/slack/catchup.js";
 import { registerCommand } from "../src/commands/registry.js";
 import { MAX_REPLAY_AGE_MS, timestampFromMs } from "../src/slack/recovery-policy.js";
@@ -869,16 +869,19 @@ describe("original age and cancellation at effect boundaries", () => {
   it("a stop with no live view is durable before a stalled server acquisition returns", async () => {
     const { d, root, key, prompt } = gated("stop-await");
     const ensure = d.pool.ensure.bind(d.pool);
+    // \stop checks the inbox for parked prompts even with no view (0.2b): an empty one.
+    Object.assign((await ensure("/p")).client!, { v2: { session: { inbox: { list: async () => [] } } } });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const entered = vi.fn();
     d.pool.ensure = async (dir) => { entered(); await gate; return ensure(dir); };
     const running = handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 2000), root, "work"), d);
     await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
-    expect(await handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "\\stop"), d)).toBe("accepted");
-    expect(d.state.getThread(key)?.recovery?.canceledThroughTs).toBe(timestampFromMs(NOW - 1000));
+    const stopping = handleIncomingMessage(ownerMsg("C", timestampFromMs(NOW - 1000), root, "\\stop"), d);
+    await vi.waitFor(() => expect(d.state.getThread(key)?.recovery?.canceledThroughTs).toBe(timestampFromMs(NOW - 1000)));
     release();
     expect(await running).toBe("canceled");
+    expect(await stopping).toBe("accepted");
     expect(prompt).not.toHaveBeenCalled();
   });
 
@@ -1012,5 +1015,103 @@ describe("top-level catch-up inspects a missed root's thread first (#10)", () =>
       expect(d.state.getThread(`${channel}:${canceled.ts}`)).toBeNull();
       expect(d.state.getThread(`${channel}:${clean.ts}`)?.sessionId).toBe(`sess-top-${channel}`);
     } finally { deleteView(`sess-top-${channel}`); }
+  });
+});
+
+describe("owner input (#52 ghost witness, #53 thread_broadcast)", () => {
+  it.each([
+    [{ user: "U1" }, true], [{ user: "U1", subtype: "file_share" }, true], [{ user: "U1", subtype: "thread_broadcast" }, true],
+    [{ user: "U1", subtype: "message_changed" }, false], [{ user: "U1", bot_id: "B1" }, false], [{ user: "U2" }, false], [{}, false],
+  ])("isOwnerInput(%o) is %s", (m, ok) => expect(isOwnerInput(m, "U1")).toBe(ok));
+
+  it("routes an owner's \"Also send to channel\" reply in a bound thread as a prompt", async () => {
+    const root = ts("1400.000000");
+    const submitted: string[] = [];
+    const client = { session: { promptAsync: async (args: any) => { submitted.push(args.body.parts[0].text); return { data: {} }; },
+      messages: async () => ({ data: [] }), get: async () => ({ data: {} }) } };
+    const d = makeDeps("broadcast", fakePool(client), fakeRender({ posted: [], deleted: [], reacted: [], dms: [] }));
+    d.state.setThread(`C:${root}`, { sessionId: "broadcast", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: root });
+    try {
+      const reply = { ...ownerMsg("C", "1400.000001", root, "also run lint"), subtype: "thread_broadcast" };
+      expect(shouldRouteMessage(reply, () => false)).toBe(true);
+      expect(await handleIncomingMessage(reply, d)).toBe("accepted");
+      expect(submitted).toEqual(["also run lint"]);
+    } finally { deleteView("broadcast"); }
+  });
+});
+
+describe("↻ Retry prompt path (D3)", () => {
+  it("stores each admitted prompt (text, capped) and resends via the normal path with the card standing in", async () => {
+    const root = ts("1500.000000");
+    const submitted: string[] = [];
+    const client = { session: { promptAsync: async (args: any) => { submitted.push(args.body.parts[0].text); return { data: {} }; },
+      messages: async () => ({ data: [] }), get: async () => ({ data: {} }) } };
+    const log: CallLog = { posted: [], deleted: [], reacted: [], dms: [] };
+    const d = makeDeps("retry-path", fakePool(client), fakeRender(log));
+    d.state.setThread(`C:${root}`, { sessionId: "retry-path", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: root });
+    try {
+      const long = `${"x".repeat(LAST_PROMPT_MAX)}tail`;
+      expect(await handleIncomingMessage(ownerMsg("C", "1500.000001", root, long), d)).toBe("accepted");
+      expect(submitted).toEqual([long]); // only the stored copy is capped
+      expect(d.state.getThread(`C:${root}`)?.lastPrompt).toEqual({ text: "x".repeat(LAST_PROMPT_MAX), ts: ts("1500.000001"), sessionId: expect.any(String), cut: true });
+      deleteView("retry-path"); // that run failed and ended
+
+      const card = ts("1500.000002");
+      expect(await retryPrompt(d, "C", root, card, "fix &amp; retry")).toBe("accepted");
+      expect(submitted.at(-1)).toBe("fix &amp; retry"); // stored text is already plain: no Slack decoding
+      expect(log.reacted).toContainEqual([card, "eyes"]);
+      expect(d.state.getThread(`C:${root}`)?.lastPrompt).toEqual({ text: "fix &amp; retry", ts: card, sessionId: expect.any(String) });
+      expect(await retryPrompt(d, "C", root, card, "fix &amp; retry")).toBe("accepted"); // a second tap is deduped
+      expect(submitted).toHaveLength(2);
+    } finally { deleteView("retry-path"); }
+  });
+
+  /** A thread with prompt A running and B queued behind it; `posts` keeps each post's blocks. */
+  async function queuedBehind(name: string, seconds: number) {
+    const root = ts(`${seconds}.000000`);
+    const client = { session: { promptAsync: async () => ({ data: {} }), messages: async () => ({ data: [] }), get: async () => ({ data: {} }) } };
+    const posts: Array<{ text: string; blocks?: any[] }> = [];
+    const render: RenderDeps = { ...fakeRender({ posted: [], deleted: [], reacted: [], dms: [] }),
+      post: async (_c, _t, text, blocks) => { posts.push({ text, blocks: blocks as any[] }); return { ts: `p-${posts.length}` }; } };
+    const d = makeDeps(name, fakePool(client), render);
+    const key = `C:${root}`;
+    d.state.setThread(key, { sessionId: name, projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: root });
+    const a = ownerMsg("C", `${seconds}.000001`, root, "first");
+    const b = ownerMsg("C", `${seconds}.000002`, root, "second");
+    expect(await handleIncomingMessage(a, d)).toBe("accepted");
+    expect(await handleIncomingMessage(b, d)).toBe("accepted"); // ⏳ Queued behind A
+    return { d, key, a, b, posts, view: getView(name)! };
+  }
+
+  it("a prompt queued mid-run doesn't take over the running prompt's Retry", async () => {
+    const { d, key, a, posts, view } = await queuedBehind("retry-queued", 1502);
+    try {
+      expect(d.state.getThread(key)?.lastPrompt?.ts).toBe(a.ts);
+      await view.handle({ type: "session.error", properties: { sessionID: "retry-queued", error: "Run interrupted" } } as never);
+      const actions = posts.at(-1)!.blocks?.find((blk) => blk.type === "actions");
+      expect(actions?.elements[0]).toMatchObject({ action_id: "run_retry", value: a.ts });
+    } finally { deleteView("retry-queued"); }
+  });
+
+  it("the queued prompt becomes what Retry resends once OpenCode delivers it as its own run", async () => {
+    const { d, key, b, view } = await queuedBehind("retry-delivered", 1503);
+    try {
+      const inboxID = d.state.getReceipt(key, b.ts)!.submission!.messageId;
+      await view.handle({ type: "session.inbox", properties: { sessionID: "retry-delivered", inboxID, outcome: "delivered" } } as never);
+      expect(d.state.getThread(key)?.lastPrompt).toEqual({ text: "second", ts: b.ts, sessionId: "retry-delivered" });
+    } finally { deleteView("retry-delivered"); }
+  });
+
+  it("a hushed thread still retries: the tap is explicit intent", async () => {
+    const root = ts("1501.000000");
+    const submitted: string[] = [];
+    const client = { session: { promptAsync: async (args: any) => { submitted.push(args.body.parts[0].text); return { data: {} }; },
+      messages: async () => ({ data: [] }), get: async () => ({ data: {} }) } };
+    const d = makeDeps("retry-hushed", fakePool(client), fakeRender({ posted: [], deleted: [], reacted: [], dms: [] }));
+    d.state.setThread(`C:${root}`, { sessionId: "retry-hushed", projectDir: "/p", verbose: "on", createdAt: 1, lastUsedAt: 1, lastSeenTs: root, hushed: true });
+    try {
+      expect(await retryPrompt(d, "C", root, ts("1501.000001"), "again")).toBe("accepted");
+      expect(submitted).toEqual(["again"]);
+    } finally { deleteView("retry-hushed"); }
   });
 });

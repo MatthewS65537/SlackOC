@@ -1,0 +1,11 @@
+[
+  "react U1 :eyes:",
+  "post M1: I need to run the migration script.",
+  "post M2: ⎯⎯⎯ tools ⎯⎯⎯\n\n🔧 Run the database migration",
+  "post M3 +blocks: 🔐 *Permission needed* — Run npm run migrate",
+  "update M3: ✅ Allowed once.",
+  "post M4: ⎯⎯⎯ response ⎯⎯⎯\n\nMigration applied: `0007_add_index`.",
+  "unreact U1 :eyes:",
+  "react U1 :white_check_mark:",
+  "post M5: *project* · `anthropic/claude-sonnet-4-5` · 13s · $0.0080 · 1.8k↑/240↓ · Verbose Tools"
+]

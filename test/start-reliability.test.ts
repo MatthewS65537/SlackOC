@@ -116,6 +116,8 @@ const THREAD_CARD_TS = `${NOW / 1000}.000001`;
 const DM_CARD_TS = `${NOW / 1000}.000002`;
 let messageSequence = 10;
 const slackTs = () => `${Math.floor(Date.now() / 1000)}.${String(messageSequence++).padStart(6, "0")}`;
+/** Delivery marker of a posted/updated Slack message: invisible metadata, never the text (slack/markers.ts). */
+const markerOf = (args: any): string => args?.metadata?.event_payload?.marker ?? "";
 const rejected = (error = "missing_scope") => Object.assign(new Error(error), {
   code: "slack_webapi_platform_error", data: { error },
 });
@@ -422,7 +424,7 @@ describe("startBridge reliability wiring", () => {
     expect(saved.askTs).not.toBe(initial.askTs);
     const posts = f.app.client.chat.postMessage.mock.calls.map(([args]: any[]) => args);
     const status = posts.findIndex((args: any) => args.channel === "C" && args.text.includes("*Pending questions:*"));
-    const fresh = posts.findIndex((args: any) => args.channel === "C" && args.text.includes(":card:1:thread"));
+    const fresh = posts.findIndex((args: any) => args.channel === "C" && markerOf(args).includes(":card:1:thread"));
     expect(fresh).toBeGreaterThan(status);
     const ack = vi.fn(async () => {});
     await f.app.views.get("qtext_submit")({ ack, body: { user: { id: "UOWNER" } }, view: {
@@ -459,13 +461,15 @@ describe("startBridge reliability wiring", () => {
     const saved = new QuestionsStore(`${f.root}/questions.json`).get(req.id)!;
     expect(saved.relocation?.thread?.status).toBe("uncertain");
     const attempted = f.app.client.chat.postMessage.mock.calls.map(([args]: any[]) => args)
-      .find((args: any) => args.channel === "C" && args.text.includes(":card:1:thread"));
+      .find((args: any) => args.channel === "C" && markerOf(args).includes(":card:1:thread"));
     expect(attempted).toBeDefined();
-    const marker = attempted.text.split("\n").at(-1);
+    // The push-notification text and the card show no raw marker.
+    expect(attempted.text).toBe("❓ OpenCode has a question");
+    expect(JSON.stringify(attempted.blocks)).not.toContain("slackoc-");
     const recoveredTs = slackTs();
     f.app.client.conversations.replies.mockResolvedValue({ messages: [
-      { user: "UOTHER", text: marker, ts: slackTs() },
-      { user: "UBOT", text: `OpenCode question\n${marker}`, ts: recoveredTs },
+      { user: "UOTHER", text: "quoted", metadata: attempted.metadata, ts: slackTs() },
+      { user: "UBOT", text: attempted.text, metadata: attempted.metadata, ts: recoveredTs },
     ] });
     const attempts = f.app.client.chat.postMessage.mock.calls.length;
     f.pool.onReady(f.root, f.pool.entry.baseUrl);
@@ -484,7 +488,7 @@ describe("startBridge reliability wiring", () => {
     await drain(Promise.all([textPermission("C", "UOWNER", "\\questions"), textPermission("C", "UOWNER", "\\questions")]), 8_800);
     const saved = new QuestionsStore(`${f.root}/questions.json`).get(request.id)!;
     expect(saved.presentation).toBe(1);
-    const newCards = f.app.client.chat.postMessage.mock.calls.map(([args]: any[]) => args).filter((args: any) => args.text.includes(":card:1:"));
+    const newCards = f.app.client.chat.postMessage.mock.calls.map(([args]: any[]) => args).filter((args: any) => markerOf(args).includes(":card:1:"));
     expect(newCards).toHaveLength(2);
     expect(f.reply).not.toHaveBeenCalled();
   });
@@ -668,7 +672,7 @@ describe("startBridge reliability wiring", () => {
     await boot(); f.questions.mockResolvedValue([request]);
     const oldPost = deferred<{ ts: string }>();
     f.app.client.chat.postMessage.mockImplementation(async (args: any) => {
-      if (args.channel === "C" && args.thread_ts === ROOT_TS && args.text.includes("slackoc-question:")) return oldPost.promise;
+      if (args.channel === "C" && args.thread_ts === ROOT_TS && markerOf(args).startsWith("slackoc-question:")) return oldPost.promise;
       return slackPost(args);
     });
     f.pool.onEvent(f.root, "question.asked", request); await vi.advanceTimersByTimeAsync(1_100);
@@ -692,12 +696,16 @@ describe("startBridge reliability wiring", () => {
     const dm = deferred<{ ts: string }>();
     f.app.client.chat.postMessage.mockImplementation(async (args: any) => args.channel === "DOWNER" ? dm.promise : slackPost(args));
     f.pool.onEvent(f.root, "question.asked", request); await vi.advanceTimersByTimeAsync(1_100);
-    const text = f.app.client.chat.postMessage.mock.calls.find(([args]: any[]) => args.channel === "DOWNER")[0].text;
+    const { text, blocks, metadata } = f.app.client.chat.postMessage.mock.calls.find(([args]: any[]) => args.channel === "DOWNER")[0];
+    expect(JSON.stringify([text, blocks])).not.toContain("slackoc-");
     await drain(clickQuestion());
     dm.reject(new Error("post response lost")); await vi.advanceTimersByTimeAsync(0);
-    f.app.client.conversations.history.mockResolvedValue({ messages: [{ user: "UBOT", ts: DM_CARD_TS, text }] });
+    f.app.client.conversations.history.mockResolvedValue({ messages: [{ user: "UBOT", ts: DM_CARD_TS, text, metadata }] });
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(f.app.client.chat.update).toHaveBeenCalledWith(expect.objectContaining({ channel: "DOWNER", ts: DM_CARD_TS, text: expect.stringContaining("Answer confirmed") }));
+    // The collapse edit re-sends the copy's marker metadata, so it stays findable after the edit.
+    expect(f.app.client.chat.update).toHaveBeenCalledWith(expect.objectContaining({ channel: "DOWNER", ts: DM_CARD_TS, text: expect.stringContaining("Answer confirmed"),
+      metadata: expect.objectContaining({ event_type: "slackoc_marker", event_payload: expect.objectContaining({ kind: "question", id: request.id }) }) }));
+    expect(f.app.client.conversations.history).toHaveBeenCalledWith(expect.objectContaining({ channel: "DOWNER", include_all_metadata: true }));
     expect(f.reply).toHaveBeenCalledOnce();
   });
 
@@ -1188,9 +1196,11 @@ describe("startBridge reliability wiring", () => {
     await postPermission();
     const attempted = f.app.client.chat.postMessage.mock.calls.find(([args]: any[]) => args.channel === channel)[0];
     const history = channel === "C" ? f.app.client.conversations.replies : f.app.client.conversations.history;
+    expect(markerOf(attempted)).toMatch(/^slackoc-permission-/);
+    expect(JSON.stringify([attempted.text, attempted.blocks])).not.toContain("slackoc-");
     history.mockResolvedValue({ messages: [
-      { user: "UOTHER", text: attempted.text, ts: slackTs() },
-      { user: "UBOT", text: attempted.text, ts: channel === "C" ? THREAD_CARD_TS : DM_CARD_TS },
+      { user: "UOTHER", text: attempted.text, metadata: attempted.metadata, ts: slackTs() },
+      { user: "UBOT", text: attempted.text, metadata: attempted.metadata, ts: channel === "C" ? THREAD_CARD_TS : DM_CARD_TS },
     ] });
     f.pool.list.mockReturnValue([f.pool.entry]);
     f.receiver.client.emit("connected");
@@ -1519,5 +1529,47 @@ describe("startBridge reliability wiring", () => {
     expect(f.app.client.chat.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining("Bridge restarted during this run"),
     }));
+  });
+});
+
+describe("Slack's native agent session (A1)", () => {
+  /** Boot with the agents API, then start a live run in the bound thread (Slack shows Working… + Stop). */
+  async function liveRun() {
+    await boot();
+    const setStatus = vi.fn(async (_args: any) => ({ ok: true }));
+    const rename = vi.fn(async (_args: any) => ({ ok: true }));
+    f.app.client.agents = { sessions: { setStatus, rename } };
+    const ops: string[] = [];
+    f.pool.entry.client.v2 = { session: { inbox: { list: vi.fn(async () => [{ type: "user", id: "inbox-1" }]) } } };
+    Object.assign(f.pool.entry.client.session, {
+      inboxCancel: vi.fn(async ({ body }: any) => { ops.push(`cancel ${body.inboxID}`); return { data: {} }; }),
+      abort: vi.fn(async () => { ops.push("abort"); return { data: {} }; }),
+    });
+    await drain(f.app.events.get("message")({ event: { channel: "C", thread_ts: ROOT_TS, ts: slackTs(), user: "UOWNER", text: "run the tests" } }));
+    expect(setStatus).toHaveBeenCalledExactlyOnceWith({ channel_id: "C", thread_ts: ROOT_TS, status: "processing",
+      title: "run the tests", initiator_user_id: "UOWNER" });
+    return { setStatus, rename, ops };
+  }
+  const stopEvent = (user: string) => f.app.events.get("agent_session_stopped")({ event: {
+    type: "agent_session_stopped", channel: "C", thread_ts: ROOT_TS, user, event_ts: slackTs(), streaming_message_ts: [],
+  } });
+
+  it("Stop from the owner cancels parked prompts and aborts like \\stop; anyone else's Stop is ignored", async () => {
+    const { setStatus, ops } = await liveRun();
+    await drain(stopEvent("USTRANGER"));
+    expect(ops).toEqual([]);
+    expect(setStatus).toHaveBeenCalledOnce();
+    await drain(stopEvent("UOWNER"));
+    expect(ops).toEqual(["cancel inbox-1", "abort"]);
+    expect(f.app.client.chat.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+      channel: "C", thread_ts: ROOT_TS, text: "🛑 Aborted. Cancelled 1 queued message." }));
+    expect(setStatus).toHaveBeenLastCalledWith(expect.objectContaining({ thread_ts: ROOT_TS, status: "active" }));
+  });
+
+  it("an OpenCode session.renamed renames the bound thread's session", async () => {
+    const { rename } = await liveRun();
+    f.pool.onEvent(f.root, "session.renamed", { sessionID: request.sessionID, title: "Fix flaky login test" });
+    await vi.advanceTimersByTimeAsync(2_200);
+    expect(rename).toHaveBeenCalledExactlyOnceWith({ channel_id: "C", thread_ts: ROOT_TS, title: "Fix flaky login test" });
   });
 });

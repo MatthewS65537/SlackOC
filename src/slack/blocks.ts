@@ -44,7 +44,14 @@ export function validPermissionId(id: unknown): id is string {
 /** Action id for the "View changes" button (finalize line, \diff, completion DMs) — opens the diff modal in diff-view.ts. Value = sessionId. */
 export const VIEW_DIFF_ACTION = "view_diff";
 
-/** A summary section plus a one-tap "View changes" button. The plain-text arg carries the same content for notifications/fallback. */
+/** Action id for the "🚀 Ship…" button (finalize line, \diff, \ship, the diff modal) — opens the Ship panel in diff-view.ts. Value = sessionId. */
+export const SHIP_OPEN_ACTION = "ship_open";
+
+export function shipButton(sessionId: string): Record<string, unknown> {
+  return { type: "button", text: { type: "plain_text", text: "🚀 Ship…" }, action_id: SHIP_OPEN_ACTION, value: sessionId };
+}
+
+/** A summary section plus one-tap "View changes" and "Ship…" buttons. The plain-text arg carries the same content for notifications/fallback. */
 export function viewDiffBlocks(text: string, sessionId: string): unknown[] {
   return [
     { type: "section", text: { type: "mrkdwn", text } },
@@ -58,8 +65,17 @@ export function viewDiffBlocks(text: string, sessionId: string): unknown[] {
           action_id: VIEW_DIFF_ACTION,
           value: sessionId,
         },
+        shipButton(sessionId),
       ],
     },
+  ];
+}
+
+/** \ship's card: modals need a click's trigger_id, so the command posts the button. */
+export function shipCardBlocks(text: string, sessionId: string): unknown[] {
+  return [
+    { type: "section", text: { type: "mrkdwn", text } },
+    { type: "actions", block_id: `ship_${sessionId}`, elements: [shipButton(sessionId)] },
   ];
 }
 
@@ -103,8 +119,9 @@ export interface PermButtonValue {
   g: number; // binding generation
 }
 
-function permissionSummary(perm: OcPermission): string {
-  const lines = [":rotating_light: *OpenCode wants permission*", `*${esc(perm.type)}*: ${esc(perm.title)}`];
+/** What a permission would touch (pattern / command / file lines) — shared by the card and the Home row. */
+export function permissionDetail(perm: OcPermission): string[] {
+  const lines: string[] = [];
   if (perm.pattern) {
     const p = Array.isArray(perm.pattern) ? perm.pattern.join(", ") : perm.pattern;
     lines.push(`pattern: \`${esc(truncate(p, 180))}\``);
@@ -112,7 +129,11 @@ function permissionSummary(perm: OcPermission): string {
   const meta = perm.metadata ?? {};
   if (typeof meta.command === "string") lines.push(`command: \`${esc(truncate(meta.command, 250))}\``);
   if (typeof meta.filePath === "string") lines.push(`file: \`${esc(meta.filePath)}\``);
+  return lines;
+}
 
+function permissionSummary(perm: OcPermission): string {
+  const lines = [":rotating_light: *OpenCode wants permission*", `*${esc(perm.type)}*: ${esc(perm.title)}`, ...permissionDetail(perm)];
   return boundedSection(unicodeEmoji(lines.join("\n")));
 }
 
@@ -409,4 +430,22 @@ export function modelSearchBlocks(prompt: string, initialOption?: unknown): unkn
     placeholder: { type: "plain_text", text: "Search models…" },
     ...(initialOption ? { initial_option: initialOption } : {}),
   } }];
+}
+
+export const RUN_RETRY_ACTION = "run_retry";
+export const PICK_MODEL_RETRY_ACTION = "pick_model_retry";
+/** block_id of a Switch-model card, `model_retry:<prompt ts>`: its pick reruns that failed prompt. */
+export const MODEL_RETRY_BLOCK = /^model_retry:(.+)$/;
+
+/**
+ * D3: a failed run's `:x:` line with ↻ Retry and, for provider errors, Switch model….
+ * Both buttons carry the failed prompt's ts so a card can't resend a newer prompt.
+ */
+export function retryBlocks(text: string, promptTs: string, opts: { switchModel: boolean; note?: string }): unknown[] {
+  const button = (action_id: string, label: string) => ({ type: "button", action_id, value: promptTs, text: { type: "plain_text", text: label } });
+  return [
+    { type: "section", text: { type: "mrkdwn", text } },
+    { type: "actions", elements: [button(RUN_RETRY_ACTION, "↻ Retry"), ...(opts.switchModel ? [button(PICK_MODEL_RETRY_ACTION, "Switch model…")] : [])] },
+    ...(opts.note ? [{ type: "context", elements: [{ type: "mrkdwn", text: opts.note }] }] : []),
+  ];
 }

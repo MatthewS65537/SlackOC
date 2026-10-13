@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { App } from "@slack/bolt";
 import type { StateStore } from "../state.js";
 import { handleIncomingMessage, type BridgeDeps, type SlackMsg } from "./router.js";
+import type { IncomingContext } from "./recovery-policy.js";
 import { enqueue } from "./queue.js";
 import { canonicalDir } from "../paths.js";
 import { logErr } from "../log.js";
@@ -16,6 +17,18 @@ export const SEND_TO_OC = "send_to_oc";
 const SUBMIT = "send_to_oc_submit";
 
 interface Source { channel: string; ts: string; threadTs?: string; text: string; files?: SlackMsg["files"] }
+
+/**
+ * Post a bot "carrier" message (top-level when `root` is undefined) that stands in
+ * for the owner's message, then route `msg` as if the owner sent it there: the run
+ * threads under it. Shared by this shortcut and the saved-prompt ▶ buttons (D1).
+ */
+export async function runViaCarrier(bridge: BridgeDeps, channel: string, root: string | undefined, carrierText: string,
+  msg: Pick<SlackMsg, "text" | "files">, context: IncomingContext = { source: "live" }): Promise<void> {
+  const carrier = await bridge.render.post(channel, root ?? "", carrierText, undefined, { unfurl: false, lane: "interactive" });
+  await handleIncomingMessage({ channel, ts: carrier.ts, thread_ts: root ?? carrier.ts, user: bridge.config.ownerSlackUserId, ...msg },
+    bridge, context);
+}
 
 /** The source channel's pin (else the current project) first, then every other known project (max 100 for a static_select). */
 export function shortcutProjects(state: StateStore, cwd: string, channel: string): string[] {
@@ -68,27 +81,34 @@ export function registerShortcut(app: App, deps: { bridge: BridgeDeps; ownerSlac
 
   app.view(SUBMIT, async ({ ack, body, view }) => {
     const source = pending.get(view.private_metadata);
+    // The source lives only in this process: a restart (or >50 newer shortcuts) loses it.
+    // Keep the modal open with a visible error instead of closing it as if it ran (#44).
+    if (!source) {
+      await ack({ response_action: "errors",
+        errors: { instructions: "This form expired (SlackOC restarted). Close it and run Send to OpenCode again." } });
+      return;
+    }
     const values = view.state.values as Record<string, { v?: { selected_option?: { value?: string } | null; value?: string | null } }>;
     const projectDir = values.project?.v?.selected_option?.value ?? undefined;
     const instructions = values.instructions?.v?.value ?? "";
     const wantThread = values.dest?.v?.selected_option?.value !== "dm";
     // The chosen project only places a new session: a source thread already bound
     // elsewhere keeps the modal open with the conflict (the router rechecks later).
-    const bound = source && wantThread && body.user.id === deps.ownerSlackUserId
+    const bound = wantThread && body.user.id === deps.ownerSlackUserId
       ? bridge.state.getThread(bridge.state.threadKey(source.channel, source.threadTs ?? source.ts)) : null;
     if (bound && projectDir && canonicalDir(bound.projectDir) !== canonicalDir(projectDir)) {
       await ack({ response_action: "errors",
         errors: { project: `This thread already runs in ${bound.projectDir}. Pick that project, or Run in: My DM for a fresh session.` } });
       return;
     }
-    const pin = source && wantThread ? bridge.state.channelProject(source.channel) : undefined;
+    const pin = wantThread ? bridge.state.channelProject(source.channel) : undefined;
     if (pin && projectDir && canonicalDir(projectDir) !== pin) {
       await ack({ response_action: "errors", errors: { project: `📌 This channel is pinned to ${pin}. Pick it, or Run in: My DM.` } });
       return;
     }
     await ack();
     pending.delete(view.private_metadata);
-    if (deps.isStopping() || body.user.id !== deps.ownerSlackUserId || !source) return;
+    if (deps.isStopping() || body.user.id !== deps.ownerSlackUserId) return;
     try {
       const permalink = await app.client.chat.getPermalink({ channel: source.channel, message_ts: source.ts })
         .then(r => r.permalink, () => undefined);
@@ -100,11 +120,8 @@ export function registerShortcut(app: App, deps: { bridge: BridgeDeps; ownerSlac
       if (!channel) return;
       const root = member ? source.threadTs ?? source.ts : undefined;
       const note = wantThread && !member ? " (the bot isn't in that conversation, so the run lives here)" : "";
-      const carrier = await bridge.render.post(channel, root ?? "", `📨 Sent to OpenCode${permalink ? `: <${permalink}|message>` : ""}${note}`,
-        undefined, { unfurl: false, lane: "interactive" });
-      // The carrier post stands in for the owner's message: the run threads under it.
-      await handleIncomingMessage({ channel, ts: carrier.ts, thread_ts: root ?? carrier.ts, user: deps.ownerSlackUserId,
-        text: shortcutPrompt(instructions, source.text, permalink), files: source.files }, bridge, { source: "live", projectDir });
+      await runViaCarrier(bridge, channel, root, `📨 Sent to OpenCode${permalink ? `: <${permalink}|message>` : ""}${note}`,
+        { text: shortcutPrompt(instructions, source.text, permalink), files: source.files }, { source: "live", projectDir });
     } catch (err) {
       logErr(`send to OpenCode failed: ${String((err as Error)?.message ?? err)}`);
     }

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getCommand, allCommands, execute, registerCommand, resolveCommandName, type CmdCtx } from "../src/commands/registry.js";
-import { newThreadState, HELP_SECTIONS } from "../src/commands/handlers.js";
+import { newThreadState, HELP_SECTIONS, stopThreadFromButton } from "../src/commands/handlers.js";
 import { StateStore } from "../src/state.js";
 import { canonicalDir } from "../src/paths.js";
 import { pickerList } from "../src/commands/picker.js";
@@ -99,16 +99,53 @@ describe("canonical project choices", () => {
   it("an exact project name wins over substring matches; a partial name stays ambiguous (#47)", async () => {
     const state = new StateStore(join(IDENTITY_FIXTURES, "exact-state.json"));
     state.setCurrentProject("/launch");
+    const [app, appWeb] = ["app", "app-web"].map((name) => join(IDENTITY_FIXTURES, "code", name));
+    for (const dir of [app!, appWeb!]) mkdirSync(dir, { recursive: true }); // \project stats its pick (#48)
     const client = { session: { create: async () => ({ data: { id: "exact-new" } }) } };
     const out: string[] = [];
     const ctx = baseCtx(state, out, null, { threadKey: "exact:1", pool: {
-      list: () => [{ dir: "/code/app", status: "ready" }, { dir: "/code/app-web", status: "ready" }],
+      list: () => [{ dir: app, status: "ready" }, { dir: appWeb, status: "ready" }],
       acquire: async () => ({ entry: { client }, release: () => {} }),
     } as never });
     await getCommand("project")!.run(ctx, "ap");
     expect(out.at(-1)).toContain("Ambiguous");
     await getCommand("project")!.run(ctx, "app");
-    expect(state.getThread("exact:1")?.projectDir).toBe("/code/app");
+    expect(state.getThread("exact:1")?.projectDir).toBe(canonicalDir(app!));
+  });
+
+  it("\\cd resolves relative paths against the thread's project, not the launch dir (#48)", async () => {
+    const root = join(IDENTITY_FIXTURES, "relative");
+    const [projA, projB, launch] = ["projA", "projB", "elsewhere/launch"].map((name) => join(root, name));
+    for (const dir of [projA!, projB!, join(launch!, "only-here")]) mkdirSync(dir, { recursive: true });
+    const state = new StateStore(join(root, "state.json"));
+    state.setThread("C1:T1", newThreadState("ses_rel", projA!));
+    const calls: string[] = [];
+    const client = { session: { create: async () => ({ data: { id: "ses_rel_new" } }),
+      abort: async () => void calls.push("abort"), delete: async () => void calls.push("delete") } };
+    const pool = { acquire: async () => ({ entry: { client }, release: () => {} }), killOne: async () => {}, list: () => [] } as never;
+    const ctx = () => baseCtx(state, [], state.getThread("C1:T1"), { cwd: launch!, pool });
+    await expect(getCommand("cd")!.run(ctx(), "only-here")).rejects.toThrow("is not a directory");
+    expect(calls).toEqual([]); // refused before the old session was torn down
+    await getCommand("cd")!.run(ctx(), "../projB");
+    expect(state.getThread("C1:T1")?.projectDir).toBe(canonicalDir(projB!));
+  });
+
+  it("\\project refuses a remembered folder that is gone, keeping this thread's session (#48)", async () => {
+    const root = join(IDENTITY_FIXTURES, "gone");
+    const here = join(root, "here");
+    mkdirSync(here, { recursive: true });
+    const state = new StateStore(join(root, "state.json"));
+    state.setCurrentProject(here);
+    state.touchProject(join(root, "vanished"));
+    state.setThread("C1:T1", newThreadState("ses_keep", here));
+    const create = vi.fn();
+    const abort = vi.fn();
+    const pool = { acquire: async () => ({ entry: { client: { session: { create, abort, delete: abort } } }, release: () => {} }),
+      killOne: async () => {}, list: () => [] } as never;
+    await expect(getCommand("project")!.run(baseCtx(state, [], state.getThread("C1:T1"), { pool }), "vanished")).rejects.toThrow("is not a directory");
+    expect(create).not.toHaveBeenCalled();
+    expect(abort).not.toHaveBeenCalled();
+    expect(state.getThread("C1:T1")?.sessionId).toBe("ses_keep");
   });
 
   it("requires a fresh successfully displayed per-thread list for numeric choices", async () => {
@@ -460,18 +497,22 @@ describe("command registry (user-mandated surface)", () => {
   });
 
   it("\\project <name|#> fuzzy-swaps through the same fresh rebind", async () => {
-    const state = new StateStore(`${import.meta.dirname}/.fixtures/project-swap/state.json`);
-    state.setCurrentProject("/code/cowork");
-    state.touchProject("/code/other-app"); // known project to swap to
+    const root = join(import.meta.dirname, ".fixtures", "project-swap");
+    rmSync(root, { recursive: true, force: true });
+    const [cowork, other] = ["cowork", "other-app"].map((name) => join(root, "code", name));
+    for (const dir of [cowork!, other!]) mkdirSync(dir, { recursive: true }); // \project stats its pick (#48)
+    const state = new StateStore(join(root, "state.json"));
+    state.setCurrentProject(cowork!);
+    state.touchProject(other!); // known project to swap to
     const out: string[] = [];
     const mkCtx = (threadModel?: string) => ({
       channelId: "C1",
       threadTs: "T1",
       threadKey: "C1:T1",
-      thread: threadModel ? ({ ...newThreadState("ses_old", "/code/cowork") } as never) : null,
+      thread: threadModel ? ({ ...newThreadState("ses_old", cowork!) } as never) : null,
       state,
       config: null as never,
-      cwd: "/code/cowork",
+      cwd: cowork!,
       postToThread: async (t: string) => {
         out.push(t);
       },
@@ -491,19 +532,19 @@ describe("command registry (user-mandated surface)", () => {
 
     // fuzzy name (case-insensitive substring of basename)
     await project!.run(mkCtx("x"), "OTHER");
-    expect(state.currentProjectDir).toBe("/code/other-app");
+    expect(state.currentProjectDir).toBe(canonicalDir(other!));
     expect(state.getThread("C1:T1")?.sessionId).toBe("ses_fresh");
     expect(out.at(-1)).toContain("other-app");
 
     // bare listing numbers the (non-current) candidates
     out.length = 0;
     await project!.run(mkCtx(), "");
-    expect(out.join("\n")).toContain("*Current:* `/code/other-app`");
+    expect(out.join("\n")).toContain(`*Current:* \`${canonicalDir(other!)}\``);
     expect(out.join("\n")).toContain("1) `cowork`");
 
     // swap by number (relative to the current listing)
     await project!.run(mkCtx(), "1");
-    expect(state.currentProjectDir).toBe("/code/cowork");
+    expect(state.currentProjectDir).toBe(canonicalDir(cowork!));
   });
 });
 
@@ -587,17 +628,51 @@ describe("QoL round (Sep 2026)", () => {
     expect(state.getThread("C1:T1")?.projectDir).toBe("/pinned");
   });
 
-  it("\\stop with nothing running says so and never touches the server", async () => {
+  it("\\stop with nothing running or parked says so and never interrupts", async () => {
     const state = new StateStore(`${import.meta.dirname}/.fixtures/stop-idle/state.json`);
     state.setThread("C1:T1", newThreadState("s-stop-idle", "/p"));
     let aborted = false;
     const out: string[] = [];
-    const ctx = baseCtx(state, out, state.getThread("C1:T1"), {
-      pool: { ensure: async () => ({ client: { session: { abort: async () => { aborted = true; return { data: {} }; } } } }) } as never,
-    });
+    const client = {
+      v2: { session: { inbox: { list: async () => [] } } },
+      session: { abort: async () => { aborted = true; return { data: {} }; } },
+    };
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), { pool: { ensure: async () => ({ client }) } as never });
     await getCommand("stop")!.run(ctx, "");
     expect(aborted).toBe(false);
     expect(out.join("\n")).toContain("Nothing running");
+  });
+
+  it("\\stop with OpenCode down: idle says nothing is running; with a live view it still fails", async () => {
+    const { SessionView, deleteView } = await import("../src/slack/render.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/stop-down/state.json`);
+    state.setThread("C1:T1", newThreadState("s-stop-down", "/p"));
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), { pool: { ensure: async () => { throw new Error("opencode unreachable"); } } as never });
+    await getCommand("stop")!.run(ctx, "");
+    expect(out).toEqual(["Nothing running in this thread."]);
+    new SessionView({ sessionId: "s-stop-down", projectDir: "/p", channel: "C1", threadTs: "T1", threadKey: "C1:T1",
+      client: {} as never, deps: fakeViewDeps([]), state, threadState: state.getThread("C1:T1")! });
+    try {
+      await expect(getCommand("stop")!.run(ctx, "")).rejects.toThrow("opencode unreachable");
+    } finally { deleteView("s-stop-down"); }
+  });
+
+  it("\\stop with no live view still cancels parked prompts and reports them (0.2b)", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/stop-parked-noview/state.json`);
+    state.setThread("C1:T1", newThreadState("s-stop-noview", "/p"));
+    const calls: string[] = [];
+    const client = {
+      v2: { session: { inbox: { list: async () => [{ type: "user", id: "msg_a" }, { type: "user", id: "msg_b" }] } } },
+      session: {
+        inboxCancel: async ({ body }: any) => void calls.push(`cancel ${body.inboxID}`),
+        abort: async () => void calls.push("abort"),
+      },
+    };
+    const out: string[] = [];
+    await getCommand("stop")!.run(baseCtx(state, out, state.getThread("C1:T1"), { pool: { ensure: async () => ({ client }) } as never }), "");
+    expect(calls).toEqual(["cancel msg_a", "cancel msg_b"]); // no view: nothing to interrupt
+    expect(out.at(-1)).toBe("🛑 Cancelled 2 queued messages.");
   });
 
   it("\\stop cancels this session's parked prompts before interrupting", async () => {
@@ -1300,6 +1375,10 @@ describe("\\watch / \\unwatch", () => {
     expect(th?.pendingRun).toBeUndefined(); // the boot sweep must never ❌ this thread
     expect(getView("ses_watchme")).toBeDefined();
     expect(posted.join("\n")).toContain("watching");
+    // A stale Home Stop must not interrupt the session the computer is driving.
+    await stopThreadFromButton({ state, pool: ctx.pool, render: ctx.render! }, "C1:T1");
+    expect(posted.at(-1)).toContain("mirrored with `\\watch` and driven elsewhere");
+    expect(getView("ses_watchme")).toBeDefined();
     await getCommand("unwatch")!.run({ ...ctx, thread: state.getThread("C1:T1") } as never, "");
     expect(state.getThread("C1:T1")?.watchOnly).toBe(false);
     expect(getView("ses_watchme")).toBeUndefined();
@@ -1430,16 +1509,41 @@ describe("\\cmd", () => {
     expect(out.at(-1)).toBe("*OpenCode commands in* `/p`\n• `compact` — Summarize context\n• `init`\n\nRun one with `\\cmd <command> [args]`.");
   });
 
-  it("chunks long command output instead of posting one oversized message", async () => {
-    const state = new StateStore(`${import.meta.dirname}/.fixtures/cmd-chunk/state.json`);
-    state.setThread("C1:T1", newThreadState("ses_c", "/p"));
-    const out: string[] = [];
-    const long = Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(40)}`).join("\n");
-    const client = { session: { command: async () => ({ data: { parts: [{ type: "text", text: long }] } }) } };
-    await getCommand("cmd")!.run(baseCtx(state, out, state.getThread("C1:T1"), { pool: leasePool(client) }), "review");
-    expect(out.length).toBeGreaterThan(1);
-    expect(out.every((m) => m.length <= 3800)).toBe(true);
-    expect(out.join("\n")).toBe(long);
+  it("\\cmd hands its message to a live view, so the queued run streams and finalizes like a prompt (#31)", async () => {
+    const { getView, deleteView } = await import("../src/slack/render.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/cmd-view/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_cmd_view", "/p"));
+    const command = vi.fn(async () => undefined); // V2: queued, no output in the reply
+    const posted: string[] = [];
+    const reactions: string[] = [];
+    const render = { ...fakeViewDeps(posted),
+      react: async (_c: string, ts: string, name: string) => void reactions.push(`+${name} ${ts}`),
+      unreact: async (_c: string, ts: string, name: string) => void reactions.push(`-${name} ${ts}`) };
+    const ctx = baseCtx(state, [], state.getThread("C1:T1"), { pool: leasePool({ session: { command } }), render, messageTs: "M1",
+      react: async (name: string, add = true) => void reactions.push(`${add ? "+" : "-"}${name} M1`) });
+    try {
+      await execute({ name: "cmd", args: "review src/x.ts" }, ctx);
+      expect(command).toHaveBeenCalledWith(expect.objectContaining({ body: { command: "review", arguments: "src/x.ts" } }));
+      const view = getView("ses_cmd_view");
+      expect(view?.isActive).toBe(true);
+      expect(reactions).toEqual(["+eyes M1"]); // execute leaves the outcome to the view
+      await view!.handle({ type: "message.part.updated",
+        properties: { part: { id: "p1", messageID: "m1", type: "text", text: "Review: looks good", time: { end: 1 } } } } as never);
+      await view!.finalize();
+      expect(posted.some((p) => p.includes("Review: looks good"))).toBe(true);
+      expect(posted.some((p) => p.includes("no text output"))).toBe(false);
+      expect(reactions.slice(1)).toEqual(["-eyes M1", "+white_check_mark M1"]);
+    } finally { deleteView("ses_cmd_view"); }
+  });
+
+  it("\\cmd that fails to queue drops the view it attached", async () => {
+    const { getView } = await import("../src/slack/render.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/cmd-fail/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_cmd_fail", "/p"));
+    const client = { session: { command: async () => { throw new Error("unknown command"); } } };
+    const ctx = baseCtx(state, [], state.getThread("C1:T1"), { pool: leasePool(client), render: fakeViewDeps([]), messageTs: "M1" });
+    await expect(getCommand("cmd")!.run(ctx, "nope")).rejects.toThrow("unknown command");
+    expect(getView("ses_cmd_fail")).toBeUndefined();
   });
 });
 
@@ -1609,5 +1713,27 @@ describe("\\pin (channel project lock)", () => {
     expect(state.channelProject("C1")).toBeUndefined();
     await getCommand("cd")!.run(baseCtx(state, out, null, { pool }), other);
     expect(state.getThread("C1:T1")?.projectDir).toBe(other);
+  });
+});
+
+describe("\\status context meter (E3)", () => {
+  it("shows the thread's context use where its last run ended, and nothing when unknown", async () => {
+    const { SessionView } = await import("../src/slack/render.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/status-ctx/state.json`);
+    const catalog = { default: {}, providers: [{ id: "anthropic", name: "anthropic", models: { sonnet: { id: "sonnet", name: "Sonnet", limit: { context: 200_000 } } } }] };
+    const view = new SessionView({ sessionId: "ses_ctx", projectDir: "/p", channel: "C1", threadTs: "T1", threadKey: "C1:T1",
+      client: { directory: "/status-ctx", config: { providers: async () => ({ data: catalog }) } } as never,
+      deps: { post: async () => ({ ts: "x" }), update: async () => {}, delete: async () => {}, react: async () => {}, unreact: async () => {}, upload: async () => {} },
+      state, threadState: newThreadState("ses_ctx", "/p") });
+    await view.handle({ type: "message.updated", properties: { info: { id: "m1", role: "assistant", providerID: "anthropic", modelID: "sonnet",
+      tokens: { input: 30_000, output: 10, cache: { read: 150_000 } } } } } as never);
+    await view.finalize();
+    const status = async (sessionId: string) => {
+      const out: string[] = [];
+      await getCommand("status")!.run(baseCtx(state, out, newThreadState(sessionId, "/p"), { pool: { list: () => [] } as never }), "");
+      return out.join("\n").split("\n").find((l) => l.startsWith("*Thread:*"))!;
+    };
+    expect(await status("ses_ctx")).toContain("· verbose=`on` · ctx 90%");
+    expect(await status("ses_unknown")).not.toContain("ctx");
   });
 });

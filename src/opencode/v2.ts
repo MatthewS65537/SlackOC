@@ -79,6 +79,7 @@ export function normalizeMessages(messages: SessionMessageInfo[], sessionID: str
   let parentID: string | undefined;
   const rows: Array<{ info: OcMessageInfo; parts: OcPart[] }> = [];
   for (const m of messages) {
+    // Shell (`\!`) rows are dropped too: their output was already posted by the command, so finalize's backstop must never re-post it.
     if (m.type !== "user" && m.type !== "assistant") continue;
     if (m.type === "user") parentID = m.id;
     const info: OcMessageInfo = { id: m.id, sessionID, role: m.type, time: m.time,
@@ -107,11 +108,26 @@ function partId(messageID: string, kind: string, ordinal: number): string {
   return `${messageID}:${kind}:${ordinal}`;
 }
 
+/**
+ * sessionID → its latest delivered user input, the parentID of new steps. Shared
+ * by every adapter (not per instance): the pool builds a fresh V2Events on each
+ * resubscribe, and steps after a reconnect must keep their parent (0.2c). Session
+ * IDs are unique on the one shared service; oldest entries are evicted past the cap.
+ */
+const parents = new Map<string, string>();
+const MAX_PARENTS = 1_000;
+
+/**
+ * assistantMessageID → its step.started info (model, parent, start time). Shared
+ * like `parents`: a step.ended after a resubscribe must still carry the model the
+ * run summary shows. Entries go at step end; the cap bounds steps whose end was lost.
+ */
+const steps = new Map<string, OcMessageInfo>();
+const MAX_STEPS = 1_000;
+
 /** Synchronous translation; never block the live event reader on Slack I/O. */
 export class V2Events {
   private tools = new Map<string, OcPart>();
-  private messages = new Map<string, OcMessageInfo>();
-  private parents = new Map<string, string>();
   private idle = new Set<string>();
   private text = new Map<string, { text: string; emitted: number; started: boolean }>();
   translate(event: V2Event): OcEvent[] {
@@ -131,23 +147,36 @@ export class V2Events {
         return emit("message.updated", { info: { id: inboxID, sessionID, role: "user", time: { created: event.created } } });
       }
       case "session.inbox.delivered":
-        this.parents.set(event.data.sessionID, event.data.inboxID);
+        parents.delete(event.data.sessionID); // re-insert: Map order is the eviction order
+        parents.set(event.data.sessionID, event.data.inboxID);
+        if (parents.size > MAX_PARENTS) parents.delete(parents.keys().next().value!);
         return emit("session.inbox", { ...event.data, outcome: "delivered" });
       case "session.inbox.cancelled": return emit("session.inbox", { ...event.data, outcome: "cancelled" });
+      // Mirrored onto the bound thread's native Slack agent session title (start.ts).
+      case "session.renamed": return emit(event.type, { sessionID: event.data.sessionID, title: event.data.title });
+      // `\!` (commands/shell.ts) waits for "ended"; views ignore both, so shell output never streams into a run.
+      case "session.shell.started":
+        return emit("session.shell", { sessionID: event.data.sessionID, phase: "started", shellID: event.data.shell.id, command: event.data.shell.command });
+      case "session.shell.ended": {
+        const { sessionID, shell, output } = event.data;
+        return emit("session.shell", { sessionID, phase: "ended", shellID: shell.id, command: shell.command,
+          status: shell.status, exit: shell.exit, output: output.output, truncated: output.truncated });
+      }
       case "session.step.started": {
         const p = event.data;
         const info: OcMessageInfo = { id: p.assistantMessageID, sessionID: p.sessionID, role: "assistant",
-          parentID: this.parents.get(p.sessionID), modelID: p.model.id, providerID: p.model.providerID, time: { created: p.started } };
-        this.messages.set(info.id, info);
+          parentID: parents.get(p.sessionID), modelID: p.model.id, providerID: p.model.providerID, time: { created: p.started } };
+        steps.set(info.id, info);
+        if (steps.size > MAX_STEPS) steps.delete(steps.keys().next().value!);
         return emit("message.updated", { info });
       }
       case "session.step.ended": case "session.step.failed": {
         const p = event.data;
-        const prior = this.messages.get(p.assistantMessageID);
+        const prior = steps.get(p.assistantMessageID);
         const info: OcMessageInfo = { ...prior, id: p.assistantMessageID, sessionID: p.sessionID, role: "assistant",
           finish: p.finish, cost: p.cost, tokens: p.tokens, time: { created: prior?.time?.created ?? event.created, completed: event.created },
           error: "error" in p ? { name: p.error.type, data: { message: p.error.message } } : undefined };
-        this.messages.delete(info.id);
+        steps.delete(info.id);
         return emit("message.updated", { info });
       }
       case "session.text.ended": {
@@ -220,7 +249,8 @@ export class V2Events {
         return emit("session.compaction", { sessionID: event.data.sessionID, phase: "failed", error: event.data.error.message });
       case "session.retry.scheduled": return emit("session.status", { sessionID: event.data.sessionID,
         status: { type: "retry", attempt: event.data.attempt, message: event.data.error.message, next: event.data.at } });
-      case "session.execution.failed": return emit("session.error", { sessionID: event.data.sessionID, error: event.data.error.message });
+      case "session.execution.failed": return emit("session.error", { sessionID: event.data.sessionID, error: event.data.error.message,
+        errorType: event.data.error.type }); // e.g. provider.transport: render.ts offers Switch model…
       case "session.execution.interrupted": return emit("session.error", { sessionID: event.data.sessionID, error: "Run interrupted" });
       default: return [];
     }

@@ -6,17 +6,22 @@ import { loadConfig, PID_PATH, CONFIG_PATH, STATE_PATH } from "./config.js";
 import { StateStore } from "./state.js";
 import { ServerPool } from "./opencode/server.js";
 import { noteSessionActivity } from "./commands/picker.js";
+import { stopThreadFromButton } from "./commands/handlers.js";
+import { PromptStore } from "./prompts.js";
 import { PERMISSION_STORE_PATH, PermissionDeliveryStore } from "./slack/permissions.js";
 import { QuestionsStore } from "./slack/questions-store.js";
 import { recoverInterruptedRuns } from "./slack/boot-recovery.js";
-import { handleIncomingMessage, shouldRouteMessage, type BridgeDeps } from "./slack/router.js";
+import { handleIncomingMessage, isOwnerInput, shouldRouteMessage, type BridgeDeps } from "./slack/router.js";
 import { sessionGet } from "./opencode/client.js";
-import { getView, reconcileStaleViews, setProjectConnectionState, describeActiveRuns, deleteView } from "./slack/render.js";
+import { getView, reconcileStaleViews, setProjectConnectionState, describeActiveRuns, deleteView, onViewsChanged } from "./slack/render.js";
 import { createRenderDeps } from "./slack/render-deps.js";
 import { createInteractions } from "./slack/interactions.js";
 import { registerDiffActions } from "./slack/diff-view.js";
 import { registerRunControls } from "./slack/run-controls.js";
+import { noteShellEvent } from "./commands/shell.js";
+import { registerWorktreeControls } from "./commands/worktrees.js";
 import { registerModelSearch, registerPickerActions } from "./slack/pickers.js";
+import { registerRetryActions } from "./slack/retry.js";
 import { registerHome } from "./slack/home.js";
 import { registerShortcut } from "./slack/shortcut.js";
 import { createCatchupRunner } from "./slack/catchup-runner.js";
@@ -109,6 +114,12 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   const state = new StateStore(STATE_PATH);
   const permissionStore = openStore(PERMISSION_STORE_PATH, (path) => new PermissionDeliveryStore(path));
   const questionStore = openStore(`${dirname(STATE_PATH)}/questions.json`, (path) => new QuestionsStore(path));
+  const promptStore = openStore(`${dirname(STATE_PATH)}/prompts.json`, (path) => new PromptStore(path));
+  // E2: run, ask, report and saved-prompt changes keep an opened Home tab current (home.ts scheduleRefresh).
+  let home: ReturnType<typeof registerHome> | undefined;
+  const refreshHome = () => home?.scheduleRefresh();
+  promptStore.onChange = refreshHome;
+  onViewsChanged(refreshHome);
   let scheduledReports: ScheduledReports | undefined;
   let interactionsEnabled = false;
   // The launch cwd owns the default project on EVERY start. currentProjectDir
@@ -156,7 +167,8 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   /** Hand-rolled thread permalink (null until the team URL is known), so a DM is one tap from context. */
   const permalink = (channel: string, threadTs: string) => teamUrl ? `${teamUrl}archives/${channel}/p${threadTs.replace(".", "")}` : null;
   const viewThread = (channel: string, threadTs: string) => teamUrl ? `\n<${permalink(channel, threadTs)}|view thread>` : "";
-  const render = createRenderDeps(app, { isStopping: () => stopping, dmChannel: () => dmChannelId, viewThread });
+  const render = createRenderDeps(app, { isStopping: () => stopping, dmChannel: () => dmChannelId, viewThread,
+    owner: config.ownerSlackUserId });
 
   const pool = new ServerPool(
     (dir, eventType, props) => {
@@ -199,7 +211,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   const interactions = createInteractions({ app, config, state, pool, render, permissionStore, questionStore,
     isStopping: () => stopping, enabled: () => interactionsEnabled,
     dmChannel: () => dmChannelId, setDmChannel: id => { dmChannelId = id; },
-    botUserId: () => botUserId, scheduledReports: () => scheduledReports, viewThread });
+    botUserId: () => botUserId, scheduledReports: () => scheduledReports, viewThread, onChange: refreshHome });
   cleanup.push(() => interactions.close());
 
   // Subagent lanes (A2): a view-less session whose ancestor has a view is a
@@ -267,6 +279,17 @@ export async function startBridge(opts: StartOpts): Promise<void> {
         if (rid) await interactions.onQuestionResolved(rid, eventType === "question.rejected" ? "rejected" : "replied", props.sessionID as string | undefined);
         return;
       }
+      // A `\!` shell finished: its waiting command posts the output (no view renders it).
+      if (eventType === "session.shell") return noteShellEvent(props);
+      // An OpenCode title change renames the bound thread's native Slack agent session.
+      if (eventType === "session.renamed") {
+        const bound = sessionId ? state.findThreadBySession(sessionId) : null;
+        if (bound && typeof props.title === "string") {
+          const sep = bound.key.indexOf(":");
+          await render.sessionRename?.(bound.key.slice(0, sep), bound.key.slice(sep + 1), props.title);
+        }
+        return;
+      }
       const sid = (props.sessionID as string | undefined) ?? (props.part as { sessionID?: string } | undefined)?.sessionID ?? (props.info as { sessionID?: string } | undefined)?.sessionID;
       if (!sid) return;
       // Activity map BEFORE the view lookup: events for view-less sessions
@@ -321,7 +344,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     scheduledReports = createScheduledReports({ app, pool, state, statePath: STATE_PATH,
       owner: config.ownerSlackUserId, botUserId, ownerDm: () => dmChannelId,
       signal: lifetime.signal, stopping: () => stopping,
-      onError: err => logErr(`scheduled reports: ${String((err as Error)?.message ?? err)}`) });
+      onError: err => logErr(`scheduled reports: ${String((err as Error)?.message ?? err)}`), onChange: refreshHome });
     cleanup.push(() => scheduledReports?.close());
   } catch (err) {
     logErr(`scheduled reports disabled: ${String((err as Error)?.message ?? err)}`);
@@ -340,6 +363,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     isStopping: () => stopping,
     bridgeInfo: { startedAt: Date.now(), dmAvailable: () => dmChannelId !== null, socket: () => socketSupervisor?.health() },
     ownerDmChannel: () => dmChannelId,
+    prompts: promptStore,
     permissions: interactions.permissions,
     threadUrl: (key) => {
       const [channel, threadTs] = key.split(":");
@@ -355,7 +379,8 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     if (stopping) return;
     const e = event as unknown as import("./slack/router.js").SlackMsg;
     pushLog(`in: message ${e.channel}:${e.ts}${e.thread_ts ? " (reply)" : ""}${e.subtype ? ` subtype=${e.subtype}` : ""}`);
-    ghost.noteLive();
+    // Witness owner input only (what sweeps replay); bot echoes and edits would swamp the ratio (#52).
+    if (isOwnerInput(e, config.ownerSlackUserId)) ghost.noteLive();
     if (shouldRouteMessage(e, (c) => state.isAlwaysOn(c))) {
       await handleIncomingMessage(e, bridge).catch((err) => console.error(err));
     }
@@ -364,17 +389,32 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     if (stopping) return;
     const e = event as unknown as import("./slack/router.js").SlackMsg;
     pushLog(`in: app_mention ${e.channel}:${e.ts}`);
-    ghost.noteLive();
+    // Not a ghost witness: the same mention also arrives as a "message" event, counted above.
     await handleIncomingMessage(e, bridge).catch((err) => console.error(err));
   });
+  // Slack's native Stop button (agent_view apps): the \stop path, owner only.
+  app.event("agent_session_stopped", async ({ event }) => {
+    if (stopping) return;
+    const { channel, thread_ts: threadTs, user } = event;
+    pushLog(`in: agent_session_stopped ${channel}:${threadTs} by ${user}`);
+    if (user !== config.ownerSlackUserId) return;
+    try {
+      await stopThreadFromButton({ state, pool, render }, state.threadKey(channel, threadTs));
+    } finally {
+      // Slack leaves the session at processing after Stop; the app must move it.
+      await render.sessionStatus?.(channel, threadTs, "active");
+    }
+  });
 
-  registerHome(app, { ownerSlackUserId: config.ownerSlackUserId, state, pool, permissions: permissionStore, questions: questionStore,
-    reports: () => scheduledReports?.jobs() ?? [], threadUrl: bridge.threadUrl!, isStopping: () => stopping });
+  home = registerHome(app, { ownerSlackUserId: config.ownerSlackUserId, state, pool, permissions: permissionStore, questions: questionStore,
+    reports: () => scheduledReports?.jobs() ?? [], threadUrl: bridge.threadUrl!, isStopping: () => stopping, bridge });
   registerShortcut(app, { bridge, ownerSlackUserId: config.ownerSlackUserId, dmChannel: () => dmChannelId, isStopping: () => stopping });
   registerPickerActions(app, { bridge, ownerSlackUserId: config.ownerSlackUserId, isStopping: () => stopping });
   registerModelSearch(app, { bridge, ownerSlackUserId: config.ownerSlackUserId });
+  registerRetryActions(app, { bridge, ownerSlackUserId: config.ownerSlackUserId, isStopping: () => stopping });
   registerDiffActions(app, { ownerSlackUserId: config.ownerSlackUserId, state, pool, isStopping: () => stopping });
   registerRunControls(app, { ownerSlackUserId: config.ownerSlackUserId, state, pool, isStopping: () => stopping });
+  registerWorktreeControls(app, { ownerSlackUserId: config.ownerSlackUserId, state, pool, render, isStopping: () => stopping });
 
   // Fair, bounded history recovery for retained threads + \listen/DM top-level messages (slack/catchup-runner.ts).
   const runCatchup = createCatchupRunner(app, { state, pool, ownerSlackUserId: config.ownerSlackUserId, ghost,

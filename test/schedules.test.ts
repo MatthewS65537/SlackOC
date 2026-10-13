@@ -334,7 +334,7 @@ describe("singleflight scheduling and recovery", () => {
     expect(tickRun).not.toHaveBeenCalled();
   });
 
-  it.each(["running", "waiting", "uncertain"] as const)("skips overlapping automatic work while a manual run is %s", async status => {
+  it.each(["running", "waiting", "uncertain"] as const)("defers automatic work while a manual run is %s (#34)", async status => {
     const job = store.createJob(definition());
     now = job.nextRunAt - 60_000;
     const manual = store.claim(job.id, now, true);
@@ -345,9 +345,26 @@ describe("singleflight scheduling and recovery", () => {
     await scheduler.poll();
     expect(tickRun).toHaveBeenCalledTimes(1);
     expect(tickRun.mock.calls[0]![0]).toMatchObject({ id: manual.id, status });
-    expect(store.run(automaticRunId(job.id, now))).toMatchObject({ status: "skipped", error: expect.stringMatching(/overlap/) });
+    // Unclaimed and the pointer kept: a later poll can still claim this occurrence.
+    expect(store.run(automaticRunId(job.id, now))).toBeUndefined();
+    expect(store.job(job.id)!.nextRunAt).toBe(now);
     await scheduler.poll();
-    expect(store.runs()).toHaveLength(2);
+    expect(store.runs()).toHaveLength(1);
+  });
+
+  it("skips a deferred occurrence once the grace window passes while still blocked (#34)", async () => {
+    const job = store.createJob(definition());
+    const occurrence = job.nextRunAt;
+    now = occurrence - 60_000;
+    const manual = store.claim(job.id, now, true);
+    store.updateRun(manual.id, run => { run.status = "waiting"; });
+    const scheduler = new Scheduler({ store, now: () => now, tickRun: async () => {} });
+    now = occurrence;
+    await scheduler.poll();
+    now = occurrence + SCHEDULE_GRACE_MS + 1;
+    await scheduler.poll();
+    expect(store.run(automaticRunId(job.id, occurrence))).toMatchObject({ status: "skipped", error: expect.stringMatching(/grace/) });
+    expect(store.job(job.id)!.nextRunAt).toBeGreaterThan(now);
   });
 
   it("an uncertain run past its deadline no longer blocks later reports", async () => {
@@ -362,15 +379,22 @@ describe("singleflight scheduling and recovery", () => {
     expect(store.run(automaticRunId(job.id, now))?.status).toBe("claimed");
   });
 
-  it("allows only one global generation, not one per job", async () => {
+  it("allows only one global generation; a same-time report runs after it (#34)", async () => {
     const first = store.createJob(definition());
     const second = store.createJob({ ...definition(), name: "Second" });
-    now = first.nextRunAt;
-    const tickRun = vi.fn(async (run: ScheduleRun) => { store.updateRun(run.id, current => { current.status = "running"; }); });
-    await new Scheduler({ store, now: () => now, tickRun }).poll();
+    const occurrence = first.nextRunAt;
+    now = occurrence;
+    const tickRun = vi.fn(async (run: ScheduleRun) => { if (run.status === "claimed") store.updateRun(run.id, current => { current.status = "running"; }); });
+    const scheduler = new Scheduler({ store, now: () => now, tickRun });
+    await scheduler.poll();
     expect(tickRun).toHaveBeenCalledTimes(1);
     expect(store.runs(first.id)[0]!.status).toBe("running");
-    expect(store.runs(second.id)[0]!.status).toBe("skipped");
+    expect(store.runs(second.id)).toEqual([]);
+    store.updateRun(store.runs(first.id)[0]!.id, run => { run.status = "delivered"; });
+    now = occurrence + 20 * 60_000;
+    await scheduler.poll();
+    expect(store.runs(second.id)).toEqual([expect.objectContaining({ status: "running", scheduledAt: occurrence })]);
+    expect([store.job(first.id)!.nextRunAt, store.job(second.id)!.nextRunAt]).toEqual([occurrence + 86_400_000, occurrence + 86_400_000]);
   });
 
   it.each(["ready", "delivering", "uncertain"] as const)("recovers saved-output %s through the runner without blocking future generation", async status => {

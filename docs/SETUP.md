@@ -32,7 +32,13 @@ CLI into your global npm bin.
 > **App Manifest**, paste the current JSON, save, then reinstall from
 > **OAuth & Permissions**. The current manifest enables the Home tab
 > (`app_home_opened`), the **Send to OpenCode** message shortcut (`commands`
-> scope), and private channels and group DMs (`message.groups`, `message.mpim`).
+> scope), private channels and group DMs (`message.groups`, `message.mpim`), and
+> Slack's agent messaging view (`features.agent_view` plus the
+> `agent_session_stopped` event), which gives runs Slack's native "Working…"
+> status and Stop button. Hard-refresh Slack (⌘⇧R / Ctrl+Shift+R) after
+> reinstalling to see it. Slack documents the switch from its older assistant view
+> as one-way; removing `agent_view` again is untested, so treat it as permanent.
+> Without it, SlackOC logs one line and keeps working with its own ⏳ status line.
 
 > Why two tokens? The bot token calls the Slack API. The app-level token opens
 > the Socket Mode connection that receives events — outbound-only, so no
@@ -218,7 +224,8 @@ thread message or force Slack's viewport to scroll.
 
 1. In Slack, send `\schedule add` and click **Create report**.
 2. Set the 24-hour start time, explicit IANA time zone, selected weekdays, saved
-   project, prompt/sources, and destination (`dm` or an invited channel ID).
+   project, prompt/sources, and destination (**Your DM**, or **A channel** picked
+   from the list; invite the bot to that channel first).
 3. Review the preview, then **Create schedule**. This authorizes recurring model
    calls; merely opening or previewing the form creates nothing.
 
@@ -227,7 +234,9 @@ for future work, and `\schedule run <id>` for an explicit manual occurrence.
 `\schedule history [id]` shows run IDs and outcomes. Cancel one occurrence with
 `\schedule cancel <run-id>` or `\stop` in its private approval-context thread.
 Removing a definition with `\schedule remove <id>` retains run history and does
-not cancel active work. Create a replacement definition to change its settings.
+not cancel active work. To change a report, `\schedule edit <id>` reopens its form
+prefilled; saving keeps its ID and run history and applies to future occurrences
+(a run already in progress keeps its original settings).
 
 The start time triggers generation, not guaranteed delivery. Keep the Mac and
 bridge awake; see the managed-service section for optional idle-sleep prevention.
@@ -269,6 +278,9 @@ cp -n dist/file-plugin.js ~/.config/opencode/plugins/slackoc-files.js
 cp -n skills/slackoc-send-file/SKILL.md ~/.config/opencode/skills/slackoc-send-file/SKILL.md
 ```
 
+After upgrading SlackOC, re-copy both files (`cp -n` leaves your old copies in
+place); compare them first if you customized either one.
+
 OpenCode V2 discovers both global directories automatically. Watched configuration
 changes can reload them without restarting the service. If the tool is not listed,
 check OpenCode's plugin diagnostics before considering a separately approved restart.
@@ -296,7 +308,15 @@ after the final check is not transactional with Slack; this is not an exactly-on
 delivery guarantee.
 
 One nonempty regular local file, at most **50 MiB**, is sent unchanged per call.
-HTML is an HTML attachment, not an interactive page or an automatic PDF conversion.
+An `.html`/`.htm` file also gets a PDF printed by local headless Chrome, posted
+first in the same message so it opens on a phone; the receipt adds `pdf`. Chrome
+renders the checked bytes from a one-time loopback URL, never the file path, so the
+page can't pull in other local files; relative local images/CSS don't appear in the
+PDF (inline them or use `data:` URIs). If Chrome
+is missing or rendering fails, the HTML still goes out and the receipt says why
+(`pdfSkipped`). `--no-pdf` (tool input `pdf: false`) sends the source only. Set
+`SLACKOC_CHROME` to a Chrome binary if it isn't found; the variable must be visible
+to the OpenCode service, which runs the CLI.
 Comments are limited to 2000 characters and escaped against Slack formatting and
 mentions. Workspace file-type restrictions still apply. The upload budget is
 120 seconds. Success prints a JSON receipt with `ok`, session, channel, parent
@@ -310,6 +330,31 @@ Missing `files:write` requires reinstalling the app with the current manifest.
 Timeout/cancellation or uncertain completion may mean Slack already received the
 file: **check the thread before authorizing another send**. Whole uploads are not
 automatically retried.
+
+## Ship panel
+
+🚀 **Ship…** appears next to 📄 View changes (finalize line, `\diff`, completion
+DMs, the diff modal); `\ship` (`\commit`, `\pr`) posts it on demand. The panel
+lists the repo's changed files with this session's edits pre-ticked, a branch
+(a new `agent/<title>` branch when you're on main/master), a prefilled commit
+message, and **Push** / **Draft PR** checkboxes that start unticked every time.
+
+SlackOC runs `git` and `gh` itself, with no model and no shell: 60 seconds per
+step, stopping at the first failure, never `--force`, hooks still run. Only the
+ticked files are committed, even if other files are already staged. Push uses the
+machine's existing git credentials; Draft PR needs `gh` installed and
+`gh auth login`. The result (or the failing step and its error) is posted to the
+session's thread.
+
+Pushing straight to main/master is refused unless you opt in by adding this to
+`~/.config/slackoc/config.json` (kept across `slackoc init`):
+
+```json
+"ship": { "allowMainPush": true }
+```
+
+Ship is refused while a run is active, and an open panel expires if the bridge
+restarts.
 
 ## Troubleshooting
 
@@ -336,10 +381,12 @@ automatically retried.
 
 ## Where things live
 
-- `~/.config/slackoc/config.json` — tokens + your user id (0600)
+- `~/.config/slackoc/config.json` — tokens + your user id, plus optional `ship` settings (0600)
 - `~/.config/slackoc/state.json` — thread⇄session bindings + known projects (0600)
 - `~/.config/slackoc/permissions.json` — durable approval delivery/response records (0600); preserves uncertain responses across restart
 - `~/.config/slackoc/questions.json` — durable question drafts, delivery/UI revisions, resume identity and uncertain submissions (0600)
+- `~/.config/slackoc/schedules.json` — scheduled report definitions and run history (0600)
+- `~/.config/slackoc/prompts.json` — saved prompts from `\save` (0600)
 - `~/.config/slackoc/slackoc.pid` — running bridge pid
 - `~/.config/slackoc/logs/bridge.log` (+ `.1`, `.2`) — managed service logs, bounded to 15 MiB total
 - `~/.config/slackoc/bridge.log` — foreground bridge log

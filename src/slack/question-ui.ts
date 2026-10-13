@@ -1,7 +1,9 @@
 import { QuestionsStore, questionBindingToken, sameQuestionBinding, type QuestionRelocation, type QuestionSnapshot } from "./questions-store.js";
+import { markerMetadata, type MarkerMetadata } from "./markers.js";
 
 type Destination = "thread" | "dm";
-type Card = { text: string; blocks: unknown[] };
+/** `metadata` (set here, never by render) is the copy's invisible placement marker; transports must send it. */
+type Card = { text: string; blocks: unknown[]; metadata?: MarkerMetadata };
 interface QuestionUiDeps {
   store: QuestionsStore;
   dmChannel(): string | null;
@@ -12,7 +14,8 @@ interface QuestionUiDeps {
   /** Check inside the Slack queue immediately before deleting the old copy. */
   remove(channel: string, ts: string, allowed: () => boolean): Promise<void>;
   post?(channel: string, threadTs: string | undefined, build: () => Card | undefined): Promise<{ ts: string } | undefined>;
-  /** The transport must restrict evidence to bot-authored messages with this exact marker.
+  /** The transport must restrict evidence to bot-authored messages with this exact marker
+   * (metadata payload, or the text of copies posted before markers moved to metadata).
    * `oldest` bounds the search: a replacement is always posted after the copy it replaces. */
   find?(channel: string, threadTs: string | undefined, marker: string, oldest?: string): Promise<{ ts: string } | undefined>;
   rejectedPost?(err: unknown): boolean;
@@ -153,9 +156,8 @@ export class QuestionUiReconciler {
         // A known old copy must never masquerade as evidence of a replacement post.
         // Keep terminal/retry controls on current state; only the placement marker describes the copy.
         const card = this.deps.render(current, destination);
-        const intended = questionPresentationMarker(current, destination);
         const actual = questionPresentationMarker({ ...current, presentation: current[presentationKey(destination)] ?? 0 }, destination);
-        return { ...card, text: card.text.split("\n").map(line => line === intended ? actual : line).join("\n") };
+        return { ...card, metadata: markerMetadata("question", id, actual) };
       });
       if (!sent) {
         if (relocationError) throw relocationError;
@@ -183,6 +185,7 @@ export class QuestionUiReconciler {
         (destination === "dm" && this.deps.dmChannel() !== channel) ||
         (current.presentation ?? 0) <= (current[presentationKey(destination)] ?? 0)) return;
       const text = "Question-card delivery unconfirmed — use \\questions to check.";
+      // No metadata: chat.update keeps this copy's own (older-epoch) marker.
       return { text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] };
     });
   }
@@ -257,8 +260,9 @@ export class QuestionUiReconciler {
     if (!intent.channel) throw new Error("Question relocation destination unavailable");
     this.deps.store.update(id, current => { current.relocation![destination] = structuredClone(intent); });
     if (intent.postedTs) { this.finish(id, destination, intent); return true; }
+    // The replacement's marker comes from the durable intent, so a search after a restart names exactly what was posted.
+    const marker = `slackoc-question:${record.id}:${intent.generation}:card:${intent.epoch}:${destination}:${intent.binding}`;
     if (intent.status === "uncertain" || intent.status === "in-flight") {
-      const marker = `slackoc-question:${record.id}:${intent.generation}:card:${intent.epoch}:${destination}:${intent.binding}`;
       const found = await this.deps.find?.(intent.channel, intent.threadTs, marker, intent.oldTs);
       if (!found) throw new Error("Question placement uncertain; no matching bot-authored evidence, current card retained");
       if (found.ts === intent.oldTs) throw new Error("Question placement uncertain; evidence names the old copy, not a replacement");
@@ -282,7 +286,7 @@ export class QuestionUiReconciler {
         intent.revision = current.ui?.revision ?? 1;
         this.deps.store.update(id, latest => { latest.relocation![destination] = structuredClone(intent); });
         built = true;
-        return card;
+        return { ...card, metadata: markerMetadata("question", id, marker) };
       });
     } catch (err) {
       intent.status = !built || this.deps.rejectedPost?.(err) ? "rejected" : "uncertain";

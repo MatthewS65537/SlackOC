@@ -4,17 +4,20 @@ import type { ScheduleCommands } from "../commands/registry.js";
 import type { ServerPool } from "../opencode/server.js";
 import type { StateStore } from "../state.js";
 import { enqueue } from "../slack/queue.js";
+import { hasMarker, markerMetadata } from "../slack/markers.js";
 import { esc, mdToMrkdwn, truncate } from "../util.js";
-import { installScheduleControls } from "./controls.js";
+import { installScheduleControls, lastRunStatus } from "./controls.js";
 import { ReportRunner } from "./runner.js";
 import { ScheduleStore, TERMINAL_RUN_STATUSES, type ScheduleJob, type ScheduleRun } from "./store.js";
 import { Scheduler } from "./scheduler.js";
 
+export type HomeReport = ScheduleJob & { last?: string };
+
 export interface ScheduledReports {
   commands: ScheduleCommands;
   eligible(threadKey: string, sessionId: string): boolean;
-  /** Current job definitions (read-only copies) for the Home tab. */
-  jobs(): ScheduleJob[];
+  /** Current job definitions (read-only copies) with their last-run status, for the Home tab. */
+  jobs(): HomeReport[];
   poll(): Promise<void>;
   close(): void;
 }
@@ -30,14 +33,18 @@ interface Options {
   signal: AbortSignal;
   stopping: () => boolean;
   onError: (error: unknown) => void;
+  /** Job or run state changed (E2: the Home tab refreshes). */
+  onChange?: () => void;
 }
 
+// Carried invisibly as message metadata (slack/markers.ts); posts before that had them in the text.
 const contextMarker = (id: string) => `slackoc-schedule-context:${id}`;
 const reportMarker = (id: string) => `slackoc-schedule-report:${id}`;
 
 /** One writer, one existing Slack connection, and no synthetic inbound messages. */
 export function createScheduledReports(opts: Options): ScheduledReports {
   const store = new ScheduleStore(join(dirname(opts.statePath), "schedules.json"));
+  store.onCommit = opts.onChange;
   const allowed = (id: string) => {
     const run = store.run(id);
     return !!run && !opts.stopping() && !opts.signal.aborted &&
@@ -63,9 +70,9 @@ export function createScheduledReports(opts: Options): ScheduledReports {
   };
   const find = async (channel: string, marker: string, since: number) => {
     const result = await enqueue(() => opts.app.client.conversations.history({ channel,
-      oldest: String(Math.max(0, since - 60_000) / 1000), inclusive: true, limit: 100 }),
+      oldest: String(Math.max(0, since - 60_000) / 1000), inclusive: true, limit: 100, include_all_metadata: true }),
     { channel, method: "conversations.history" });
-    const message = result.messages?.find(m => m.user === opts.botUserId && m.ts && m.text?.includes(marker));
+    const message = result.messages?.find(m => m.user === opts.botUserId && m.ts && hasMarker(m, text => text.includes(marker)));
     return message?.ts ? { channel, ts: message.ts } : undefined;
   };
   const runner = new ReportRunner({
@@ -88,8 +95,8 @@ export function createScheduledReports(opts: Options): ScheduledReports {
       const result = await enqueue(() => {
         if (!allowed(run.id)) throw new Error("scheduled report canceled");
         return opts.app.client.chat.postMessage({ channel,
-          text: `⏳ *${esc(run.snapshot.name)}* — generating a scheduled report. Approval/questions appear here; use \`\\stop\` in this thread to cancel.\n\`${contextMarker(run.id)}\``,
-          unfurl_links: false, unfurl_media: false });
+          text: `⏳ *${esc(run.snapshot.name)}* — generating a scheduled report. Approval/questions appear here; use \`\\stop\` in this thread to cancel.`,
+          metadata: markerMetadata("schedule_context", run.id, contextMarker(run.id)), unfurl_links: false, unfurl_media: false });
       }, { channel });
       if (!result.ts) throw new Error("Slack did not confirm the report context timestamp");
       const context = { channel, ts: result.ts };
@@ -103,12 +110,13 @@ export function createScheduledReports(opts: Options): ScheduledReports {
       if (!channel) throw new Error("report destination unavailable");
       const formatted = mdToMrkdwn(run.output ?? "");
       const content = truncate(formatted, 35_000);
-      const text = `*${esc(run.snapshot.name)}* · ${new Date(run.scheduledAt).toLocaleString("en-US", { timeZone: run.snapshot.schedule.timezone })}\n\n${content}${formatted.length > content.length ? "\n\n_Report shortened in Slack; the full response remains in this session (use \\history)._" : ""}\n\n\`${reportMarker(run.id)}\``;
+      const text = `*${esc(run.snapshot.name)}* · ${new Date(run.scheduledAt).toLocaleString("en-US", { timeZone: run.snapshot.schedule.timezone })}\n\n${content}${formatted.length > content.length ? "\n\n_Report shortened in Slack; the full response remains in this session (use \\history)._" : ""}`;
+      const metadata = markerMetadata("schedule_report", run.id, reportMarker(run.id));
       const result = await enqueue(async () => {
         if (!allowed(run.id)) throw new Error("scheduled report canceled");
         const response = run.snapshot.destination.kind === "dm"
-          ? await opts.app.client.chat.update({ channel, ts: run.context!.ts, text, blocks: [] })
-          : await opts.app.client.chat.postMessage({ channel, text, unfurl_links: false, unfurl_media: false });
+          ? await opts.app.client.chat.update({ channel, ts: run.context!.ts, text, blocks: [], metadata })
+          : await opts.app.client.chat.postMessage({ channel, text, metadata, unfurl_links: false, unfurl_media: false });
         return { ts: response.ts };
       }, { channel, method: run.snapshot.destination.kind === "dm" ? "chat.update" : "chat.postMessage" });
       const ts = result.ts ?? (run.snapshot.destination.kind === "dm" ? run.context?.ts : undefined);
@@ -178,5 +186,9 @@ export function createScheduledReports(opts: Options): ScheduledReports {
       if (id) await runner.cancel(id);
     },
   };
-  return { commands, eligible, jobs: () => store.jobs(), poll, close: () => scheduler.close() };
+  const jobs = (): HomeReport[] => {
+    const runs = store.runs();
+    return store.jobs().map(job => ({ ...job, last: lastRunStatus(runs.filter(r => r.jobId === job.id), job.schedule.timezone, Date.now()) }));
+  };
+  return { commands, eligible, jobs, poll, close: () => scheduler.close() };
 }

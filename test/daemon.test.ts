@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { detectPlatform, renderLaunchdPlist, renderSystemdUnit } from "../src/daemon.js";
+
+// A config dir with XML and systemd metacharacters, so the log paths exercise escaping too.
+vi.mock("../src/config.js", () => ({ CONFIG_DIR: "/home/u/R&D 100%/slackoc", CONFIG_PATH: "/home/u/R&D 100%/slackoc/config.json" }));
 
 const opts = {
   node: "/opt/homebrew/bin/node",
@@ -41,5 +44,24 @@ describe("daemon unit rendering (D3)", () => {
     const unit = renderSystemdUnit({ ...opts, node: "/home/u/My Tools/node", path: "/usr/bin:/mnt/c/Program Files/Git/cmd" });
     expect(unit).toContain(`ExecStart="/home/u/My Tools/node" "${opts.cli}" start`);
     expect(unit).toContain(`Environment="PATH=/usr/bin:/mnt/c/Program Files/Git/cmd"`);
+  });
+
+  it("systemd path settings escape specifiers but stay unquoted (#45)", () => {
+    const unit = renderSystemdUnit({ ...opts, workdir: "/srv/100%/my app" });
+    expect(unit).toContain("WorkingDirectory=/srv/100%%/my app\n");
+    expect(unit).toContain("StandardOutput=append:/home/u/R&D 100%%/slackoc/daemon-stdout.log\n");
+    expect(unit).toContain("StandardError=append:/home/u/R&D 100%%/slackoc/daemon-stderr.log\n");
+  });
+
+  it("systemd unit rejects control characters that would inject a directive", () => {
+    expect(() => renderSystemdUnit({ ...opts, workdir: "/srv/x\nExecStartPre=/bin/evil" })).toThrow(/control character/);
+  });
+
+  it("launchd plist XML-escapes every interpolated value", () => {
+    const xml = renderLaunchdPlist({ ...opts, workdir: "/Users/me/R&D <draft>", path: "/a&b:/usr/bin" });
+    expect(xml).toContain("<key>WorkingDirectory</key><string>/Users/me/R&amp;D &lt;draft&gt;</string>");
+    expect(xml).toContain("<key>PATH</key><string>/a&amp;b:/usr/bin</string>");
+    expect(xml).toContain("<string>/home/u/R&amp;D 100%/slackoc/daemon-stderr.log</string>");
+    expect(xml).not.toMatch(/&(?!amp;|lt;|gt;)/); // no bare ampersand left anywhere
   });
 });

@@ -1,0 +1,23 @@
+[
+  "react U1 :eyes:",
+  "post M1: Starting with the cache interface.",
+  "post M2: ⎯⎯⎯ tools ⎯⎯⎯\n\n📄 read `src/cache.ts`",
+  "react U2 :eyes:",
+  "post M3 +blocks: ⏳ Queued — runs after the current task.",
+  "post M4: ✏️ edit `src/cache.ts`",
+  "update M3: ➡️ Steered into the current run.",
+  "react U3 :eyes:",
+  "post M5 +blocks: ⏳ Queued — runs after the current task.",
+  "post M6: ✏️ edit `src/cache.ts`",
+  "post M7: ⎯⎯⎯ response ⎯⎯⎯\n\nRenamed `get` to `read` as asked; callers are updated.",
+  "delete M5",
+  "post M8: ⎯⎯⎯ tools ⎯⎯⎯\n\n✏️ edit `CHANGELOG.md`",
+  "post M9: ⎯⎯⎯ response ⎯⎯⎯\n\nAdded a changelog entry for the rename.",
+  "unreact U1 :eyes:",
+  "unreact U2 :eyes:",
+  "unreact U3 :eyes:",
+  "react U1 :white_check_mark:",
+  "react U2 :white_check_mark:",
+  "react U3 :white_check_mark:",
+  "post M10: *project* · `anthropic/claude-sonnet-4-5` · 18s · $0.012 · 2.7k↑/360↓ · Verbose Tools"
+]
