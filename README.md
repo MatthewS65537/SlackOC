@@ -128,7 +128,7 @@ Plural/singular forms work as aliases (`\session`, `\models`, `\log`, `\schedule
 | `\agent <#\|name>` | swap OpenCode agent |
 | `\diff` `\cmd …` | diff summary with a View changes button (`\diff full` adds the unified diff, snippet when long) / OpenCode native command passthrough; a bare `\cmd` lists the project's native commands |
 | `\usage [today\|7d\|30d] [all]` | cost, tokens, sessions and a daily activity sparkline for this project (default 7d) or every project with `all` (also `\cost`, `\spend`, `\stats`) |
-| `\notify on\|off` | DM the owner when runs in this thread finish (failures + permission asks always DM) |
+| `\notify on\|off` | DM the owner when runs in this thread finish successfully (failures stay in the thread; permission asks and questions are always mirrored to DMs) |
 | `\schedule` `\schedule add` | list reports with next starts and last-run outcome, or open guided creation with explicit time-zone, project, prompt and destination confirmation |
 | `\schedule edit <id>` | reopen the creation form prefilled; saving keeps the ID and history and applies to future occurrences |
 | `\schedule pause\|resume\|run\|remove <id>` | manage future occurrences or request a manual run; pause/remove do not cancel active work |

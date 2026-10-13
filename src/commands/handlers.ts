@@ -306,19 +306,19 @@ registerCommand({
   name: "notify",
   usage: "\\notify [on|off]",
   summary: "DM when runs here finish",
-  detail: "Failures DM you either way. Permission asks are always mirrored to your DMs with working buttons — approve from anywhere.",
+  detail: "Only successful completions are DMed; failures stay in the thread. Permission asks and questions are always mirrored to your DMs with working buttons — approve from anywhere.",
   async run(ctx, args) {
     const th = requireThread(ctx);
     const arg = args.toLowerCase();
     if (!arg) {
       await ctx.postToThread(
-        `Completion DMs here: \`${th.notify ? "on" : "off"}\` (failures and permission asks always DM you)`,
+        `Completion DMs here: \`${th.notify ? "on" : "off"}\` (failures stay in this thread; permission asks and questions always reach your DMs)`,
       );
       return;
     }
     if (arg !== "on" && arg !== "off") throw new Error("usage: \\notify on|off");
     ctx.state.setThread(ctx.threadKey, { ...th, notify: arg === "on" });
-    await ctx.postToThread(arg === "on" ? "🔔 I'll DM you when runs in this thread finish." : "🔕 Completion DMs off — failures and permission asks still reach you.");
+    await ctx.postToThread(arg === "on" ? "🔔 I'll DM you when runs in this thread finish." : "🔕 Completion DMs off — permission asks and questions still reach your DMs; failures show in this thread.");
   },
 });
 
