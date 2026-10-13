@@ -5,15 +5,18 @@ import type { OCClient } from "../opencode/api.js";
 import type { PoolEntry } from "../opencode/server.js";
 import {
   agentsList,
+  cancelParkedPrompts,
   commandList,
   configGet,
   configProviders,
   promptAsync,
+  revertStage,
   sessionAbort,
   sessionCommand,
   sessionCreate,
   sessionDelete,
   sessionDiff,
+  sessionFork,
   sessionGet,
   sessionMessages,
   sessionStats,
@@ -30,7 +33,7 @@ import { droppedOpCount, oldestPendingAgeMs, queueDepth } from "../slack/queue.j
 import { fileLogPath, logCount, newLogsSince, recentLogs } from "../log.js";
 import { parsePermissionCommand } from "../slack/permissions.js";
 import { SCHEDULE_USAGE } from "../schedules/controls.js";
-import { modelSearchBlocks, pickerBlocks, viewDiffBlocks } from "../slack/blocks.js";
+import { modelSearchBlocks, pickerBlocks, revertCardBlocks, viewDiffBlocks } from "../slack/blocks.js";
 import { modelOption, orderedModels, readFavorites } from "../opencode/favorites.js";
 import { buildUnifiedDiff, formatDiffSummary } from "../slack/diff-view.js";
 import { USAGE_RANGES, dayKeys, formatUsage, parseUsageArgs, rangeStart } from "./usage.js";
@@ -126,7 +129,7 @@ async function rebindThread(
 /** Grouping + order for `\help`; every registered command must appear here. */
 export const HELP_SECTIONS: Array<{ title: string; names: string[] }> = [
   { title: "Threads & replies", names: ["hush", "listen", "verbose", "stream"] },
-  { title: "Sessions", names: ["new", "sessions", "resume", "stop", "diff"] },
+  { title: "Sessions", names: ["new", "sessions", "resume", "stop", "diff", "fork", "undo"] },
   { title: "Monitoring", names: ["watch", "unwatch", "history", "summary", "usage"] },
   { title: "Model & agent", names: ["model", "agent"] },
   { title: "Projects", names: ["project", "cd", "pin", "unpin"] },
@@ -861,6 +864,105 @@ registerCommand({
   },
 });
 
+/** `[n]` turn-count argument for \fork / \undo. */
+function turnCount(args: string, fallback: number, usage: string): number {
+  const arg = args.trim();
+  if (!arg) return fallback;
+  if (!/^\d+$/.test(arg)) throw new Error(`usage: ${usage}`);
+  return Number(arg);
+}
+
+/**
+ * IDs of the session's real user turns, oldest first. Undelivered inbox items
+ * show up as user rows with no parts (client.ts messages) and are not turns.
+ */
+export function userTurnIds(msgs: Array<{ info: OcMessageInfo; parts: OcPart[] }>): string[] {
+  return msgs.filter((m) => m.info.role === "user" && m.parts.length > 0).map((m) => m.info.id);
+}
+
+const turnsWord = (n: number): string => `${n} turn${n === 1 ? "" : "s"}`;
+
+registerCommand({
+  name: "fork",
+  usage: "\\fork [n]",
+  summary: "Copy this session into a new thread, minus the last n turns",
+  detail: "Bare `\\fork` copies everything. The fork shares this thread's working directory, so edits from either thread land in the same files.",
+  async run(ctx, args) {
+    const th = requireThread(ctx);
+    const n = turnCount(args, 0, "\\fork [n]");
+    if (!ctx.render) throw new Error("\\fork needs the Slack render pipeline (unavailable here)");
+    const fork = await withServerLease(ctx, th.projectDir, async (entry) => {
+      let before: string | undefined;
+      if (n) {
+        const ids = userTurnIds(await sessionMessages(entry.client!, th.sessionId));
+        before = ids.at(-n);
+        if (!before) return ids.length;
+      }
+      return sessionFork(entry.client!, th.sessionId, before);
+    });
+    if (typeof fork === "number") {
+      await ctx.postToThread(`Only ${turnsWord(fork)} in this session.`);
+      return;
+    }
+    const origin = ctx.threadUrl?.(ctx.threadKey);
+    const dropped = n ? `, last ${turnsWord(n)} dropped` : "";
+    // "" threadTs posts top-level: the fork gets its own thread (a new DM root in DMs).
+    const { ts } = await ctx.render.post(ctx.channelId, "",
+      `🔀 Fork of ${origin ? `<${origin}|this thread>` : "a thread"} (session \`${shortId(fork.id)}\`${dropped}) in \`${th.projectDir}\`. Reply here to drive it. Note: it shares the same working directory.`,
+      undefined, { unfurl: false });
+    const key = ctx.state.threadKey(ctx.channelId, ts);
+    ctx.state.setThread(key, { ...newThreadState(fork.id, th.projectDir, th.verbose), model: th.model, agent: th.agent, stream: th.stream });
+    const link = ctx.threadUrl?.(key);
+    await ctx.postToThread(`🔀 Forked${n ? ` without the last ${turnsWord(n)}` : ""} → ${link ? `<${link}|new thread>` : "new thread"}. This thread is unchanged.`);
+  },
+});
+
+const UNDO_BUSY = "A run is in progress. Use `\\stop` first, then `\\undo`.";
+
+registerCommand({
+  name: "undo",
+  aliases: ["revert"],
+  usage: "\\undo [n]",
+  summary: "Rewind the last n turns (default 1) and OpenCode's edits from them",
+  detail: "Posts a card listing the restored files: *Keep* makes it final, *Put it back* restores everything. Your next message also keeps it. Repeat `\\undo` to go further back.",
+  async run(ctx, args) {
+    const th = requireThread(ctx);
+    const n = turnCount(args, 1, "\\undo [n]");
+    if (n < 1) throw new Error("usage: \\undo [n]");
+    if (getView(th.sessionId)?.isActive) {
+      await ctx.postToThread(UNDO_BUSY);
+      return;
+    }
+    const client = (await ctx.pool.ensure(th.projectDir)).client!;
+    const [sess, msgs] = await Promise.all([sessionGet(client, th.sessionId), sessionMessages(client, th.sessionId)]);
+    const all = userTurnIds(msgs);
+    // A staged undo still lists its turns, so count back from its boundary.
+    const staged = sess.revert ? all.indexOf(sess.revert.messageID) : -1;
+    const ids = staged >= 0 ? all.slice(0, staged) : all;
+    const messageID = ids.at(-n);
+    if (!messageID) {
+      await ctx.postToThread(`Only ${turnsWord(ids.length)} ${staged >= 0 ? "left before the current undo" : "in this session"}.`);
+      return;
+    }
+    let files: OcFileDiff[];
+    try {
+      files = (await revertStage(client, th.sessionId, messageID)).files ?? [];
+    } catch (err) {
+      if ((err as { _tag?: string })?._tag !== "SessionBusyError") throw err;
+      await ctx.postToThread(UNDO_BUSY);
+      return;
+    }
+    const total = all.length - all.indexOf(messageID);
+    const first = partsText(msgs.find((m) => m.info.id === messageID)?.parts ?? []);
+    const text = [
+      `↩ Rewound ${turnsWord(total)}${first ? ` (“${firstLine(first, 60)}”)` : ""}.`,
+      files.length ? `Files restored:\n${formatDiffSummary(files)}` : "No file edits to restore.",
+      "Only OpenCode's own edits are restored. The Slack messages above stay, but the agent no longer sees them. Your next message keeps this undo.",
+    ].join("\n");
+    await ctx.postToThread(text, revertCardBlocks(text, { s: th.sessionId, m: messageID, n: total }));
+  },
+});
+
 /** First line of a text part, whitespace-squeezed, Slack-safe. */
 const firstLine = (s: string, n: number): string => truncate(esc((s.split("\n", 1)[0] ?? "").replace(/\s+/g, " ").trim()), n);
 
@@ -1038,6 +1140,7 @@ registerCommand({
   aliases: ["abort", "cancel"],
   usage: "\\stop",
   summary: "Abort the running task",
+  detail: "Also cancels this thread's queued messages, so nothing runs after it.",
   async run(ctx) {
     const th = requireThread(ctx);
     ctx.state.cancelRecovery(ctx.threadKey, ctx.messageTs);
@@ -1047,8 +1150,10 @@ registerCommand({
       return;
     }
     const entry = await ctx.pool.ensure(th.projectDir);
+    // Cancel queued prompts first: interrupt alone leaves them parked in the inbox.
+    const cancelled = await cancelParkedPrompts(entry.client!, th.sessionId);
     await sessionAbort(entry.client!, th.sessionId);
-    await ctx.postToThread("🛑 Aborted.");
+    await ctx.postToThread(`🛑 Aborted.${cancelled ? ` Cancelled ${cancelled} queued message${cancelled === 1 ? "" : "s"}.` : ""}`);
   },
 });
 

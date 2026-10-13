@@ -63,6 +63,39 @@ export function viewDiffBlocks(text: string, sessionId: string): unknown[] {
   ];
 }
 
+/** \undo card buttons (run-controls.ts). Value = JSON RevertCardValue. */
+export const REVERT_KEEP_ACTION = "revert_keep";
+export const REVERT_CLEAR_ACTION = "revert_clear";
+export interface RevertCardValue { s: string; m: string; n: number } // session, staged boundary message, turns
+
+/** The \undo card: what was rewound plus Keep / Put it back. */
+export function revertCardBlocks(text: string, value: RevertCardValue): unknown[] {
+  const v = buttonValue(value);
+  return [
+    { type: "section", text: { type: "mrkdwn", text: boundedSection(text) } },
+    { type: "actions", elements: [
+      { type: "button", text: { type: "plain_text", text: "Keep" }, action_id: REVERT_KEEP_ACTION, value: v },
+      { type: "button", text: { type: "plain_text", text: "Put it back" }, action_id: REVERT_CLEAR_ACTION, value: v },
+    ] },
+  ];
+}
+
+/** Buttons on a queued prompt's "⏳ Queued" ack (run-controls.ts). Value = JSON QueuedCardValue. */
+export const INBOX_STEER_ACTION = "inbox_steer";
+export const INBOX_CANCEL_ACTION = "inbox_cancel";
+export interface QueuedCardValue { c: string; t: string; u: string } // channel, thread root, user message ts
+
+export function queuedAckBlocks(text: string, value: QueuedCardValue): unknown[] {
+  const v = buttonValue(value);
+  return [
+    { type: "section", text: { type: "mrkdwn", text } },
+    { type: "actions", elements: [
+      { type: "button", text: { type: "plain_text", text: "Steer now" }, action_id: INBOX_STEER_ACTION, value: v },
+      { type: "button", text: { type: "plain_text", text: "Cancel" }, action_id: INBOX_CANCEL_ACTION, value: v },
+    ] },
+  ];
+}
+
 export interface PermButtonValue {
   s: string; // sessionId
   p: string; // permissionId

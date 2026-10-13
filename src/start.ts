@@ -15,6 +15,7 @@ import { getView, reconcileStaleViews, setProjectConnectionState, describeActive
 import { createRenderDeps } from "./slack/render-deps.js";
 import { createInteractions } from "./slack/interactions.js";
 import { registerDiffActions } from "./slack/diff-view.js";
+import { registerRunControls } from "./slack/run-controls.js";
 import { registerModelSearch, registerPickerActions } from "./slack/pickers.js";
 import { registerHome } from "./slack/home.js";
 import { registerShortcut } from "./slack/shortcut.js";
@@ -211,7 +212,8 @@ export async function startBridge(opts: StartOpts): Promise<void> {
     const client = pool.get(dir)?.client;
     if (!client) return Promise.resolve(null);
     if (sessionInfo.size > 500) sessionInfo.clear();
-    hit = sessionGet(client, sid).then(s => ({ parentID: s.parentID ?? null, title: s.title }), () => {
+    // A fork may carry parentID too, but it is a sibling session, never a subagent lane.
+    hit = sessionGet(client, sid).then(s => ({ parentID: s.fork ? null : s.parentID ?? null, title: s.title }), () => {
       sessionInfo.delete(sid);
       return null;
     });
@@ -372,6 +374,7 @@ export async function startBridge(opts: StartOpts): Promise<void> {
   registerPickerActions(app, { bridge, ownerSlackUserId: config.ownerSlackUserId, isStopping: () => stopping });
   registerModelSearch(app, { bridge, ownerSlackUserId: config.ownerSlackUserId });
   registerDiffActions(app, { ownerSlackUserId: config.ownerSlackUserId, state, pool, isStopping: () => stopping });
+  registerRunControls(app, { ownerSlackUserId: config.ownerSlackUserId, state, pool, isStopping: () => stopping });
 
   // Fair, bounded history recovery for retained threads + \listen/DM top-level messages (slack/catchup-runner.ts).
   const runCatchup = createCatchupRunner(app, { state, pool, ownerSlackUserId: config.ownerSlackUserId, ghost,

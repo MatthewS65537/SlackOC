@@ -5,7 +5,7 @@ import type { ConnectionState } from "../opencode/server.js";
 import { canonicalDir } from "../paths.js";
 import { formatTool, safeCodePayload, safePayload } from "./tool-format.js";
 import type { StateStore, ThreadState, VerboseMode } from "../state.js";
-import { planText, planTodos, viewDiffBlocks } from "./blocks.js";
+import { planText, planTodos, queuedAckBlocks, viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
 import { chunkText, dur, mdToMrkdwn, money, shortId, tok, truncate } from "../util.js";
 import { isSlackDrop, laneDepth } from "./queue.js";
@@ -353,6 +353,10 @@ export class SessionView {
   private static readonly IDLE_GRACE_MS = 8_000;
   /** ts of user messages awaiting ✅/❌ — resolved at finalize. */
   private readonly pendingUserMsgs: string[] = [];
+  /** Queued prompt (user ts) → its "⏳ Queued" card, until delivery, cancel, or a button takes it over. */
+  private readonly queuedCards = new Map<string, string>();
+  /** Queued prompts steered into the current run: they produce no idle of their own. */
+  private readonly steered = new Set<string>();
   /**
    * \watch mode: this view mirrors a session driven OUTSIDE Slack (TUI/IDE).
    * Cross-process SSE does NOT propagate (live-verified 2026-09-16: a session
@@ -640,12 +644,13 @@ export class SessionView {
     }
     if (wasActive) {
       // Interactive: this ack directly answers the user's just-sent message.
+      const text = "⏳ Queued — runs after the current task.";
       void this.deps
-        .post(this.channel, this.threadTs, "⏳ Queued — runs after the current task.", undefined, {
+        .post(this.channel, this.threadTs, text, queuedAckBlocks(text, { c: this.channel, t: this.threadTs, u: userMsgTs }), {
           unfurl: false,
           lane: "interactive",
         })
-        .then(() => this.contentPosted())
+        .then((r) => { this.queuedCards.set(userMsgTs, r.ts); this.contentPosted(); })
         .catch(() => {});
     }
   }
@@ -699,6 +704,13 @@ export class SessionView {
       if (this.statusTs) await this.deleteStatus(this.statusTs);
       deleteView(this.sessionId);
     }
+  }
+
+  /** A Steer/Cancel button now owns this queued prompt's card; `steered` marks it as joining the current run. */
+  noteQueuedAction(userMsgTs: string, steered: boolean): void {
+    this.queuedCards.delete(userMsgTs);
+    if (steered) this.steered.add(userMsgTs);
+    else this.steered.delete(userMsgTs);
   }
 
   private cancelIdleGrace(): void {
@@ -1056,6 +1068,22 @@ export class SessionView {
       case "session.idle":
         await this.onIdle();
         return;
+      case "session.inbox": {
+        // A queued prompt left the inbox: delivered (ran or was steered) or cancelled.
+        const ts = this.pendingUserMsgs.find((t) => this.state.getReceipt(this.threadKey, t)?.submission?.messageId === props.inboxID);
+        if (!ts) return;
+        const card = this.queuedCards.get(ts);
+        this.queuedCards.delete(ts);
+        if (props.outcome === "cancelled") {
+          if (card) await this.deps.update(this.channel, card, "✖ Cancelled, won't run.", this.threadTs).catch(() => {});
+          await this.reactOrLog(this.channel, ts, "eyes", false);
+          await this.forgetUnsubmittedPrompt(ts); // won't idle: finalize needn't wait for it
+        } else {
+          if (card) await this.deps.delete(this.channel, card, this.threadTs).catch(() => {});
+          if (this.steered.delete(ts)) this.outstandingPrompts = Math.max(0, this.outstandingPrompts - 1);
+        }
+        return;
+      }
       case "session.error":
         await this.finalizeInner(errorMessage(props.error)); // in-chain
         return;

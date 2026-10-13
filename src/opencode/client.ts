@@ -118,6 +118,12 @@ export function makeClient(baseUrl: string, options: ClientOptions = {}): OCClie
       diff: ({ path, signal }) => native.session.diff({ sessionID: path.id }, { signal }),
       abort: ({ path, signal }) => native.session.interrupt({ sessionID: path.id }, { signal }),
       delete: ({ path, signal }) => native.session.remove({ sessionID: path.id }, { signal }),
+      fork: async ({ path, body, signal }) => normalizeSession(await native.session.fork({ sessionID: path.id, before: body?.before }, { signal })),
+      revertStage: ({ path, body, signal }) => native.session.revert.stage({ sessionID: path.id, messageID: body.messageID, files: true }, { signal }),
+      revertCommit: ({ path, signal }) => native.session.revert.commit({ sessionID: path.id }, { signal }),
+      revertClear: ({ path, signal }) => native.session.revert.clear({ sessionID: path.id }, { signal }),
+      inboxUpdate: ({ path, body, signal }) => native.session.inbox.update({ sessionID: path.id, inboxID: body.inboxID, delivery: body.delivery }, { signal }),
+      inboxCancel: ({ path, body, signal }) => native.session.inbox.cancel({ sessionID: path.id, inboxID: body.inboxID }, { signal }),
       promptAsync: async ({ path, body, signal }) => {
         const sessionID = path.id as string;
         const known = modelSettings.get(sessionID) ?? {};
@@ -201,6 +207,46 @@ export async function sessionCreate(c: OCClient, title?: string, signal?: AbortS
 
 export async function sessionGet(c: OCClient, id: string, signal?: AbortSignal): Promise<OcSession> {
   return data(c.session.get({ path: { id }, signal }));
+}
+
+/** Copy a session's history (all of it, or only what precedes message `before`) into a new session. */
+export async function sessionFork(c: OCClient, id: string, before?: string, signal?: AbortSignal): Promise<OcSession> {
+  return data(c.session.fork({ path: { id }, body: { before }, signal }));
+}
+
+/**
+ * Stage (or move) an undo boundary at user message `messageID`; OpenCode's file
+ * edits from there on are reverted immediately. The next prompt commits it.
+ */
+export async function revertStage(c: OCClient, id: string, messageID: string, signal?: AbortSignal): Promise<{ messageID: string; files?: OcFileDiff[] }> {
+  return data(c.session.revertStage({ path: { id }, body: { messageID }, signal }));
+}
+
+/** Make the staged undo permanent (drops the rewound turns). */
+export async function revertCommit(c: OCClient, id: string, signal?: AbortSignal): Promise<void> {
+  await data(c.session.revertCommit({ path: { id }, signal }));
+}
+
+/** Drop the staged undo, restoring the turns and their file edits. */
+export async function revertClear(c: OCClient, id: string, signal?: AbortSignal): Promise<void> {
+  await data(c.session.revertClear({ path: { id }, signal }));
+}
+
+/** Move a parked prompt: "steer" wakes it into the current run. ConflictError = already delivered. */
+export async function inboxUpdate(c: OCClient, id: string, inboxID: string, delivery: "steer" | "queue", signal?: AbortSignal): Promise<void> {
+  await data(c.session.inboxUpdate({ path: { id }, body: { inboxID, delivery }, signal }));
+}
+
+/** Withdraw a parked prompt; a no-op once it is delivered or gone. */
+export async function inboxCancel(c: OCClient, id: string, inboxID: string, signal?: AbortSignal): Promise<void> {
+  await data(c.session.inboxCancel({ path: { id }, body: { inboxID }, signal }));
+}
+
+/** \stop: cancel every user prompt still parked in the session's inbox (interrupt leaves them queued). Returns how many. */
+export async function cancelParkedPrompts(c: OCClient, id: string, signal?: AbortSignal): Promise<number> {
+  const parked = (await c.v2!.session.inbox.list({ sessionID: id }, { signal })).filter((item) => item.type === "user");
+  for (const item of parked) await inboxCancel(c, id, item.id, signal);
+  return parked.length;
 }
 
 /** All messages (info + parts) of a session — used by finalize's delivery backstop. */

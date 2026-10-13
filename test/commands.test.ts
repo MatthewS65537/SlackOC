@@ -600,6 +600,27 @@ describe("QoL round (Sep 2026)", () => {
     expect(out.join("\n")).toContain("Nothing running");
   });
 
+  it("\\stop cancels this session's parked prompts before interrupting", async () => {
+    const { SessionView, deleteView } = await import("../src/slack/render.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/stop-parked/state.json`);
+    state.setThread("C1:T1", newThreadState("s-stop-parked", "/p"));
+    const calls: string[] = [];
+    const client = {
+      v2: { session: { inbox: { list: async () => [{ type: "user", id: "msg_q" }, { type: "compaction", id: "c1" }] } } },
+      session: {
+        inboxCancel: async ({ body }: any) => void calls.push(`cancel ${body.inboxID}`),
+        abort: async () => void calls.push("abort"),
+      },
+    };
+    new SessionView({ sessionId: "s-stop-parked", projectDir: "/p", channel: "C1", threadTs: "T1", threadKey: "C1:T1",
+      client: {} as never, deps: fakeViewDeps([]), state, threadState: state.getThread("C1:T1")! });
+    const out: string[] = [];
+    await getCommand("stop")!.run(baseCtx(state, out, state.getThread("C1:T1"), { pool: { ensure: async () => ({ client }) } as never }), "");
+    deleteView("s-stop-parked");
+    expect(calls).toEqual(["cancel msg_q", "abort"]);
+    expect(out.at(-1)).toBe("🛑 Aborted. Cancelled 1 queued message.");
+  });
+
   it("\\diff full posts a small unified diff inline", async () => {
     const state = new StateStore(`${import.meta.dirname}/.fixtures/diff-full/state.json`);
     state.setThread("C1:T1", newThreadState("s-diff", "/p"));
@@ -1303,6 +1324,67 @@ describe("\\watch / \\unwatch", () => {
     const ctx = baseCtx(state, out, null, { pool: poolWith([]) } as never);
     await getCommand("unwatch")!.run(ctx, "");
     expect(out.at(-1)).toContain("isn't watching");
+  });
+});
+
+describe("\\fork / \\undo", () => {
+  it("\\fork 1 forks before the last real user turn, posts top-level, and binds the new thread with inherited settings", async () => {
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/fork/state.json`);
+    state.setThread("C1:T1", { ...newThreadState("ses_orig", "/p", "off"), model: "a/b", agent: "plan", stream: false, hushed: true });
+    const msgs = [
+      { info: { id: "u1", sessionID: "s", role: "user" }, parts: [{ id: "p1", type: "text", text: "one" }] },
+      { info: { id: "u2", sessionID: "s", role: "user" }, parts: [{ id: "p2", type: "text", text: "two" }] },
+      { info: { id: "q1", sessionID: "s", role: "user" }, parts: [] }, // parked inbox item, not a turn
+    ];
+    const fork = vi.fn(async () => ({ data: { id: "ses_forked", directory: "/p", title: "", time: { created: 1, updated: 1 } } }));
+    const posts: Array<{ threadTs: string; text: string }> = [];
+    const out: string[] = [];
+    const ctx = baseCtx(state, out, state.getThread("C1:T1"), {
+      pool: poolWith([], { messages: async () => ({ data: msgs }), fork }),
+      render: { post: async (_c: string, threadTs: string, text: string) => { posts.push({ threadTs, text }); return { ts: "R9" }; } },
+      threadUrl: (k: string) => `https://x/${k}`,
+    } as never);
+    await getCommand("fork")!.run(ctx, "1");
+    expect(fork).toHaveBeenCalledWith(expect.objectContaining({ path: { id: "ses_orig" }, body: { before: "u2" } }));
+    expect(posts).toEqual([expect.objectContaining({ threadTs: "" })]);
+    expect(posts[0]!.text).toContain("shares the same working directory");
+    expect(state.getThread("C1:R9")).toMatchObject({ sessionId: "ses_forked", projectDir: "/p", verbose: "off", model: "a/b", agent: "plan", stream: false });
+    expect(state.getThread("C1:R9")?.hushed).toBeUndefined();
+    expect(out.at(-1)).toContain("<https://x/C1:R9|new thread>");
+    await getCommand("fork")!.run(ctx, "3");
+    expect(out.at(-1)).toBe("Only 2 turns in this session.");
+  });
+
+  it("\\undo 2 stages at the second-to-last real user turn, posts a card listing the files, and refuses while the view is active", async () => {
+    const { SessionView, deleteView } = await import("../src/slack/render.js");
+    const state = new StateStore(`${import.meta.dirname}/.fixtures/undo/state.json`);
+    state.setThread("C1:T1", newThreadState("ses_undo", "/p"));
+    const msgs = [
+      { info: { id: "u1", sessionID: "s", role: "user" }, parts: [{ id: "p1", type: "text", text: "refactor the parser" }] },
+      { info: { id: "u2", sessionID: "s", role: "user" }, parts: [{ id: "p2", type: "text", text: "add tests" }] },
+      { info: { id: "q1", sessionID: "s", role: "user" }, parts: [] },
+    ];
+    const revertStage = vi.fn(async () => ({ data: { messageID: "u1", files: [{ file: "src/parse.ts", additions: 0, deletions: 42, patch: "" }] } }));
+    const posts: Array<{ text: string; blocks?: any[] }> = [];
+    const ctx = baseCtx(state, [], state.getThread("C1:T1"), {
+      pool: poolWith([], { messages: async () => ({ data: msgs }), get: async () => ({ data: { id: "ses_undo" } }), revertStage }),
+      postToThread: async (text: string, blocks?: any[]) => void posts.push({ text, blocks }),
+    } as never);
+    const view = new SessionView({ sessionId: "ses_undo", projectDir: "/p", channel: "C1", threadTs: "T1", threadKey: "C1:T1",
+      client: {} as never, deps: fakeViewDeps([]), state, threadState: state.getThread("C1:T1")! });
+    await view.beginPrompt("1.1");
+    await getCommand("undo")!.run(ctx, "2");
+    expect(revertStage).not.toHaveBeenCalled();
+    expect(posts.at(-1)!.text).toContain("Use `\\stop` first");
+    deleteView("ses_undo");
+
+    await getCommand("undo")!.run(ctx, "2");
+    expect(revertStage).toHaveBeenCalledWith(expect.objectContaining({ path: { id: "ses_undo" }, body: { messageID: "u1" } }));
+    const card = posts.at(-1)!;
+    expect(card.text).toContain("Rewound 2 turns (“refactor the parser”)");
+    expect(card.text).toContain("`+0/−42` src/parse.ts");
+    expect(card.blocks?.[1].elements.map((e: any) => e.text.text)).toEqual(["Keep", "Put it back"]);
+    expect(JSON.parse(card.blocks?.[1].elements[0].value)).toEqual({ s: "ses_undo", m: "u1", n: 2 });
   });
 });
 

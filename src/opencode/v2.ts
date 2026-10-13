@@ -130,7 +130,10 @@ export class V2Events {
         // Admission is not delivery; later queued inputs must not become parents early.
         return emit("message.updated", { info: { id: inboxID, sessionID, role: "user", time: { created: event.created } } });
       }
-      case "session.inbox.delivered": this.parents.set(event.data.sessionID, event.data.inboxID); return [];
+      case "session.inbox.delivered":
+        this.parents.set(event.data.sessionID, event.data.inboxID);
+        return emit("session.inbox", { ...event.data, outcome: "delivered" });
+      case "session.inbox.cancelled": return emit("session.inbox", { ...event.data, outcome: "cancelled" });
       case "session.step.started": {
         const p = event.data;
         const info: OcMessageInfo = { id: p.assistantMessageID, sessionID: p.sessionID, role: "assistant",

@@ -10,6 +10,10 @@ export interface OcSession {
   title: string;
   /** Set on subagent (child) sessions. */
   parentID?: string | null;
+  /** Set on forks (\fork); a fork is a sibling, not a subagent. */
+  fork?: { sessionID: string };
+  /** Staged (uncommitted) \undo boundary; its file edits are already applied. */
+  revert?: { messageID: string; files?: OcFileDiff[] };
   summary?: { additions: number; deletions: number; files: number };
   time: { created: number; updated: number };
 }
@@ -142,7 +146,8 @@ export interface OCClient {
   v2?: import("@opencode/client").OpenCodeClient;
   directory?: string;
   session: { status: Call; create: Call; get: Call; messages: Call; list: Call; diff: Call;
-    abort: Call; delete: Call; promptAsync: Call; command: Call };
+    abort: Call; delete: Call; promptAsync: Call; command: Call; fork: Call;
+    revertStage: Call; revertCommit: Call; revertClear: Call; inboxUpdate: Call; inboxCancel: Call };
   config: { providers: Call; get: Call };
   app: { agents: Call };
   postSessionIdPermissionsPermissionId: Call;

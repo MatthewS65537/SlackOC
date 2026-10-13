@@ -46,6 +46,7 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 - **Paragraph streaming** — each paragraph of a reply posts as soon as the model finishes it (never split inside a code block, no in-place edits). `\stream off` reverts a thread to posting each part once complete
 - **Live plan and subagent lanes** — when the agent writes a todo list, one 📋 plan card (☐ / ◐ / ☑, "3 of 5 done") is edited in place; each subagent gets one 🤖 lane line (tools, elapsed, then its result) instead of silence. Context compaction and provider retries show in the status line
 - **Review changes on a phone** — a run that edited files ends with a 📄 View changes button; it opens a modal with a file dropdown and one file's diff at a time (oversized files offer a snippet download)
+- **Steer, undo, fork** — a message sent mid-run gets ⏳ Queued with Steer now / Cancel buttons; `\undo [n]` rewinds the last turns and OpenCode's file edits behind a Keep / Put it back card; `\fork [n]` copies the session into a new thread (same working directory)
 - **Home tab** — opening the app's Home shows what's running, what's waiting on you, scheduled reports and today's usage, each linked to its thread. It's a snapshot taken when you open it; nothing is pushed
 - **Send to OpenCode** — the ⋯ menu on any message starts a run from it: pick a project, add instructions, and run in that message's thread (or your DM when the bot isn't in that conversation)
 - **Markdown answers render properly** — GFM → Slack mrkdwn conversion (bold, lists, links, headings); fenced code stays code
@@ -116,7 +117,9 @@ Plural/singular forms work as aliases (`\session`, `\models`, `\log`, `\schedule
 | `\hush` | toggle quiet mode in this thread (@ mention wakes it) |
 | `\verbose on\|off\|full` | tool-call visibility — `on` by default, `full` adds output snippets |
 | `\model` | searchable picker, ★ OpenCode favorites first; `\model provider/model` or a filter (`\model sonnet`) to set |
-| `\stop` `\abort` `\cancel` | cancel the running task in this thread |
+| `\stop` `\abort` `\cancel` | cancel the running task and this thread's queued messages |
+| `\undo [n]` `\revert` | rewind the last n turns (default 1) and OpenCode's edits from them; Keep / Put it back card, and your next message keeps it |
+| `\fork [n]` | copy this session into a new top-level thread, optionally without the last n turns; both share the working directory |
 | `\permissions` | pending approvals and thread/DM delivery state |
 | `\permission <request-id> once\|deny\|always` | explicit text backup for approval buttons |
 | `\project <name\|#>` | swap projects by fuzzy name (`\project cowork`) or listing number — same fresh teardown as `\cd` |

@@ -222,6 +222,34 @@ describe("timed tool delivery", () => {
   });
 });
 
+describe("queued prompt steer/cancel", () => {
+  it("a queued ack carries steer/cancel buttons; a cancelled inbox event edits it, drops it from pending, and finalize skips the idle grace", async () => {
+    const f = fixture();
+    const [first, second] = [timestampFromMs(Date.now() - 2000), timestampFromMs(Date.now() - 1000)];
+    f.state.setThread("C:T", { sessionId: f.v.sessionId, projectDir: "/renderer-reliability", verbose: "on",
+      createdAt: Date.now(), lastUsedAt: Date.now(), historyCursorTs: timestampFromMs(Date.now() - 3000) });
+    for (const [ts, messageId] of [[first, "msg_a"], [second, "msg_b"]] as const) {
+      f.state.claimMessage("C:T", ts);
+      f.state.associatePrompt("C:T", ts, { projectDir: "/renderer-reliability", sessionId: f.v.sessionId, messageId });
+    }
+    await f.v.beginPrompt(first);
+    await f.v.beginPrompt(second);
+    await vi.advanceTimersByTimeAsync(0);
+    const calls = vi.mocked(f.deps.post).mock.calls;
+    const ack = calls.findIndex((c) => c[2].includes("Queued"));
+    const blocks = calls[ack]![3] as Array<{ elements?: Array<{ action_id: string; value: string }> }>;
+    expect(blocks[1]!.elements!.map((e) => e.action_id)).toEqual(["inbox_steer", "inbox_cancel"]);
+    expect(JSON.parse(blocks[1]!.elements![0]!.value)).toEqual({ c: "C", t: "T", u: second });
+
+    await f.v.handle({ type: "session.inbox", properties: { sessionID: f.v.sessionId, inboxID: "msg_b", outcome: "cancelled" } });
+    expect(f.deps.update).toHaveBeenCalledWith("C", `ts-${ack + 1}`, expect.stringContaining("Cancelled"), "T");
+    expect(f.state.getThread("C:T")?.pendingRun?.userMsgTs).toEqual([first]);
+    await f.v.handle({ type: "session.idle", properties: { sessionID: f.v.sessionId } });
+    expect(f.v.isFinalized).toBe(true); // no 8s grace waiting on the cancelled prompt
+    expect(f.deps.react).not.toHaveBeenCalledWith("C", second, "white_check_mark");
+  });
+});
+
 describe("status reliability and lifetime", () => {
   it("re-homes only after a delayed queued-prompt acknowledgement lands", async () => {
     const f = fixture();
