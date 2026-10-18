@@ -48,7 +48,7 @@ export function permissionKey(identity: PermissionIdentity): string {
   return JSON.stringify([identity.projectDir, identity.sessionId, identity.requestId, identity.generation]);
 }
 
-/** Include this in post text/metadata; recovery must also verify the bot author. */
+/** Sent as post metadata (older posts: in the text); recovery must also verify the bot author. */
 export function permissionDeliveryMarker(identity: PermissionIdentity, destination: "thread" | "dm"): string {
   return `slackoc-permission-${createHash("sha256").update(permissionKey(identity)).digest("hex").slice(0, 24)}-${destination}`;
 }

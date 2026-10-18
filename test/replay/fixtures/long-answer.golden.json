@@ -1,0 +1,11 @@
+[
+  "react U1 :eyes:",
+  "post M1: The retry helper wraps one call and retries it on transient failures.",
+  "post M2: Here is the core loop:",
+  "post M3: ```ts\nfor (let attempt = 0; attempt &lt; max; attempt++) {\n  try { return await run(); }\n\n  catch (err) { await sleep(backoff(attempt)); }\n}\n```",
+  "post M4: Each attempt doubles the wait, capped at *eight seconds*.\n\n• Network errors retry.\n• Rate limits honor `Retry-After`.",
+  "post M5: That keeps one flaky request from failing the whole run.",
+  "unreact U1 :eyes:",
+  "react U1 :white_check_mark:",
+  "post M6: *project* · `anthropic/claude-sonnet-4-5` · 9s · $0.012 · 1.2k↑/340↓ · Verbose Tools"
+]

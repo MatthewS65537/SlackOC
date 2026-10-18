@@ -50,7 +50,7 @@ function complete(child: FakeChild, value: unknown = receipt(), code: number | n
 }
 
 describe("native file-send tool", () => {
-  it("registers only the strict path/comment tool with its distinct native permission and disposes its transform", async () => {
+  it("registers only the strict path/comment/pdf tool with its distinct native permission and disposes its transform", async () => {
     const add = vi.fn();
     const dispose = vi.fn().mockResolvedValue(undefined);
     const transform = vi.fn(async (edit: (editor: { add: typeof add }) => void) => {
@@ -63,7 +63,7 @@ describe("native file-send tool", () => {
     expect(fileSendTool.name).toBe("slackoc_send_file");
     expect(fileSendTool.options).toEqual({ permission: "slackoc.send_file" });
     expect(fileSendTool.input).toMatchObject({ type: "object", required: ["path"], additionalProperties: false });
-    expect(Object.keys((fileSendTool.input as { properties: object }).properties)).toEqual(["path", "comment"]);
+    expect(Object.keys((fileSendTool.input as { properties: object }).properties)).toEqual(["path", "comment", "pdf"]);
     if (typeof cleanup !== "function") throw new Error("Missing transform cleanup");
     await cleanup();
     expect(dispose).toHaveBeenCalledOnce();
@@ -116,6 +116,7 @@ describe("native file-send tool", () => {
     { path: "/file.pdf", sessionID: "ses_other" }, { path: "/file.pdf", destination: "DM" },
     { path: "/file.pdf", channel: "C012ABCDEF" }, { path: "/file.pdf", threadTs: "1700000000.000001" },
     { path: "/file.pdf", unrelated: true }, { path: "/file.pdf", comment: "x".repeat(2001) },
+    { path: "/file.html", pdf: "false" }, { path: "/file.html", pdf: 0 },
   ])("rejects invalid or destination-bearing input without launching a CLI: %j", async input => {
     await expect(fileSendTool.execute(input, context())).rejects.toThrow();
     expect(spawn).not.toHaveBeenCalled();
@@ -286,11 +287,27 @@ describe("confirmed file-send receipts", () => {
     { ...receipt(), threadTs: "" }, { ...receipt(), threadTs: "1700000000" },
     { ...receipt(), threadTs: "0.000001" }, { ...receipt(), threadTs: "1700000000.000001\n" },
     { ...receipt(), filename: "" }, { ...receipt(), bytes: 0 }, { ...receipt(), bytes: 50 * 1024 * 1024 + 1 },
+    { ...receipt(), pdf: null }, { ...receipt(), pdf: { fileId: "F1", filename: "a.pdf", bytes: 0 } },
+    { ...receipt(), pdf: { fileId: "nope", filename: "a.pdf", bytes: 1 } }, { ...receipt(), pdfSkipped: 7 },
   ])("rejects unconfirmed, malformed or mismatched success output: %j", async value => {
     const pending = fileSendTool.execute({ path: "/file.pdf" }, context());
     complete(children[0]!, value);
     await expect(pending).rejects.toThrow(/Delivery is uncertain/);
     expect(spawn).toHaveBeenCalledOnce();
+  });
+
+  it("asks for --no-pdf only when pdf is false, and forwards the HTML's PDF result without extra fields", async () => {
+    const pdf = { fileId: "F0PDF", filename: "report.pdf", bytes: 99 };
+    const sent = fileSendTool.execute({ path: "/project/report.html" }, context());
+    complete(children[0]!, { ...receipt(), filename: "report.html", pdf: { ...pdf, extra: "must-not-forward" } });
+    expect(await sent).toEqual({ content: JSON.stringify({ ...receipt(), filename: "report.html", pdf }) });
+    const skipped = fileSendTool.execute({ path: "/project/report.html", pdf: true }, context());
+    complete(children[1]!, { ...receipt(), pdfSkipped: "Chrome wasn't found" });
+    expect(JSON.parse((await skipped).content as string).pdfSkipped).toBe("Chrome wasn't found");
+    const source = fileSendTool.execute({ path: "/project/report.html", pdf: false }, context());
+    complete(children[2]!);
+    await source;
+    expect(vi.mocked(spawn).mock.calls.map(call => (call[1] as string[]).includes("--no-pdf"))).toEqual([false, false, true]);
   });
 
   it("accepts a receipt split across chunks only after the process closes", async () => {

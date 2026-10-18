@@ -39,19 +39,25 @@ Slack (mobile/desktop) ── Socket Mode (outbound, no public URL) ──► sl
 
 - **Remote prompting** from Slack DM or mention, with answers streamed into threads
 - **Always-on channels** — `\listen` (toggle, or `on|off`) in a channel makes every top-level message of yours start a session without an @ (off by default; DMs always listen)
-- **Channel pins** — `\pin [path|name|#]` locks a channel to one project: new sessions there start in it, and switching that channel to another folder is refused until `\unpin`
+- **Channel pins** — `\pin [path|name|#]` locks a channel to one project: new sessions there start in it, and switching that channel to another folder is refused until `\unpin` (worktrees of the pinned project count as the same project)
 - **Proactive threads with a mute** — once a thread has a session, replies are answered with no @ mention needed; `\hush` quiets the thread (an @ always wakes it)
 - **Tool visibility by default** — `\verbose full|on|off` (channel-wide); compact tool batches flush after 1.5 seconds or at a size threshold, and before answers. Paths, commands, and search patterns use inline code; shell descriptions stay concise. `full` adds output snippets. Slack queueing or rate limits may delay delivery
 - **Clear progress** — literal ⏳/⌛ characters, elapsed time, waiting-for-answer/permission and connection states; the indicator moves below new content, with bounded retry backoff when Slack is unavailable
+- **One-tap retry** — a failed run's ❌ line has ↻ Retry (resends your last prompt's text; attachments aren't re-sent, and prompts over 4,000 characters are cut) and, for provider errors, Switch model… (pick a model and the prompt reruns on it)
+- **Context meter** — the run summary line ends with `ctx N%`, how much of the model's context window the last step used; the ⏳ line shows it from 80%, and `\status` shows it per thread
 - **Paragraph streaming** — each paragraph of a reply posts as soon as the model finishes it (never split inside a code block, no in-place edits). `\stream off` reverts a thread to posting each part once complete
 - **Live plan and subagent lanes** — when the agent writes a todo list, one 📋 plan card (☐ / ◐ / ☑, "3 of 5 done") is edited in place; each subagent gets one 🤖 lane line (tools, elapsed, then its result) instead of silence. Context compaction and provider retries show in the status line
 - **Review changes on a phone** — a run that edited files ends with a 📄 View changes button; it opens a modal with a file dropdown and one file's diff at a time (oversized files offer a snippet download)
+- **Ship from Slack** — 🚀 Ship… (next to View changes, or `\ship`) opens a panel to commit the files you tick, and optionally push and open a draft PR. SlackOC runs `git`/`gh` itself — no model, no shell, never `--force`; pushing to main/master is refused unless you opt in ([details](docs/SETUP.md#ship-panel))
+- **Native Slack agent status** — runs drive Slack's own "Working…" indicator and Stop button in the agent messaging view (questions/approvals show as waiting on you); the ⏳ status line stays as before. Needs the current manifest ([upgrading](docs/SETUP.md#upgrading-an-existing-app))
 - **Steer, undo, fork** — a message sent mid-run gets ⏳ Queued with Steer now / Cancel buttons; `\undo [n]` rewinds the last turns and OpenCode's file edits behind a Keep / Put it back card; `\fork [n]` copies the session into a new thread (same working directory)
-- **Home tab** — opening the app's Home shows what's running, what's waiting on you, scheduled reports and today's usage, each linked to its thread. It's a snapshot taken when you open it; nothing is pushed
+- **Worktree per thread (opt-in)** — `\new --wt [branch]` and `\fork --wt [n]` give a thread its own git worktree (created by OpenCode), so parallel runs on one repo don't trample each other; `\wt` lists them and `\wt remove <#>` asks before discarding uncommitted or unpushed work
+- **Shell without the model** — `\! npm test` runs a command in the thread's session folder and posts the output, which becomes session context for your next prompt
+- **Live Home tab** — the app's Home shows what's running, what's waiting on you, scheduled reports and today's usage, each linked to its thread. Once you've opened it, it updates silently within about 5 seconds of a change (no notifications). Stop running threads, Approve once / Deny pending permissions, and run saved prompts (▶ starts a new DM thread) right from Home
 - **Send to OpenCode** — the ⋯ menu on any message starts a run from it: pick a project, add instructions, and run in that message's thread (or your DM when the bot isn't in that conversation)
 - **Markdown answers render properly** — GFM → Slack mrkdwn conversion (bold, lists, links, headings); fenced code stays code
 - **Image support, both ways** — attach a screenshot (or any text/PDF/JSON file ≤8MB) to your message and the model sees it; images over ~1MB are auto-compressed to stay under provider request-size limits; images the model produces are posted back into the thread
-- **Agent file delivery** — the global `slackoc_send_file` tool sends PDFs, screenshots, reports and other local files (≤50 MiB) to the agent's current Slack thread. Its session comes from OpenCode, not a guessed destination; there is no separate DM fallback. [Setup](docs/SETUP.md#agent-file-delivery)
+- **Agent file delivery** — the global `slackoc_send_file` tool sends PDFs, screenshots, reports and other local files (≤50 MiB) to the agent's current Slack thread. HTML files also arrive as a PDF printed by local headless Chrome, so they open on a phone. Its session comes from OpenCode, not a guessed destination; there is no separate DM fallback. [Setup](docs/SETUP.md#agent-file-delivery)
 - **Approval buttons with text backup** — ✓ Approve once / Always allow / ✕ Deny, independently delivered to the thread and owner DM. Rejected cards fall back to usable text commands; `\permissions` lists pending requests and `\permission <request-id> once|deny|always` answers them. Button/text races share one owner-only responder
 - **Notifications that reach you** — failures and stalls stay in the thread (no DM clutter); `\notify on` adds a DM when each run finishes (with a one-tap 📄 View changes button)
 - **Scheduled reports** — `\schedule add` previews a daily/weekly report before confirmation. Each occurrence uses a fresh, restricted OpenCode session and sends the finished report to your DM or an invited channel; durable records recover work without blindly repeating prompts or posts
@@ -115,20 +121,31 @@ Plural/singular forms work as aliases (`\session`, `\models`, `\log`, `\schedule
 |---|---|
 | `\help` `\status` | grouped cheat sheet / project, binding, pool health |
 | `\hush` | toggle quiet mode in this thread (@ mention wakes it) |
+| `\listen [on\|off]` | answer every top-level message in this channel without an @ mention, each in its own thread; off by default, bare `\listen` toggles; DMs always listen |
 | `\verbose on\|off\|full` | tool-call visibility — `on` by default, `full` adds output snippets |
+| `\stream [on\|off]` | post this thread's answers paragraph by paragraph as they're written (`on` by default) or once each part is complete; bare `\stream` shows the setting |
 | `\model` | searchable picker, ★ OpenCode favorites first; `\model provider/model` or a filter (`\model sonnet`) to set |
 | `\stop` `\abort` `\cancel` | cancel the running task and this thread's queued messages |
 | `\undo [n]` `\revert` | rewind the last n turns (default 1) and OpenCode's edits from them; Keep / Put it back card, and your next message keeps it |
 | `\fork [n]` | copy this session into a new top-level thread, optionally without the last n turns; both share the working directory |
+| `\new --wt [branch]` `\fork --wt [n]` | same, but in a new git worktree of the project (prompts sent while it's being prepared are declined; resend once it's ready). If a fork can't get a worktree it falls back to the shared folder |
+| `\worktrees` `\wt` `\wt remove <#>` | list the project's worktrees and their threads / remove one (confirms first if there are uncommitted, unpushed or no-upstream changes; unbinds its threads) |
+| `\! <command>` `\sh` | run a shell command in this session's folder on the bridge machine with your user's permissions — no model; output joins the session context (snippet over 3,500 characters). Refused while a run is active and in scheduled-report threads |
 | `\permissions` | pending approvals and thread/DM delivery state |
 | `\permission <request-id> once\|deny\|always` | explicit text backup for approval buttons |
 | `\project <name\|#>` | swap projects by fuzzy name (`\project cowork`) or listing number — same fresh teardown as `\cd` |
 | `\new [dir]` `\cd <dir>` `\projects` | fresh session (previous one kept for `\resume`) / switch by path (`~` OK) / list projects |
+| `\pin [path\|name\|#]` `\unpin` | lock this channel to one project (bare `\pin` uses this thread's): new sessions start there and moves to other folders are refused / release the pin (same as `\pin off`) |
 | `\sessions [all\|<filter>]` `\resume <#\|id>` | list this project's sessions (or machine-wide with `all`/a filter) + bind a thread using stable picker numbers |
 | `\watch <#\|id>` `\unwatch` | read-only mirror of a computer-driven session / stop mirroring; `\resume` enables prompting |
 | `\history [n]` `\history <#\|id>` | display recent transcript turns without modifying session context; use `#N` for a picker number |
 | `\summary [#\|id]` | opt-in AI catch-up summary using a temporary session; costs a model call, leaves the target context unchanged |
 | `\agent <#\|name>` | swap OpenCode agent |
+| `\save <name> <prompt…>` `\unsave <name>` | save a reusable prompt (names: a–z, 0–9, `-`, `_`; saving again updates it) / delete one |
+| `\run <name> [extra]` `\play` | send a saved prompt (plus any extra text) here; in a DM or new message it starts a session |
+| `\saved` `\prompts` `\macro` | list saved prompts with ▶ buttons that run in this thread |
+| `\ship` `\commit` `\pr` | 🚀 Ship panel: commit ticked files, optionally push and open a draft PR |
+| `\shot <url\|path> [phone\|desktop\|pdf]` `\screenshot` `\snap` | screenshot a page or a project file with local headless Chrome (phone-sized by default) or print it to PDF; no model call. Set `SLACKOC_CHROME` if Chrome isn't found |
 | `\diff` `\cmd …` | diff summary with a View changes button (`\diff full` adds the unified diff, snippet when long) / OpenCode native command passthrough; a bare `\cmd` lists the project's native commands |
 | `\usage [today\|7d\|30d] [all]` | cost, tokens, sessions and a daily activity sparkline for this project (default 7d) or every project with `all` (also `\cost`, `\spend`, `\stats`) |
 | `\notify on\|off` | DM the owner when runs in this thread finish successfully (failures stay in the thread; permission asks and questions are always mirrored to DMs) |
@@ -172,8 +189,10 @@ settings. `\schedule` shows each report's latest outcome, such as
 The scheduled time is when generation **starts**, not a delivery deadline. Your
 Mac and bridge must be awake and online. After sleep/restart, only the latest
 missed occurrence within two hours can run; older work is skipped rather than
-backlogged. One report executes at a time. Pause/resume starts with the next
-future occurrence; manual runs use a separate run ID.
+backlogged. One report executes at a time; a report that comes due while another
+is generating waits for it (still inside the two-hour window) instead of being
+skipped. Pause/resume starts with the next future occurrence; manual runs use a
+separate run ID.
 
 Repeated daylight-saving times run once, at the first occurrence. Missing local
 times follow the recurrence library: full-hour spring gaps shift forward;
@@ -200,6 +219,7 @@ scheduler state disables scheduled work without stopping ordinary conversations.
 - Tokens + state live at `~/.config/slackoc/`, mode `0600`, never logged.
 - SlackOC authenticates to the local OpenCode V2 service; Slack Socket Mode needs no public HTTP endpoint. SlackOC does not expose its own inbound server.
 - Unknown `\…` text is rejected as a command, never forwarded to OpenCode as a prompt.
+- `\!` and 🚀 Ship run commands on your machine as you; owner-only pairing is the gate, the same trust as your terminal. Ship never force-pushes and won't push to main/master unless you opt in.
 - File sending uses the native current session's unique saved thread binding, with a recheck before Slack shares the upload. Missing/ambiguous/changed bindings fail closed. The native tool respects the `slackoc.send_file` permission action; upload credentials are loaded inside the CLI, never supplied by the model.
 
 ## Dev

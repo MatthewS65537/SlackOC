@@ -8,7 +8,9 @@ export interface IncomingContext { source: "live" | "history"; generation?: numb
   /** Project for a brand-new thread session (the shortcut's choice); defaults to the current project. */
   projectDir?: string;
   /** History sweep of a \listen channel / owner DM: an unbound top-level message after the channel watermark. */
-  topLevel?: boolean }
+  topLevel?: boolean;
+  /** ↻ Retry (D3): resend this stored plain prompt; msg.text is ignored (no decoding, commands, hush gate or files). */
+  retryText?: string }
 
 /** Slack timestamps are decimal seconds, with at most six microsecond digits. */
 export function timestampMicros(ts: string | undefined): bigint | undefined {

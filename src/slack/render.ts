@@ -1,15 +1,18 @@
-import type { OCClient, OcEvent, OcPart } from "../opencode/api.js";
-import { readFile } from "node:fs/promises";
-import { sessionGet, sessionIdle, sessionMessages } from "../opencode/client.js";
+import type { OCClient, OcEvent, OcFileDiff, OcPart } from "../opencode/api.js";
+import { fileURLToPath } from "node:url";
+import { contextLimit, modelCatalog, sessionDiff, sessionIdle, sessionMessages } from "../opencode/client.js";
+import { withDeadline } from "../http.js";
+import { assertNotSecret, fileBytes, MAX_SEND_FILE_BYTES } from "../send-file.js";
 import type { ConnectionState } from "../opencode/server.js";
 import { canonicalDir } from "../paths.js";
 import { formatTool, safeCodePayload, safePayload } from "./tool-format.js";
-import type { StateStore, ThreadState, VerboseMode } from "../state.js";
-import { planText, planTodos, queuedAckBlocks, viewDiffBlocks } from "./blocks.js";
+import { LAST_PROMPT_MAX, type StateStore, type ThreadState, type VerboseMode } from "../state.js";
+import { planText, planTodos, queuedAckBlocks, retryBlocks, viewDiffBlocks } from "./blocks.js";
 import { logErr } from "../log.js";
 import { chunkText, dur, mdToMrkdwn, money, shortId, tok, truncate } from "../util.js";
 import { isSlackDrop, laneDepth } from "./queue.js";
 import type { SlackLane } from "./queue.js";
+import type { MarkerMetadata } from "./markers.js";
 import { classifyPendingRun, replayAge } from "./recovery-policy.js";
 
 export interface RenderDeps {
@@ -18,7 +21,8 @@ export interface RenderDeps {
     threadTs: string,
     text: string,
     blocks?: unknown[],
-    opts?: { unfurl?: boolean; lane?: SlackLane },
+    /** `metadata` carries an invisible delivery marker (slack/markers.ts). */
+    opts?: { unfurl?: boolean; lane?: SlackLane; metadata?: MarkerMetadata },
   ): Promise<{ ts: string }>;
   /** `threadTs` keeps the edit ordered with the thread's posts (queue.ts). */
   update(channel: string, ts: string, text: string, threadTs?: string): Promise<void>;
@@ -40,10 +44,26 @@ export interface RenderDeps {
    * remote pager: completions when \notify is on, permission/question asks
    * mirrored with their buttons. Absent when DMs are unavailable.
    */
-  dm?(channel: string, threadTs: string, text: string, blocks?: unknown[], opts?: { lane?: SlackLane }): Promise<{ ts: string }>;
+  dm?(channel: string, threadTs: string, text: string, blocks?: unknown[], opts?: { lane?: SlackLane; metadata?: MarkerMetadata }): Promise<{ ts: string }>;
+  /**
+   * Slack's native agent-session status for the thread (agents.sessions.setStatus):
+   * "Working…" + Stop while processing, waiting-on-you while suspended. `title`
+   * and `initiatorUserId` only apply when Slack creates the session. Never
+   * throws; a no-op when the app can't use agent sessions (render-deps.ts).
+   */
+  sessionStatus?(channel: string, threadTs: string, status: SessionStatus, opts?: { title?: string; initiatorUserId?: string }): Promise<void>;
+  /** Rename the thread's agent session (agents.sessions.rename). Never throws. */
+  sessionRename?(channel: string, threadTs: string, title: string): Promise<void>;
 }
 
+export type SessionStatus = "processing" | "suspended" | "active" | "closed";
+/** Slack drops `processing` to `active` after 1 h; long runs re-send it this often. */
+export const SESSION_STATUS_REFRESH_MS = 50 * 60_000;
+
 const registry = new Map<string, SessionView>();
+/** E2: told when a view registers or leaves (a run starts or ends); the Home tab refreshes on it. */
+let viewsChanged = (): void => {};
+export function onViewsChanged(fn: () => void): void { viewsChanged = fn; }
 const connections = new Map<string, ConnectionState>();
 
 export function setProjectConnectionState(dir: string, state: ConnectionState): void {
@@ -90,6 +110,37 @@ export function errorMessage(err: unknown, fallback = "unknown session error"): 
   return fallback;
 }
 
+/**
+ * E3: % of the model's context window a step used — (tokens.input + cache.read + cache.write)
+ * ÷ limit.context, rounded. V2 `input` excludes cached tokens, both those read from the cache
+ * and those written to it (a first step that caches a big prompt is mostly cache.write).
+ * Undefined when either side is unknown (no tokens, unlisted model, no limit).
+ */
+export function contextPercent(tokens: { input?: number; cache?: { read?: number; write?: number } } | undefined, limit: number | undefined): number | undefined {
+  const used = (tokens?.input ?? 0) + (tokens?.cache?.read ?? 0) + (tokens?.cache?.write ?? 0);
+  return limit && used > 0 ? Math.round((used / limit) * 100) : undefined;
+}
+
+/** sessionID → context % its last finished run ended at, for \status between runs. Capped. */
+const lastContext = new Map<string, number>();
+
+/** E3: the session's context use — the live run's latest step, else where its last run ended. */
+export function sessionContextPct(sessionId: string): number | undefined {
+  return registry.get(sessionId)?.contextPct ?? lastContext.get(sessionId);
+}
+
+/** D3: the context line under ↻ Retry when it can't resend the original exactly. */
+function retryNote(p: { files?: true; cut?: true }): string | undefined {
+  if (!p.files && !p.cut) return undefined;
+  const what = p.cut ? `only the first ${LAST_PROMPT_MAX.toLocaleString("en-US")} characters of the text` : "the text only";
+  return `Retry resends ${what}${p.files ? " — attachments aren't re-sent" : ""}.`;
+}
+
+/** OpenCode error types (step/execution failures) that blame the model provider: Switch model… is offered. */
+function isProviderError(type: string | undefined): boolean {
+  return !!type?.startsWith("provider.");
+}
+
 /** Status-line text for a provider retry; `next` (epoch ms) adds a countdown when known. */
 export function retryActivity(st: { message?: string; attempt?: number; next?: number }, now: number): string {
   const wait = st.next && st.next > now ? ` in ${Math.ceil((st.next - now) / 1000)}s` : "";
@@ -130,6 +181,7 @@ export function getView(sessionId: string): SessionView | undefined {
 export function deleteView(sessionId: string): void {
   registry.get(sessionId)?.dispose();
   registry.delete(sessionId);
+  viewsChanged();
 }
 
 /**
@@ -159,6 +211,8 @@ export interface ActiveRunInfo {
   threadKey: string;
   elapsedMs: number;
   queued: number;
+  /** A \watch view: the run is driven outside Slack (TUI/IDE), so Slack offers no Stop. */
+  watching: boolean;
 }
 
 export function describeActiveRuns(): ActiveRunInfo[] {
@@ -171,6 +225,7 @@ export function describeActiveRuns(): ActiveRunInfo[] {
       threadKey: v.threadKey,
       elapsedMs: v.currentRunElapsedMs,
       queued: v.queuedCount,
+      watching: v.isWatching,
     });
   }
   return out;
@@ -207,6 +262,7 @@ function registerView(view: SessionView): void {
   const prev = registry.get(view.sessionId);
   if (prev && !prev.isFinalized) prev.dispose();
   registry.set(view.sessionId, view);
+  viewsChanged();
 }
 
 export interface SessionViewOpts {
@@ -262,6 +318,12 @@ export class SessionView {
   private readonly pendingText = new Map<string, string>();
   private readonly activeTools = new Map<string, string>();
   private readonly msgCost = new Map<string, { cost: number; input: number; output: number; model?: string }>();
+  /** E3: context % used by the latest step (contextPercent); undefined until known. */
+  private ctxPct: number | undefined;
+  /** Orders catalog lookups so an older step's late answer can't overwrite a newer one. */
+  private ctxSeq = 0;
+  /** The latest step's catalog lookup; finalize awaits it (it never rejects). */
+  private ctxLookup: Promise<void> = Promise.resolve();
   private readonly msgRoles = new Map<string, string>(); // messageID -> role (filter user echo)
   /** Assistant text part ids already posted to Slack (backstop dedup). */
   private readonly postedPartIds = new Set<string>();
@@ -357,6 +419,8 @@ export class SessionView {
   private readonly queuedCards = new Map<string, string>();
   /** Queued prompts steered into the current run: they produce no idle of their own. */
   private readonly steered = new Set<string>();
+  /** Queued prompts' ↻ Retry text (parkPrompt), keyed by user ts; becomes lastPrompt once delivered as its own run. */
+  private readonly parkedPrompts = new Map<string, NonNullable<ThreadState["lastPrompt"]>>();
   /**
    * \watch mode: this view mirrors a session driven OUTSIDE Slack (TUI/IDE).
    * Cross-process SSE does NOT propagate (live-verified 2026-09-16: a session
@@ -372,6 +436,13 @@ export class SessionView {
   private settleTimer: NodeJS.Timeout | null = null;
   /** True once the watcher posted at least one post-attach part. */
   private streamedAny = false;
+  /**
+   * Native agent-session status last sent for this run (A1): processing while
+   * running, suspended while a question/approval waits, active once over.
+   * null until a run starts (\watch mirrors never set it).
+   */
+  private native: Exclude<SessionStatus, "closed"> | null = null;
+  private nativeRefresh: NodeJS.Timeout | null = null;
 
   constructor(opts: SessionViewOpts) {
     this.sessionId = opts.sessionId;
@@ -418,6 +489,20 @@ export class SessionView {
     this.cancelIdleGrace();
     if (this.active && !this.attached) this.armWatchdog();
     if (hadQuestion && !hasQuestion) this.maybeSink();
+    if (this.native === "processing" || this.native === "suspended") this.setNative(this.waiting.size ? "suspended" : "processing");
+  }
+
+  /** Send the native status on a transition only; `processing` re-arms the 1 h keep-alive. */
+  private setNative(status: Exclude<SessionStatus, "closed">, title?: string, refresh = false): void {
+    if (!this.deps.sessionStatus || (status === this.native && !refresh)) return;
+    this.native = status;
+    if (this.nativeRefresh) clearTimeout(this.nativeRefresh);
+    this.nativeRefresh = null;
+    if (status === "processing") {
+      this.nativeRefresh = setTimeout(() => this.setNative("processing", undefined, true), SESSION_STATUS_REFRESH_MS);
+      this.nativeRefresh.unref();
+    }
+    void this.deps.sessionStatus(this.channel, this.threadTs, status, title ? { title } : undefined).catch(() => {});
   }
 
   private hasPendingQuestion(): boolean {
@@ -442,12 +527,15 @@ export class SessionView {
     this.cancelToolTimer();
     if (this.ticker) clearInterval(this.ticker);
     if (this.watchdog) clearTimeout(this.watchdog);
-    this.ticker = this.watchdog = null;
+    if (this.nativeRefresh) clearTimeout(this.nativeRefresh);
+    this.ticker = this.watchdog = this.nativeRefresh = null;
     for (const card of this.liveCards()) if (card.timer) { clearTimeout(card.timer); card.timer = null; }
   }
 
   /** Detach immediately; in-flight status posts clean themselves up on arrival. */
   dispose(): void {
+    // A run torn down without finalize (rebind, unsubmitted prompt, \resume) must not leave "Working…" up.
+    if (this.native === "processing" || this.native === "suspended") this.setNative("active");
     this.disposed = true;
     this.active = false;
     this.generation++;
@@ -473,11 +561,25 @@ export class SessionView {
   get queuedCount(): number {
     return Math.max(0, this.outstandingPrompts - 1);
   }
+  get isWatching(): boolean {
+    return this.attached;
+  }
   get currentRunElapsedMs(): number {
     return Date.now() - this.runStartedAt;
   }
   get isFinalized(): boolean {
     return this.finalized;
+  }
+  get contextPct(): number | undefined {
+    return this.ctxPct;
+  }
+
+  /** E3: price a finished step against its model's window, off the event chain (the catalog is cached per dir). */
+  private noteContext(providerID: string, modelID: string, tokens: { input?: number; cache?: { read?: number; write?: number } }): void {
+    const seq = ++this.ctxSeq;
+    this.ctxLookup = modelCatalog(this.client).then((catalog) => {
+      if (seq === this.ctxSeq) this.ctxPct = contextPercent(tokens, contextLimit(catalog, providerID, modelID));
+    }, () => {});
   }
 
   /**
@@ -526,7 +628,7 @@ export class SessionView {
           }
           // Lost terminal events can leave activeTools stale. Transcript states
           // above, not that event cache, decide whether tools are still pending.
-          await this.finalizeInner(completed.info.error ? errorMessage(completed.info.error) : undefined);
+          await this.finalizeInner(completed.info.error ? errorMessage(completed.info.error) : undefined, completed.info.error?.name);
           return true;
         });
         this.tail = check.then(() => {}, () => {});
@@ -612,9 +714,10 @@ export class SessionView {
    * Called when a new user prompt begins driving this session. Marks the
    * user's message for later ✅/❌ resolution and posts the live status.
    * A second prompt arriving mid-run gets a queued ack. Safe for
-   * back-to-back prompts on an active session.
+   * back-to-back prompts on an active session. `title` names a new native
+   * agent session (Slack ignores it once the thread has one).
    */
-  async beginPrompt(userMsgTs: string): Promise<void> {
+  async beginPrompt(userMsgTs: string, title?: string): Promise<void> {
     if (this.finalized || this.disposed) return;
     this.generation++;
     // A prompt through this thread means Slack is taking the watched session
@@ -634,6 +737,7 @@ export class SessionView {
     this.armWatchdog();
     void this.start().catch(err => logErr(`status post failed: ${errorMessage(err)}`));
     this.startTicker();
+    this.setNative(this.waiting.size ? "suspended" : "processing", title); // no-op for a queued prompt
     // Tombstone for the interrupt sweep: if the bridge dies before finalize,
     // the next boot can resolve this thread's ⏳ instead of leaving it frozen.
     const cur = this.state.getThread(this.threadKey);
@@ -685,6 +789,7 @@ export class SessionView {
     this.syncTombstoneStatusTs();
     this.armWatchdog();
     this.startTicker();
+    this.setNative(this.waiting.size ? "suspended" : "processing");
     return true;
   }
 
@@ -704,6 +809,11 @@ export class SessionView {
       if (this.statusTs) await this.deleteStatus(this.statusTs);
       deleteView(this.sessionId);
     }
+  }
+
+  /** Router: a prompt queued behind the active run. The running prompt keeps the thread's lastPrompt until this one is delivered. */
+  parkPrompt(lastPrompt: NonNullable<ThreadState["lastPrompt"]>): void {
+    this.parkedPrompts.set(lastPrompt.ts, lastPrompt);
   }
 
   /** A Steer/Cancel button now owns this queued prompt's card; `steered` marks it as joining the current run. */
@@ -1028,7 +1138,7 @@ export class SessionView {
       }
       case "message.updated": {
         const info = props.info as
-          | { id: string; role: string; cost?: number; modelID?: string; providerID?: string; tokens?: { input?: number; output?: number }; error?: { name?: string; data?: Record<string, unknown> }; time?: { completed?: number } }
+          | { id: string; role: string; cost?: number; modelID?: string; providerID?: string; tokens?: { input?: number; output?: number; cache?: { read?: number } }; error?: { name?: string; data?: Record<string, unknown> }; time?: { completed?: number } }
           | undefined;
         if (!info) return;
         if (!this.msgRoles.has(info.id)) this.msgRoles.set(info.id, info.role);
@@ -1039,10 +1149,11 @@ export class SessionView {
           output: info.tokens?.output ?? 0,
           model: info.providerID && info.modelID ? `${info.providerID}/${info.modelID}` : undefined,
         });
+        if (info.tokens && info.providerID && info.modelID) this.noteContext(info.providerID, info.modelID, info.tokens);
         if (info.error && info.time?.completed) {
           const msg =
             (info.error.data?.message as string | undefined) ?? info.error.name ?? "provider error";
-          await this.finalizeInner(msg); // in-chain: finalizeInner, not finalize (deadlock)
+          await this.finalizeInner(msg, info.error.name); // in-chain: finalizeInner, not finalize (deadlock)
         }
         return;
       }
@@ -1074,6 +1185,8 @@ export class SessionView {
         if (!ts) return;
         const card = this.queuedCards.get(ts);
         this.queuedCards.delete(ts);
+        const parked = this.parkedPrompts.get(ts);
+        this.parkedPrompts.delete(ts);
         if (props.outcome === "cancelled") {
           if (card) await this.deps.update(this.channel, card, "✖ Cancelled, won't run.", this.threadTs).catch(() => {});
           await this.reactOrLog(this.channel, ts, "eyes", false);
@@ -1081,11 +1194,15 @@ export class SessionView {
         } else {
           if (card) await this.deps.delete(this.channel, card, this.threadTs).catch(() => {});
           if (this.steered.delete(ts)) this.outstandingPrompts = Math.max(0, this.outstandingPrompts - 1);
+          else if (parked) { // its own run starts now: a failure from here on is this prompt's to retry
+            const cur = this.state.getThread(this.threadKey);
+            if (cur?.sessionId === this.sessionId) this.state.setThread(this.threadKey, { ...cur, lastPrompt: parked });
+          }
         }
         return;
       }
       case "session.error":
-        await this.finalizeInner(errorMessage(props.error)); // in-chain
+        await this.finalizeInner(errorMessage(props.error), props.errorType as string | undefined); // in-chain
         return;
       default:
         return;
@@ -1235,7 +1352,9 @@ export class SessionView {
     // Post-stall, the watchdog's "no updates for 3m" nudge owns the diagnosis —
     // the ticker just keeps the line visibly alive (distinct wording on purpose).
     if (this.stalled) return `${glass} still working… (${elapsed}) — \`\\stop\` to cancel`;
-    return `${glass} ${this.activity || "working…"} (${elapsed})`;
+    // E3: a looming compaction shows up top only once it's near (≥ 80%).
+    const ctx = this.ctxPct !== undefined && this.ctxPct >= 80 ? ` · ctx ${this.ctxPct}%` : "";
+    return `${glass} ${this.activity || "working…"} (${elapsed})${ctx}`;
   }
 
   private toolTitle(part: OcPart): string {
@@ -1459,11 +1578,12 @@ export class SessionView {
       if (url.startsWith("data:")) {
         data = Buffer.from(url.slice(url.indexOf(",") + 1), "base64");
       } else if (url.startsWith("file:")) {
-        data = await readFile(new URL(url));
+        const path = fileURLToPath(url);
+        await assertNotSecret(path); // same refusal list as slackoc_send_file (#42)
+        data = await fileBytes(path); // send-file's guard: regular file, ≤ 50 MiB (#42)
       } else {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        data = Buffer.from(await res.arrayBuffer());
+        // Deadline + byte cap: a slow or huge resource must not stall this view's tail (#42).
+        data = await withDeadline((signal) => fetchCapped(url, signal), { timeoutMs: FILE_FETCH_TIMEOUT_MS }, "file fetch");
       }
     } catch (err) {
       await this.deps
@@ -1586,7 +1706,8 @@ export class SessionView {
     return run;
   }
 
-  private async finalizeInner(err?: string): Promise<void> {
+  /** `errType` is the OpenCode error type when known (e.g. provider.transport); it picks the failure line's buttons. */
+  private async finalizeInner(err?: string, errType?: string): Promise<void> {
     if (this.finalized || this.disposed) return;
     this.finalized = true;
     this.generation++;
@@ -1595,6 +1716,7 @@ export class SessionView {
     // same breath (watchOnly must never outlive its view).
     const wasWatch = this.attached;
     this.stopTimers();
+    if (this.native) this.setNative("active"); // Slack's "Working…" ends with the run (success or error)
     // Run completed normally — it is no longer an interruption candidate.
     // One write: clear any tombstone, and lift the watch gate when this was a
     // watched run (watchOnly must never outlive its view). A second spread of
@@ -1613,8 +1735,10 @@ export class SessionView {
     // assistant text Slack never got. Only THIS run's messages are considered
     // (runAssistants) — earlier turns were already delivered (and this view's
     // posted-set doesn't know about them). Errors degrade to SSE-only behavior.
-    // The diff summary is independent of the backstop — fetch it alongside.
-    const summaryFetch = sessionGet(this.client, this.sessionId).then(s => s.summary ?? null, () => null);
+    // The diffstat is independent of the backstop — fetch it alongside. V2
+    // session info carries no summary, so total the session diff (the same
+    // source as the 📄 View changes modal); a failed fetch just omits it.
+    const summaryFetch = sessionDiff(this.client, this.sessionId).then(diffTotals, () => null);
     try {
       const msgs = await sessionMessages(this.client, this.sessionId);
       this.reconcileReceipts(msgs);
@@ -1645,6 +1769,12 @@ export class SessionView {
     this.pendingText.clear();
 
     const summary: { additions: number; deletions: number; files: number } | null = await summaryFetch;
+    await this.ctxLookup; // E3: the last step's context-window lookup
+    if (this.ctxPct !== undefined) {
+      lastContext.delete(this.sessionId);
+      lastContext.set(this.sessionId, this.ctxPct);
+      if (lastContext.size > 500) lastContext.delete(lastContext.keys().next().value!);
+    }
 
     let cost = 0;
     let input = 0;
@@ -1668,6 +1798,7 @@ export class SessionView {
     bits.push(dur(Date.now() - this.runStartedAt));
     if (cost) bits.push(money(cost));
     if (input || output) bits.push(`${tok(input)}↑/${tok(output)}↓`);
+    if (this.ctxPct !== undefined) bits.push(`ctx ${this.ctxPct}%`);
     // Rightmost: visibility mode for this run (what "N tool call(s)" used to say).
     bits.push(this.verbose === "off" ? "Silent Tools" : "Verbose Tools");
 
@@ -1677,6 +1808,9 @@ export class SessionView {
     // dispatch is removed first — one state per message (seen → outcome).
     // Reactions (per message: 👀 off, then outcome) and the status cleanup run together.
     if (this.disposed) return;
+    // D3: a failure offers ↻ Retry when this run's prompt is the one the thread stored.
+    const lastPrompt = err && !wasWatch ? this.state.getThread(this.threadKey)?.lastPrompt : undefined;
+    const retry = lastPrompt && this.pendingUserMsgs.includes(lastPrompt.ts) ? lastPrompt : undefined;
     const outcomes = this.pendingUserMsgs.splice(0).map(async (ts) => {
       await this.reactOrLog(this.channel, ts, "eyes", false);
       await this.reactOrLog(this.channel, ts, err ? "x" : "white_check_mark", true);
@@ -1691,8 +1825,10 @@ export class SessionView {
     if (this.disposed) return;
     const summaryLine = err ? `:x: ${safePayload(truncate(err, 200))}` : bits.length ? bits.join(" · ") : null;
     if (summaryLine) {
-      // D1: a run that edited files gets an in-thread "View changes" button.
-      const blocks = !err && summary?.files ? viewDiffBlocks(summaryLine, this.sessionId) : undefined;
+      // D3: a failure whose prompt is stored gets ↻ Retry; D1: a run that edited files gets
+      // 📄 View changes beside 🚀 Ship… (viewDiffBlocks).
+      const blocks = retry ? retryBlocks(summaryLine, retry.ts, { switchModel: isProviderError(errType), note: retryNote(retry) })
+        : !err && summary?.files ? viewDiffBlocks(summaryLine, this.sessionId) : undefined;
       await this.deps.post(this.channel, this.threadTs, summaryLine, blocks, { unfurl: false }).catch((postErr) => {
         logErr(`run summary post failed (${this.sessionId}): ${String((postErr as Error)?.message ?? postErr)}`);
       });
@@ -1719,6 +1855,36 @@ export class SessionView {
     }
     if (registry.get(this.sessionId) === this) deleteView(this.sessionId);
   }
+}
+
+/** "+a/−d across N file(s)" totals of a session diff (whole session, like V1's summary). */
+function diffTotals(diffs: OcFileDiff[]): { additions: number; deletions: number; files: number } | null {
+  if (!Array.isArray(diffs)) return null;
+  let additions = 0;
+  let deletions = 0;
+  for (const d of diffs) {
+    additions += d.additions || 0;
+    deletions += d.deletions || 0;
+  }
+  return { additions, deletions, files: diffs.length };
+}
+
+const FILE_FETCH_TIMEOUT_MS = 30_000;
+
+/** GET a model-produced file URL, refusing bodies over send-file's cap before buffering them (#42). */
+async function fetchCapped(url: string, signal: AbortSignal): Promise<Buffer> {
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const tooBig = () => new Error("File exceeds the 50 MiB SlackOC send limit");
+  if (Number(res.headers.get("content-length")) > MAX_SEND_FILE_BYTES) throw tooBig();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of res.body ?? []) {
+    size += chunk.byteLength;
+    if (size > MAX_SEND_FILE_BYTES) throw tooBig();
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 /** End index of the last paragraph break (blank line) outside a code fence; 0 when none. */

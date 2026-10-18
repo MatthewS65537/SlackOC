@@ -10,7 +10,11 @@ export const FILE_SEND_KILL_GRACE_MS = 1_000;
 interface FileSendInput {
   path: string;
   comment?: string;
+  /** false sends .html/.htm source only (`--no-pdf`); by default HTML also gets a rendered PDF. */
+  pdf?: boolean;
 }
+
+interface SentFile { fileId: string; filename: string; bytes: number }
 
 interface FileSendReceipt {
   ok: true;
@@ -20,14 +24,16 @@ interface FileSendReceipt {
   threadTs: string;
   filename: string;
   bytes: number;
+  pdf?: SentFile;
+  pdfSkipped?: string;
 }
 
 function validateInput(input: unknown): FileSendInput {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new Error("Expected an absolute file path and optional comment.");
   }
-  if (Reflect.ownKeys(input).some(key => key !== "path" && key !== "comment")) {
-    throw new Error("Only path and comment are accepted; the current session supplies the destination.");
+  if (Reflect.ownKeys(input).some(key => key !== "path" && key !== "comment" && key !== "pdf")) {
+    throw new Error("Only path, comment and pdf are accepted; the current session supplies the destination.");
   }
   const value = input as Record<string, unknown>;
   if (!Object.hasOwn(value, "path") || typeof value.path !== "string" ||
@@ -37,11 +43,19 @@ function validateInput(input: unknown): FileSendInput {
   if (value.comment !== undefined && (typeof value.comment !== "string" || value.comment.length > 2000 || value.comment.includes("\0"))) {
     throw new Error("comment must be a string of at most 2000 characters without null bytes.");
   }
-  return { path: value.path, comment: value.comment as string | undefined };
+  if (value.pdf !== undefined && typeof value.pdf !== "boolean") throw new Error("pdf must be a boolean.");
+  return { path: value.path, comment: value.comment as string | undefined, pdf: value.pdf as boolean | undefined };
 }
 
 function uncertain(reason: string): Error {
   return new Error(`${reason} Delivery is uncertain and the file may already have been sent. Check the active Slack thread before retrying; do not automatically resend.`);
+}
+
+function sentFile(value: Record<string, unknown>): SentFile | undefined {
+  if (typeof value.fileId !== "string" || !/^F[A-Z0-9]+$/.test(value.fileId) ||
+    typeof value.filename !== "string" || !value.filename || /[/\x00-\x1f\x7f]/.test(value.filename) ||
+    !Number.isSafeInteger(value.bytes) || Number(value.bytes) < 1 || Number(value.bytes) > 50 * 1024 * 1024) return undefined;
+  return { fileId: value.fileId, filename: value.filename, bytes: Number(value.bytes) };
 }
 
 function validateReceipt(stdout: string, sessionId: string): FileSendReceipt {
@@ -51,16 +65,19 @@ function validateReceipt(stdout: string, sessionId: string): FileSendReceipt {
     throw uncertain("slackoc returned an invalid upload receipt.");
   }
   const receipt = value as Record<string, unknown>;
-  if (receipt.ok !== true || receipt.sessionId !== sessionId ||
-    typeof receipt.fileId !== "string" || !/^F[A-Z0-9]+$/.test(receipt.fileId) ||
+  const file = sentFile(receipt);
+  // An HTML send may also report its rendered PDF, or why it was skipped.
+  const pdf = receipt.pdf && typeof receipt.pdf === "object" ? sentFile(receipt.pdf as Record<string, unknown>) : undefined;
+  if (receipt.ok !== true || receipt.sessionId !== sessionId || !file ||
     typeof receipt.channelId !== "string" || !/^[CGD][A-Z0-9]+$/.test(receipt.channelId) ||
     typeof receipt.threadTs !== "string" || !/^[1-9]\d*\.\d{6}$/.test(receipt.threadTs) ||
-    typeof receipt.filename !== "string" || !receipt.filename || /[/\x00-\x1f\x7f]/.test(receipt.filename) ||
-    !Number.isSafeInteger(receipt.bytes) || Number(receipt.bytes) < 1 || Number(receipt.bytes) > 50 * 1024 * 1024) {
+    (receipt.pdf !== undefined && !pdf) ||
+    (receipt.pdfSkipped !== undefined && (typeof receipt.pdfSkipped !== "string" || receipt.pdfSkipped.length > 500))) {
     throw uncertain("slackoc did not confirm a valid upload for the current session's thread.");
   }
-  return { ok: true, sessionId, fileId: receipt.fileId, channelId: receipt.channelId, threadTs: receipt.threadTs,
-    filename: receipt.filename, bytes: Number(receipt.bytes) };
+  return { ok: true, sessionId, fileId: file.fileId, channelId: receipt.channelId, threadTs: receipt.threadTs,
+    filename: file.filename, bytes: file.bytes, ...(pdf ? { pdf } : {}),
+    ...(typeof receipt.pdfSkipped === "string" ? { pdfSkipped: receipt.pdfSkipped } : {}) };
 }
 
 function runFileCommand(args: string[], signal: AbortSignal): Promise<string> {
@@ -157,12 +174,13 @@ function runFileCommand(args: string[], signal: AbortSignal): Promise<string> {
 
 export const fileSendTool: Info = {
   name: "slackoc_send_file",
-  description: "Send one local file (up to 50 MiB) to this session's existing active Slack thread. The session supplies the destination; no separate DM is opened. Return a confirmed receipt, not file content. Never automatically retry uncertain delivery.",
+  description: "Send one local file (up to 50 MiB) to this session's existing active Slack thread. The session supplies the destination; no separate DM is opened. HTML (.html/.htm) is also delivered as a PDF rendered by headless Chrome, in the same message. Return a confirmed receipt, not file content. Never automatically retry uncertain delivery.",
   input: {
     type: "object",
     properties: {
       path: { type: "string", minLength: 1, description: "Absolute path to the finished local file to send." },
       comment: { type: "string", maxLength: 2000, description: "Optional text accompanying this file in the active thread." },
+      pdf: { type: "boolean", description: "HTML only: false sends just the source, without the rendered PDF. Default true." },
     },
     required: ["path"],
     additionalProperties: false,
@@ -176,6 +194,7 @@ export const fileSendTool: Info = {
     }
     const args = ["send-file", "--file", value.path, "--session", sessionId];
     if (value.comment !== undefined) args.push(`--comment=${value.comment}`);
+    if (value.pdf === false) args.push("--no-pdf");
     const receipt = validateReceipt(await runFileCommand(args, context.signal), sessionId);
     return { content: JSON.stringify(receipt) };
   },

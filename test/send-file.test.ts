@@ -1,7 +1,10 @@
-import { appendFileSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { get } from "node:http";
+import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_SEND_FILE_BYTES, parseSendFileArgs, sendFile } from "../src/send-file.js";
+import type { ExecFn } from "../src/headless.js";
 
 const root = resolve("test/.fixtures/send-file");
 const configPath = `${root}/config.json`;
@@ -188,5 +191,109 @@ describe("credential guard", () => {
     writeFileSync(deck, "keynote bytes");
     const outcome = await sendFile({ file: deck, session: "ses_current" }, { configPath, statePath }).then(() => null, (err: Error) => err);
     expect(String(outcome?.message ?? "")).not.toMatch(/credentials/);
+  });
+});
+
+/** Plain node:http GET (global fetch is stubbed by these tests). */
+function httpGet(url: string): Promise<string> {
+  return new Promise((ok, fail) => get(url, res => {
+    let body = "";
+    res.on("data", chunk => { body += chunk; }).on("end", () => ok(body));
+  }).on("error", fail));
+}
+
+describe("HTML sends also deliver a rendered PDF", () => {
+  const html = `${root}/report.html`;
+  const source = "<h1>Quarterly</h1>";
+  const findChrome = async () => "/fake/chrome";
+  const outOf = (args: string[]) => args.find(a => a.startsWith("--print-to-pdf="))!.slice("--print-to-pdf=".length);
+  const profileOf = (args: string[]) => args.find(a => a.startsWith("--user-data-dir="))!.slice("--user-data-dir=".length);
+  beforeEach(() => writeFileSync(html, source));
+
+  /** Per-file upload IDs (FPDF/FHTML) and a completion that confirms exactly what was completed. */
+  function echoTransport() {
+    const bodies = new Map<string, Buffer>();
+    const completions: URLSearchParams[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      const u = String(url);
+      if (u.endsWith("files.getUploadURLExternal")) {
+        const id = new URLSearchParams(String(init.body)).get("filename")!.endsWith(".pdf") ? "FPDF" : "FHTML";
+        return Response.json({ ok: true, file_id: id, upload_url: `https://files.slack.com/upload/${id}` });
+      }
+      if (u.includes("/upload/")) {
+        bodies.set(u.split("/").at(-1)!, Buffer.from(await ((init.body as FormData).get("body") as Blob).arrayBuffer()));
+        return new Response("ok");
+      }
+      if (u.endsWith("files.completeUploadExternal")) {
+        const params = new URLSearchParams(String(init.body));
+        completions.push(params);
+        return Response.json({ ok: true, files: JSON.parse(params.get("files")!).map((f: { id: string }) => ({ id: f.id })) });
+      }
+      throw new Error(`Unexpected call ${u}`);
+    }));
+    return { bodies, completions };
+  }
+
+  it("posts the PDF first and the HTML in one thread message, reports both, and removes temp files", async () => {
+    const { bodies, completions } = echoTransport();
+    const argv: string[][] = [];
+    let served = "";
+    const exec = vi.fn<ExecFn>(async (_file, args) => {
+      argv.push(args);
+      served = await httpGet(args.at(-1)!); // what Chrome would load
+      writeFileSync(outOf(args), "%PDF-1.7 fake");
+      return { stderr: "" };
+    });
+    const receipt = await call({ file: html, comment: "Report" }, { headless: { exec, findChrome } });
+    expect(receipt).toEqual({ ok: true, sessionId: "ses_current", channelId: "C123", threadTs: "1791000000.123456",
+      fileId: "FHTML", filename: "report.html", bytes: source.length, pdf: { fileId: "FPDF", filename: "report.pdf", bytes: 13 } });
+    expect(completions).toHaveLength(1);
+    expect(JSON.parse(completions[0]!.get("files")!)).toEqual([{ id: "FPDF", title: "report.pdf" }, { id: "FHTML", title: "report.html" }]);
+    expect(completions[0]!.get("thread_ts")).toBe("1791000000.123456");
+    expect(completions[0]!.get("initial_comment")).toBe("Report");
+    expect(bodies.get("FPDF")!.toString()).toBe("%PDF-1.7 fake");
+    expect(bodies.get("FHTML")!.toString()).toBe(source);
+    // Chrome gets the checked bytes over loopback, never a file:// URL that could frame local files.
+    expect(argv[0]!.at(-1)).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32}\.html$/);
+    expect(served).toBe(source);
+    await expect(httpGet(argv[0]!.at(-1)!)).rejects.toThrow(); // server closed after the render
+    expect(existsSync(profileOf(argv[0]!))).toBe(false);
+    expect(existsSync(dirname(outOf(argv[0]!)))).toBe(false);
+  });
+
+  it("sends the HTML alone with a SLACKOC_CHROME note when Chrome is missing", async () => {
+    const { completions } = echoTransport();
+    const exec = vi.fn<ExecFn>();
+    const receipt = await call({ file: html, comment: "Report" }, { headless: { exec, findChrome: async () => undefined } });
+    expect(receipt).toMatchObject({ fileId: "FHTML", filename: "report.html", pdfSkipped: expect.stringContaining("SLACKOC_CHROME") });
+    expect(receipt.pdf).toBeUndefined();
+    expect(exec).not.toHaveBeenCalled();
+    expect(JSON.parse(completions[0]!.get("files")!)).toEqual([{ id: "FHTML", title: "report.html" }]);
+    expect(completions[0]!.get("initial_comment")).toMatch(/^Report\nNo PDF: Chrome wasn't found; set `SLACKOC_CHROME`/);
+  });
+
+  it.each([
+    ["a Chrome timeout", /timed out/, async () => { throw Object.assign(new Error("killed"), { killed: true, signal: "SIGKILL" }); }],
+    ["a PDF over the 50 MiB limit", /50 MiB/, async (args: string[]) => { writeFileSync(outOf(args), "%PDF"); truncateSync(outOf(args), MAX_SEND_FILE_BYTES + 1); return { stderr: "" }; }],
+  ] as const)("still sends the HTML after %s", async (_name, reason, run) => {
+    const { completions } = echoTransport();
+    let profile = "";
+    const exec: ExecFn = async (_file, args) => { profile = profileOf(args); return run(args); };
+    const receipt = await call({ file: html }, { headless: { exec, findChrome } });
+    expect(receipt.pdfSkipped).toMatch(reason);
+    expect(JSON.parse(completions[0]!.get("files")!)).toEqual([{ id: "FHTML", title: "report.html" }]);
+    expect(existsSync(profile)).toBe(false);
+  });
+
+  it("--no-pdf sends only the source without running Chrome; other files never render", async () => {
+    expect(parseSendFileArgs(["--file", html, "--session", "ses_current", "--no-pdf"]).noPdf).toBe(true);
+    expect(() => parseSendFileArgs(["--file", html, "--session", "ses_current", "--no-pdf", "--no-pdf"])).toThrow(/duplicate/);
+    const { completions } = echoTransport();
+    const exec = vi.fn<ExecFn>();
+    const plain = await call({ file: html, noPdf: true }, { headless: { exec, findChrome } });
+    const pdfFile = await call({}, { headless: { exec, findChrome } });
+    expect(exec).not.toHaveBeenCalled();
+    expect([plain, pdfFile].map(r => [r.filename, "pdf" in r, "pdfSkipped" in r])).toEqual([["report.html", false, false], ["report with spaces.pdf", false, false]]);
+    expect(completions.map(c => JSON.parse(c.get("files")!).length)).toEqual([1, 1]);
   });
 });

@@ -18,7 +18,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsx src/cli.ts",
-    "test": "vitest run",
+    "test": "vitest run --dir test",
     "smoke": "tsx test/integration/smoke.ts",
     "check": "tsc --noEmit"
   },

@@ -5,9 +5,10 @@ import type { ServerPool, PoolEntry } from "../opencode/server.js";
 import { permRespond, pendingQuestions, pendingPermissions, questionReply, questionReject } from "../opencode/client.js";
 import { appendSectionSuffix, PERMISSION_ACTIONS, QUESTION_ACTION_PATTERN, questionBlocks } from "./blocks.js";
 import { PermissionDeliveryStore, PermissionResponder, parsePermissionButton, type PermissionRecord } from "./permissions.js";
-import { PermissionDeliveryManager } from "./permission-delivery.js";
+import { PermissionDeliveryManager, permissionMarkerMetadata } from "./permission-delivery.js";
 import { QuestionsStore, questionBindingToken, sameQuestionBinding, type QuestionSnapshot } from "./questions-store.js";
-import { QuestionUiReconciler, questionPresentationMarker } from "./question-ui.js";
+import { QuestionUiReconciler } from "./question-ui.js";
+import { hasMarker, markerMetadata } from "./markers.js";
 import { unicodeEmoji } from "./emoji.js";
 import { formAnswer, visibleQuestions } from "../opencode/v2.js";
 import { compareTs, isRecentRecoveryEligibleThread, replayAge } from "./recovery-policy.js";
@@ -40,6 +41,8 @@ export interface InteractionDeps {
   botUserId: () => string;
   scheduledReports: () => ScheduledReports | undefined;
   viewThread: (channel: string, threadTs: string) => string;
+  /** E2: a permission/question ask was created or resolved (the Home tab refreshes). */
+  onChange?: () => void;
 }
 
 export function createInteractions(deps: InteractionDeps) {
@@ -58,6 +61,7 @@ export function createInteractions(deps: InteractionDeps) {
   const interactionSweeps = new Map<string, { flight: Promise<void>; requested: boolean }>();
   const interactionChanged = (dir: string): void => {
     interactionVersions.set(dir, (interactionVersions.get(dir) ?? 0) + 1);
+    deps.onChange?.();
   };
 
   type Delivery = { status: "new" | "in-flight" | "delivered" | "rejected" | "uncertain"; attempts: number };
@@ -150,6 +154,19 @@ export function createInteractions(deps: InteractionDeps) {
     const c = ask.cursor;
     return c !== undefined && visibleQuestions(ask.req, ask.answers)[c] ? c : activeQuestion(ask);
   }
+  /** True when question `i` needs an answer and has none (the "Submit selection" rule). */
+  const missingRequired = (ask: Pick<QuestionAsk, "req" | "answers">, i: number): boolean => {
+    const field = ask.req.questions[i]?.field;
+    return !ask.answers[i]?.length && (!field || field.type === "external" || !!field.required);
+  };
+  /**
+   * Review-step entry check (#43): toggles on a finalized multiselect revisited via Back can empty
+   * a required answer, so reopen any such question; shownQuestion then lands on it, not the review.
+   */
+  function reopenMissingRequired(ask: QuestionAsk): void {
+    const visible = visibleQuestions(ask.req, ask.answers);
+    ask.req.questions.forEach((_, i) => { if (visible[i] && ask.finalized[i] && missingRequired(ask, i)) ask.finalized[i] = false; });
+  }
   /** Single-question asks submit on the answering tap; longer forms wait for the review step's "Submit answers". */
   const oneTap = (ask: QuestionAsk): boolean => visibleQuestions(ask.req, ask.answers).filter(Boolean).length === 1;
   /** Persist a draft/UI change. Moving to another question posts a fresh bottom card (presentation++) unless `inPlace` (Back/Next). */
@@ -189,18 +206,19 @@ export function createInteractions(deps: InteractionDeps) {
     eligible: snapshot => snapshot.response === "resolved" ||
       (quesAsks.get(snapshot.id)?.generation === snapshot.generation && isPending(quesAsks.get(snapshot.id)!, "question")),
     render: (snapshot, destination) => {
-      const text = snapshot.resolvedText ?? "OpenCode question";
+      // `text` is the push-notification line; question-ui attaches the marker as metadata.
+      const text = snapshot.resolvedText ?? "❓ OpenCode has a question";
       const blocks = snapshot.response === "resolved"
         ? [{ type: "section", text: { type: "mrkdwn", text: unicodeEmoji(text) } }]
         : questionCard(snapshot);
       const link = destination === "dm" ? viewThread(snapshot.channel, snapshot.threadTs) : "";
-      return { text: `${unicodeEmoji(text)}\n${questionPresentationMarker(snapshot, destination)}`,
-        blocks: link ? appendSectionSuffix(blocks, link) : blocks };
+      return { text: unicodeEmoji(text), blocks: link ? appendSectionSuffix(blocks, link) : blocks };
     },
     send: async (channel, ts, build) => {
       await enqueue(async () => {
         const card = build();
-        if (card) await app.client.chat.update({ channel, ts, text: card.text, blocks: card.blocks as never });
+        if (card) await app.client.chat.update({ channel, ts, text: card.text, blocks: card.blocks as never,
+          ...(card.metadata ? { metadata: card.metadata } : {}) });
       }, { channel, method: "chat.update", lane: "interactive", thread: questionCopyThread(channel, ts) });
     },
     remove: async (channel, ts, allowed) => {
@@ -217,7 +235,8 @@ export function createInteractions(deps: InteractionDeps) {
       const card = build();
       if (!card) return;
       const result = await app.client.chat.postMessage({ channel, ...(threadTs ? { thread_ts: threadTs } : {}),
-        text: card.text, blocks: card.blocks as never, unfurl_links: false, unfurl_media: false });
+        text: card.text, blocks: card.blocks as never, unfurl_links: false, unfurl_media: false,
+        ...(card.metadata ? { metadata: card.metadata } : {}) });
       if (!result.ts) throw new Error("Slack did not confirm the question card timestamp");
       return { ts: result.ts };
     }, { channel, lane: "interactive", thread: threadTs ?? "" }),
@@ -275,9 +294,10 @@ export function createInteractions(deps: InteractionDeps) {
     ]).has(e.data?.error ?? "");
   }
 
-  /** One page (100) of a thread, or of a channel when `threadTs` is unset; callers enqueue it. */
+  /** One page (100) of a thread, or of a channel when `threadTs` is unset; callers enqueue it.
+   * `include_all_metadata`: without it Slack returns only event_type, not our marker payload. */
   function historyPage(channel: string, threadTs: string | undefined, oldest?: string, cursor?: string) {
-    const range = { ...(oldest ? { oldest, inclusive: true } : {}), ...(cursor ? { cursor } : {}) };
+    const range = { ...(oldest ? { oldest, inclusive: true } : {}), ...(cursor ? { cursor } : {}), include_all_metadata: true };
     return threadTs
       ? app.client.conversations.replies({ channel, ts: threadTs, ...range, limit: 100 })
       : app.client.conversations.history({ channel, ...range, limit: 100 });
@@ -286,7 +306,8 @@ export function createInteractions(deps: InteractionDeps) {
   /** Pages read per marker search; past this, absence stays unproven. */
   const MARKER_PAGES = 5;
   /**
-   * First bot-authored post whose text matches, following next_cursor for up to
+   * First bot-authored post whose marker matches (metadata payload first, then
+   * text for pre-metadata posts; markers.ts), following next_cursor for up to
    * MARKER_PAGES pages (one queued request each). `complete` means every page in
    * the range was read, so absence is proven; a missing cursor, has_more, or an
    * exhausted budget leaves it unproven. Read-only: never posts or replies.
@@ -297,7 +318,7 @@ export function createInteractions(deps: InteractionDeps) {
     for (let pages = 0; pages < MARKER_PAGES && !isStopping(); pages++) {
       const page = await enqueue(() => historyPage(channel, threadTs, opts.oldest, cursor),
         { channel, method: threadTs ? "conversations.replies" : "conversations.history", ...(opts.lane ? { lane: opts.lane } : {}) });
-      const copy = page.messages?.find(m => m.user === botUserId() && !!m.text && match(m.text) && m.ts);
+      const copy = page.messages?.find(m => m.user === botUserId() && !!m.ts && hasMarker(m, match));
       if (copy?.ts) return { ts: copy.ts, complete: true };
       cursor = page.response_metadata?.next_cursor || undefined;
       if (!cursor) return { complete: !page.has_more };
@@ -307,14 +328,15 @@ export function createInteractions(deps: InteractionDeps) {
 
   const hasLine = (markers: string[]) => (text: string) => text.split("\n").some(line => markers.includes(line));
 
-  async function collapseCopy(channel: string, ts: string, text: string): Promise<boolean> {
+  /** `thread` orders the edit within its thread (queue.ts); untagged it would be a channel-wide barrier. */
+  async function collapseCopy(channel: string, ts: string, text: string, thread: string): Promise<boolean> {
     if (isStopping()) return false;
     return enqueue(async () => {
       if (isStopping()) return false;
       await app.client.chat.update({ channel, ts, text: unicodeEmoji(text),
         blocks: [{ type: "section", text: { type: "mrkdwn", text: unicodeEmoji(text) } }] });
       return true;
-    }, { channel, method: "chat.update", lane: "interactive" }).catch(err => { pushLog(`interaction update failed: ${String(err)}`); return false; });
+    }, { channel, method: "chat.update", lane: "interactive", thread }).catch(err => { pushLog(`interaction update failed: ${String(err)}`); return false; });
   }
 
   function armInteractionNudge(ask: InteractionAsk, kind: InteractionKind): void {
@@ -379,10 +401,10 @@ export function createInteractions(deps: InteractionDeps) {
           try { postedBlocks = blocks(); }
           catch (err) { delivery.status = "rejected"; saveQuestion(ask as QuestionAsk); throw err; }
           built = true;
-          const text = `${header}\n${marker}`;
+          const metadata = markerMetadata("question", ask.id, marker);
           const result = destination === "thread"
-            ? await render.post(ask.channel, ask.threadTs, text, postedBlocks, { unfurl: false, lane: "interactive" })
-            : await render.dm!(ask.channel, ask.threadTs, text, postedBlocks, { lane: "interactive" });
+            ? await render.post(ask.channel, ask.threadTs, header, postedBlocks, { unfurl: false, lane: "interactive", metadata })
+            : await render.dm!(ask.channel, ask.threadTs, header, postedBlocks, { lane: "interactive", metadata });
           ts = result.ts;
           delivery.status = "delivered";
           if (destination === "thread") ask.askTs = ts; else ask.dmTs = ts;
@@ -680,7 +702,9 @@ export function createInteractions(deps: InteractionDeps) {
     await Promise.all((["thread", "dm"] as const).map(async destination => {
       const copy = permissionStore.get(record)?.[destination];
       if (!copy?.channel || !copy.ts || copy.collapsed) return;
-      if (await collapseCopy(copy.channel, copy.ts, text)) permissionStore.update(record, r => {
+      // Same thread tags as the card posts: the thread root, or top level for the DM copy.
+      const thread = destination === "thread" ? record.threadKey.split(":")[1]! : "";
+      if (await collapseCopy(copy.channel, copy.ts, text, thread)) permissionStore.update(record, r => {
         if (r[destination].ts === copy.ts) r[destination].collapsed = true;
       });
     }));
@@ -717,7 +741,7 @@ export function createInteractions(deps: InteractionDeps) {
         if (!current || current.response.status === "resolved" || !permissionEligible(current)) throw new Error("permission no longer pending");
         return app.client.chat.postMessage({ channel, ...(destination === "thread" ? { thread_ts: rootTs } : {}),
           text: text + link, ...(blocks ? { blocks: appendSectionSuffix(blocks, link) as never } : {}),
-          mrkdwn: true, unfurl_links: false, unfurl_media: false });
+          metadata: permissionMarkerMetadata(record, destination), mrkdwn: true, unfurl_links: false, unfurl_media: false });
       }, { channel, lane: "interactive", thread: destination === "thread" ? rootTs : "" });
       if (!result.ts) throw new Error("Slack did not confirm the permission message timestamp");
       return { channel, ts: result.ts };
@@ -798,11 +822,9 @@ export function createInteractions(deps: InteractionDeps) {
       setDmChannel(opened?.channel?.id ?? null);
     }
     for (const record of permissionStore.list()) {
-      if (record.response.status === "resolved" && permissionEligible(record)) {
-        await collapsePermissionCopies(record, record.response.text ?? "Permission resolved or expired.");
-      }
       if (record.response.status !== "resolved" && !permissionEligible(record)) {
         permissionStore.update(record, r => { r.response = { ...r.response, status: "resolved", confirmed: false, text: "Permission retired: old or canceled conversation." }; });
+        deps.onChange?.();
         const ask = permAsks.get(record.requestId);
         if (ask) {
           ask.resolvedText = "Permission retired.";
@@ -812,6 +834,12 @@ export function createInteractions(deps: InteractionDeps) {
           permNudges.delete(record.requestId);
           getView(record.sessionId)?.setWaiting(record.requestId, "permission", false);
         }
+      }
+      // Collapse every resolved record's cards, retired/ineligible ones included (#32). Idempotent:
+      // collapsed copies are skipped, and a failed edit stays uncollapsed for the next refresh.
+      const latest = permissionStore.get(record);
+      if (latest?.response.status === "resolved") {
+        await collapsePermissionCopies(latest, latest.response.text ?? "Permission resolved or expired.");
       }
     }
     await Promise.all(pool.list().filter(e => e.status === "ready").map(e => sweepInteractions(e.dir)));
@@ -864,6 +892,8 @@ export function createInteractions(deps: InteractionDeps) {
   const submitAskIfComplete = async (ask: QuestionAsk, client: NonNullable<PoolEntry["client"]>, confirmed: boolean): Promise<"replied" | "incomplete" | "failed"> => {
     if (!isPending(ask, "question")) return "incomplete";
     if (questionLocks.has(ask.id)) return "incomplete";
+    // Every answer path enters the review step (or sends) through here.
+    reopenMissingRequired(ask);
     changedQuestion(ask);
     if (ask.response === "uncertain") {
       questionLocks.add(ask.id);
@@ -1033,8 +1063,7 @@ export function createInteractions(deps: InteractionDeps) {
     if (!g) return;
     const { v, ask, client } = g;
     if (answerLocked(ask, v.i)) { await alreadySaved(ask, respond); return; }
-    const field = ask.req.questions[v.i]?.field;
-    if (!ask.answers[v.i!]?.length && (!field || field.type === "external" || field.required)) {
+    if (missingRequired(ask, v.i)) {
       await respond({ text: "Pick at least one option before submitting.", response_type: "ephemeral" }).catch(() => {});
       return;
     }
@@ -1073,6 +1102,7 @@ export function createInteractions(deps: InteractionDeps) {
     if (!g || questionLocks.has(g.ask.id) || g.ask.response !== "pending") return;
     if (!g.v.r && !visibleQuestions(g.ask.req, g.ask.answers)[g.v.i]) { await alreadySaved(g.ask, respond); return; }
     g.ask.cursor = g.v.r ? undefined : g.v.i;
+    if (g.v.r) reopenMissingRequired(g.ask); // Next from the last question enters the review step
     g.ask.page = 0;
     changedQuestion(g.ask, false, true);
     await Promise.all(renderAskBoth(g.ask));

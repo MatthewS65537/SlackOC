@@ -101,7 +101,7 @@ export function scheduleConfirmView(token: string, input: NewScheduleJob, now: n
       { type: "section", text: plain(`${input.name}\n${scheduleDescription(input)}\nNext start: ${next}\nProject: ${input.projectDir}\nDestination: ${input.destination.kind === "dm" ? "your DM" : input.destination.channelId}\nRuntime: ${input.timeoutMs / 60_000} minutes\nModel: ${input.model ?? "OpenCode default"}\nAgent: ${input.agent ?? "OpenCode default"}`) },
       ...(editing ? [{ type: "section", text: plain("Saving keeps this report's ID and run history. Changes apply to future occurrences; a run already in progress keeps its original settings.") }] : []),
       ...chunkText(input.prompt, 2800).map(text => ({ type: "section", text: plain(text) })),
-      { type: "section", text: plain("Starts generation at the scheduled time; delivery follows completion. Read-only tools; no shell, edits, subagents or MCP tools. Latest missed run only, within two hours. Approval/questions pause privately until the runtime deadline. Your Mac and bridge must be awake and online.") },
+      { type: "section", text: plain("Starts generation at the scheduled time; delivery follows completion. Read-only tools; no shell, edits, subagents or MCP tools. Latest missed run only, within two hours. Reports due at the same time run one after another. Approval/questions pause privately until the runtime deadline. Your Mac and bridge must be awake and online.") },
     ] };
 }
 
@@ -120,9 +120,15 @@ function shortTime(at: number, timeZone: string, now: number): string {
   return (date + time).replace(/\u202f/g, " ");
 }
 
+/** Newest run by start; on a tie the later occurrence, so a missed-range skip never masks the run claimed with it. */
+function newestRun(runs: ScheduleRun[]): ScheduleRun | undefined {
+  return runs.reduce<ScheduleRun | undefined>((a, b) =>
+    !a || b.startedAt > a.startedAt || (b.startedAt === a.startedAt && b.scheduledAt > a.scheduledAt) ? b : a, undefined);
+}
+
 /** Outcome of the newest run (by start), timed at its occurrence; active runs show no time. */
 export function lastRunStatus(runs: ScheduleRun[], timeZone: string, now: number): string | undefined {
-  const run = runs.reduce<ScheduleRun | undefined>((a, b) => !a || b.startedAt > a.startedAt ? b : a, undefined);
+  const run = newestRun(runs);
   if (!run) return undefined;
   const label = RUN_LABELS[run.status];
   return label.startsWith("…") ? label : `${label} ${shortTime(run.scheduledAt, timeZone, now)}`;
@@ -229,7 +235,12 @@ export function installScheduleControls(opts: ControlOptions): Pick<ScheduleComm
           const status = lastRunStatus(runs.filter(r => r.jobId === job.id), job.schedule.timezone, now());
           return status ? ` · last ${status}` : "";
         };
-        const lines = jobs.map(job => `\`${job.id}\` — *${esc(job.name)}* · ${job.enabled ? "on" : "paused"}${last(job)}\n${scheduleDescription(job)} · next ${new Date(job.nextRunAt).toLocaleString("en-US", { timeZone: job.schedule.timezone })}\n${job.destination.kind === "dm" ? "your DM" : `<#${job.destination.channelId}>`} · \`${esc(job.projectDir)}\``);
+        // A skipped newest run says why, so a lost report is never silent here (#34).
+        const skipped = (job: ScheduleJob) => {
+          const run = newestRun(runs.filter(r => r.jobId === job.id));
+          return run?.status === "skipped" ? `\n⚠ ${esc(run.error ?? "Skipped.")}` : "";
+        };
+        const lines = jobs.map(job => `\`${job.id}\` — *${esc(job.name)}* · ${job.enabled ? "on" : "paused"}${last(job)}\n${scheduleDescription(job)} · next ${new Date(job.nextRunAt).toLocaleString("en-US", { timeZone: job.schedule.timezone })}\n${job.destination.kind === "dm" ? "your DM" : `<#${job.destination.channelId}>`} · \`${esc(job.projectDir)}\`${skipped(job)}`);
         for (const text of chunkText(lines.length ? lines.join("\n\n") : "No scheduled reports. Use `\\schedule add` to create one.")) await ctx.postToThread(text);
         return;
       }

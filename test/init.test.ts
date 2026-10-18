@@ -3,6 +3,7 @@ import {
   assertAppTokenShape,
   assertBotTokenShape,
   assertOwnerIdShape,
+  slackApiWithScopes,
   testAppToken,
   testBotToken,
   verifyOwnerId,
@@ -10,6 +11,7 @@ import {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 function stubFetchJson(body: unknown) {
@@ -35,6 +37,22 @@ describe("token/owner shape guards", () => {
 });
 
 describe("live token validators (stubbed fetch)", () => {
+  it("every Slack call carries a 10 s timeout signal", async () => {
+    const signal = AbortSignal.abort();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(signal);
+    const fetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
+    vi.stubGlobal("fetch", fetch);
+    await testAppToken("xapp-t");
+    expect(timeout).toHaveBeenCalledWith(10_000);
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("apps.connections.open"), expect.objectContaining({ signal }));
+  });
+
+  it("slackApiWithScopes parses x-oauth-scopes, and reports null when the header is missing", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response('{"ok":true}', { headers: { "x-oauth-scopes": "chat:write, files:write" } })));
+    await expect(slackApiWithScopes("auth.test", "xoxb-t")).resolves.toEqual({ body: { ok: true }, scopes: ["chat:write", "files:write"] });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response('{"ok":true}')));
+    await expect(slackApiWithScopes("auth.test", "xoxb-t")).resolves.toEqual({ body: { ok: true }, scopes: null });
+  });
   it("testBotToken happy path", async () => {
     stubFetchJson({ ok: true, team: "My Team", user: "slackoc" });
     await expect(testBotToken("xoxb-t")).resolves.toEqual({ ok: true, team: "My Team", user: "slackoc" });
@@ -63,5 +81,31 @@ describe("live token validators (stubbed fetch)", () => {
   it("verifyOwnerId soft-skips when scope is missing", async () => {
     stubFetchJson({ ok: false, error: "missing_scope" });
     await expect(verifyOwnerId("xoxb-t", "U01234ABCD")).resolves.toBeNull();
+  });
+});
+
+describe("runInit", () => {
+  it("keeps optional settings (ship) from an existing config and replaces tokens", async () => {
+    const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+    const { join, resolve } = await import("node:path");
+    const root = resolve("test/.fixtures/init");
+    mkdirSync(root, { recursive: true });
+    const home = mkdtempSync(join(root, "home-"));
+    mkdirSync(join(home, "slackoc"));
+    const path = join(home, "slackoc", "config.json");
+    writeFileSync(path, JSON.stringify({ slackBotToken: "xoxb-old", slackAppToken: "xapp-old", ownerSlackUserId: "UOLD00000", createdAt: "x", ship: { allowMainPush: true } }));
+    vi.stubEnv("SLACKOC_HOME", home);
+    vi.resetModules(); // CONFIG_DIR is read at import time
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    stubFetchJson({ ok: true, user: "bot" });
+    try {
+      const { runInit } = await import("../src/init.js");
+      await runInit({ botToken: "xoxb-new", appToken: "xapp-new", ownerId: "UNEW00000" });
+      const saved = JSON.parse(readFileSync(path, "utf8"));
+      expect(saved).toMatchObject({ slackBotToken: "xoxb-new", slackAppToken: "xapp-new", ownerSlackUserId: "UNEW00000", ship: { allowMainPush: true } });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

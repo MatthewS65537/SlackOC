@@ -14,6 +14,9 @@
       "messages_tab_enabled": true,
       "messages_tab_read_only_enabled": false
     },
+    "agent_view": {
+      "agent_description": "SlackOC runs an OpenCode coding agent on your own computer. Each thread is one OpenCode session: send a prompt, watch tool calls and answers stream in, approve permissions, answer questions, and stop a run from Slack."
+    },
     "shortcuts": [
       {
         "name": "Send to OpenCode",
@@ -45,6 +48,7 @@
   "settings": {
     "event_subscriptions": {
       "bot_events": [
+        "agent_session_stopped",
         "app_home_opened",
         "app_mention",
         "message.channels",

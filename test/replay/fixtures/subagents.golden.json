@@ -1,0 +1,17 @@
+[
+  "react U1 :eyes:",
+  "post M1: I'll split this between two helpers.",
+  "post M2: ⎯⎯⎯ tools ⎯⎯⎯\n\n🤖 task explore: Audit docs\n🤖 task explore: Audit CLI flags",
+  "post M3: 🤖 *Audit docs* · 1 tool · 1s · working…",
+  "post M4: 🤖 *Audit CLI flags* · 1 tool · 1s · working…",
+  "update M3: 🤖 *Audit docs* · 2 tools · 4s · working…",
+  "update M4: 🤖 *Audit CLI flags* · 1 tool · 2s · working…",
+  "update M3: 🤖 *Audit docs* · 2 tools · 6s · done\n> Docs are current except the stream flag.",
+  "update M4: 🤖 *Audit CLI flags* · 2 tools · 5s · working…",
+  "update M4: 🤖 *Audit CLI flags* · 2 tools · 8s · done\n> Two flags lack help text: dir and json.",
+  "post M5: ⎯⎯⎯ response ⎯⎯⎯\n\nBoth audits are done.",
+  "post M6: Docs have one stale flag, and two CLI flags need help text.",
+  "unreact U1 :eyes:",
+  "react U1 :white_check_mark:",
+  "post M7: *project* · `anthropic/claude-sonnet-4-5` · 16s · $0.0080 · 1.8k↑/240↓ · Verbose Tools"
+]

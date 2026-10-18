@@ -146,11 +146,15 @@ describe("scheduled report controls", () => {
     expect(lastRunStatus([run("waiting", "2026-10-03T15:00:00Z")], tz, NOW)).toBe("… waiting for you");
     // Newest by start: a manual run started later wins over a later-scheduled skip.
     expect(lastRunStatus([run("skipped", "2026-10-03T18:00:00Z", 1), run("running", "2026-10-03T17:00:00Z", 2)], tz, NOW)).toBe("… running");
+    // Same start (a missed-range skip recorded with the claim): the later occurrence wins.
+    expect(lastRunStatus([run("skipped", "2026-10-02T16:00:00Z", 5), run("running", "2026-10-03T16:00:00Z", 5)], tz, NOW)).toBe("… running");
 
     const s = setup(); const job = s.store.createJob(parseScheduleFields(fields()));
     s.store.skipOccurrence(job.id, Date.parse("2026-10-03T16:00:00Z"), "missed");
     await s.controls.run(s.ctx, "");
     expect(s.ctx.postToThread).toHaveBeenCalledWith(expect.stringContaining("· on · last ⚠ skipped 9:00 AM\n"));
+    // ...and says why on its own line (#34).
+    expect(s.ctx.postToThread).toHaveBeenCalledWith(expect.stringMatching(/\n⚠ missed$/));
   });
 
   it("owner-only preview and explicit confirmation create exactly one task", async () => {

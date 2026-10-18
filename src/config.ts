@@ -11,6 +11,8 @@ export interface SlackocConfig {
   /** The single Slack user allowed to drive this bridge. SECURITY INVARIANT. */
   ownerSlackUserId: string;
   createdAt: string;
+  /** Ship panel (C1). `allowMainPush` (default false) lets it push straight to main/master. Hand-edited; kept across `slackoc init`. */
+  ship?: { allowMainPush?: boolean };
 }
 
 export const CONFIG_DIR = join(process.env.SLACKOC_HOME ?? join(homedir(), ".config"), "slackoc");

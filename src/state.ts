@@ -38,11 +38,22 @@ export interface ThreadState {
   lastSeenTs?: string;
   /** Only the history poll advances this, after verifying contiguous dispositions. */
   historyCursorTs?: string;
+  /**
+   * D3: the latest prompt the router admitted, which ↻ Retry resends. Text only,
+   * capped at LAST_PROMPT_MAX (`cut` = longer originally); `files` = the original
+   * had attachments (never re-sent); `ts` = its Slack message, so a stale card
+   * can tell a newer prompt ran; `sessionId` stops a retry after a rebind (\resume, \new).
+   * Absent in older state files: no Retry buttons.
+   */
+  lastPrompt?: { text: string; ts: string; sessionId: string; files?: true; cut?: true };
   /** Always set on stored threads (constructor + setThread); optional only for callers building a ThreadState. */
   recovery?: ThreadRecovery;
   createdAt: number;
   lastUsedAt: number;
 }
+
+/** Cap on ThreadState.lastPrompt.text (characters). */
+export const LAST_PROMPT_MAX = 4_000;
 
 interface ThreadRecovery {
   ownerActivityTs?: string;
@@ -342,6 +353,13 @@ export class StateStore {
   anyThreadInDir(dir: string, exceptKey?: string): boolean {
     const canonical = canonicalDir(dir);
     return Object.entries(this.state.threads).some(([k, t]) => k !== exceptKey && canonicalDir(t.projectDir) === canonical);
+  }
+
+  /** Threads bound to `dir` (\worktrees lists them; removing a worktree unbinds them). */
+  threadsInDir(dir: string): Array<{ key: string; thread: ThreadState }> {
+    const canonical = canonicalDir(dir);
+    return Object.entries(this.state.threads).filter(([, t]) => canonicalDir(t.projectDir) === canonical)
+      .map(([key, t]) => ({ key, thread: structuredClone(t) }));
   }
 
   /** Threads whose last run never finalized (bridge stopped mid-run). */

@@ -4,8 +4,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/MatthewS65537/SlackOC/main/install.sh | bash
 #
 # By default installs the latest GitHub release (pinned bytes, checksum
-# verified). Overrides (mostly for testing):
-#   SLACKOC_REF          install a specific git ref instead (v* = tag, else branch)
+# verified). If the release can't be resolved it stops; it never falls back
+# to an unpinned branch on its own. Overrides (mostly for testing):
+#   SLACKOC_REF          install a specific git ref instead (v* = tag, else branch;
+#                        SLACKOC_REF=main installs unreleased main, no checksum)
 #   SLACKOC_TARBALL_URL  full tarball URL override (skips resolution + checksum)
 set -euo pipefail
 
@@ -14,6 +16,16 @@ REF="${SLACKOC_REF:-}"
 TARBALL_URL="${SLACKOC_TARBALL_URL:-}"
 CHECKSUM_URL=""
 
+fail() { echo "slackoc install: error: $*" >&2; exit 1; }
+
+# --- Pre-flight -------------------------------------------------------------
+command -v node >/dev/null 2>&1 || fail "node not found — install Node.js >= 20 first (https://nodejs.org)"
+NODE_MAJOR="$(node -v | sed -E 's/^v?([0-9]+).*/\1/')"
+[ "${NODE_MAJOR:-0}" -ge 20 ] 2>/dev/null || fail "node >= 20 required (found $(node -v)) — upgrade: https://nodejs.org"
+command -v npm  >/dev/null 2>&1 || fail "npm not found — it ships with Node.js"
+command -v curl >/dev/null 2>&1 || fail "curl not found"
+
+# --- Resolve what to install ------------------------------------------------
 if [ -n "$TARBALL_URL" ]; then
   REF="${REF:-override}"
 elif [ -n "$REF" ]; then
@@ -25,25 +37,13 @@ else
   # Latest release: pinned tarball + SHA256SUMS attached to the GitHub release.
   TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
-  if [ -n "$TAG" ]; then
-    REF="$TAG"
-    TARBALL_URL="https://github.com/${REPO}/releases/download/${TAG}/slackoc-${TAG}.tar.gz"
-    CHECKSUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
-  else
-    echo "⚠ no GitHub release found — falling back to main"
-    REF="main"
-    TARBALL_URL="https://codeload.github.com/${REPO}/tar.gz/refs/heads/main"
-  fi
+  # Fail closed: an API outage or rate limit must not silently install unpinned main.
+  [ -n "$TAG" ] || fail "couldn't look up the latest release via the GitHub API (offline or rate-limited?).
+  Retry later, pin a release with SLACKOC_REF=v<version>, or install unreleased main with SLACKOC_REF=main."
+  REF="$TAG"
+  TARBALL_URL="https://github.com/${REPO}/releases/download/${TAG}/slackoc-${TAG}.tar.gz"
+  CHECKSUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
 fi
-
-fail() { echo "slackoc install: error: $*" >&2; exit 1; }
-
-# --- Pre-flight -------------------------------------------------------------
-command -v node >/dev/null 2>&1 || fail "node not found — install Node.js >= 20 first (https://nodejs.org)"
-NODE_MAJOR="$(node -v | sed -E 's/^v?([0-9]+).*/\1/')"
-[ "${NODE_MAJOR:-0}" -ge 20 ] 2>/dev/null || fail "node >= 20 required (found $(node -v)) — upgrade: https://nodejs.org"
-command -v npm  >/dev/null 2>&1 || fail "npm not found — it ships with Node.js"
-command -v curl >/dev/null 2>&1 || fail "curl not found"
 
 # --- Download + build -------------------------------------------------------
 WORK="$(mktemp -d)"

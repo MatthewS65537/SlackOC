@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
-import { PermissionDeliveryManager, type PermissionCopy, type PermissionDeliveryDeps } from "../src/slack/permission-delivery.js";
+import { PermissionDeliveryManager, permissionMarkerMetadata, type PermissionCopy, type PermissionDeliveryDeps } from "../src/slack/permission-delivery.js";
 import { PermissionDeliveryStore, permissionDeliveryMarker, type PermissionRecord } from "../src/slack/permissions-store.js";
 import * as blocks from "../src/slack/blocks.js";
 import { recentLogs } from "../src/log.js";
@@ -42,7 +42,7 @@ function setup(initial = record()) {
 }
 
 describe("permission delivery", () => {
-  it("posts valid native cards with stable top-level markers and coalesces by identity", async () => {
+  it("posts valid native cards without a visible marker and coalesces by identity", async () => {
     const h = setup();
     const first = h.manager.deliver(record());
     const identity = { projectDir: "/project", sessionId: "ses_1", requestId: "per_1", generation: 2 };
@@ -50,7 +50,10 @@ describe("permission delivery", () => {
     await first;
     expect(h.post).toHaveBeenCalledTimes(2);
     for (const [r, destination, text, card] of h.post.mock.calls) {
-      expect(text).toContain(permissionDeliveryMarker(r, destination));
+      // The marker rides in metadata the transport attaches; push text and blocks stay human.
+      expect(JSON.stringify([text, card])).not.toContain("slackoc-");
+      expect(permissionMarkerMetadata(r, destination)).toEqual({ event_type: "slackoc_marker",
+        event_payload: { kind: "permission", id: "per_1", marker: permissionDeliveryMarker(r, destination) } });
       expect(text).toContain("\\permission per_1 deny");
       expect(card).toEqual(blocks.permissionBlocks(r.permission, 2));
       expect(r[destination]).toMatchObject({ status: "in-flight", attempts: 1 });

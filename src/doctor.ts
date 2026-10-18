@@ -3,9 +3,10 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { Service } from "@opencode/client/service";
 import { CONFIG_DIR, loadConfig } from "./config.js";
 import { ScheduleStore } from "./schedules/store.js";
-import { slackApi } from "./init.js";
+import { slackApi, slackApiWithScopes } from "./init.js";
 import { isSupportedOpencodeVersion, MIN_OPENCODE, VERSION } from "./version.js";
 
 const execFileP = promisify(execFile);
@@ -31,6 +32,34 @@ export function scopeCheck(name: string, body: { ok: boolean; error?: string }):
     return { name, ok: true, detail: "granted" };
   }
   return { name, ok: false, detail: `unverified — ${body.error ?? "unexpected response"}; resolve the probe failure and rerun doctor` };
+}
+
+/**
+ * Verdict for a scope read from auth.test's `x-oauth-scopes` header (no
+ * write probe needed). A missing header proves nothing, so it only warns.
+ */
+export function grantedScopeCheck(name: string, scope: string, scopes: string[] | null): Check {
+  if (!scopes) return { name, ok: true, warn: true, detail: "couldn't verify scopes — Slack's x-oauth-scopes header was missing (a proxy may strip it)" };
+  return scopes.includes(scope) ? { name, ok: true, detail: "granted" } : scopeCheck(name, { ok: false, error: "missing_scope" });
+}
+
+/**
+ * The shared OpenCode V2 service: discover only, never spawn one. `slackoc
+ * start` launches a missing service itself, so "none running" is a warning;
+ * a discovery error is a failure.
+ */
+export async function serviceCheck(
+  discover: () => Promise<{ url: string } | undefined> = () => Service.discover({ version: isSupportedOpencodeVersion }),
+): Promise<Check> {
+  const name = "OpenCode service";
+  try {
+    const endpoint = await discover();
+    return endpoint
+      ? { name, ok: true, detail: `reachable at ${endpoint.url}` }
+      : { name, ok: true, warn: true, detail: "no compatible service running — `slackoc start` launches one; if that fails, run `opencode serve --service` to see why" };
+  } catch (err) {
+    return { name, ok: false, detail: `unreachable — ${String((err as Error)?.message ?? err).slice(0, 120)}; run \`opencode serve --service\` to see why` };
+  }
 }
 
 const OPENCODE_CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode");
@@ -78,6 +107,7 @@ export async function runDoctor(): Promise<number> {
   } catch (err) {
     checks.push({ name: "opencode on PATH", ok: false, detail: `not found or failed — ${String(err).slice(0, 120)}` });
   }
+  checks.push(await serviceCheck());
 
   checks.push(...localChecks());
 
@@ -88,8 +118,11 @@ export async function runDoctor(): Promise<number> {
     checks.push({ name: "config exists", ok: true, detail: "config.json found" });
     checks.push({ name: "bot token shape", ok: cfg.slackBotToken.startsWith("xoxb-"), detail: "xoxb-…" });
     checks.push({ name: "app-level token shape", ok: cfg.slackAppToken.startsWith("xapp-"), detail: "xapp-…" });
+    let scopes: string[] | null = null; // granted scopes, trusted only from a successful auth.test
     try {
-      const auth = await slackApi<{ ok: boolean; team?: string; user?: string; error?: string; url?: string }>("auth.test", cfg.slackBotToken);
+      const res = await slackApiWithScopes<{ ok: boolean; team?: string; user?: string; error?: string; url?: string }>("auth.test", cfg.slackBotToken);
+      const auth = res.body;
+      if (auth.ok) scopes = res.scopes;
       checks.push(
         auth.ok
           ? { name: "bot token auth.test", ok: true, detail: `@${auth.user}${auth.team ? ` in ${auth.team}` : ""}${auth.url ? ` — ${auth.url}` : ""}` }
@@ -126,6 +159,8 @@ export async function runDoctor(): Promise<number> {
     // call that gets "missing_scope" PROVES the installed app is behind the
     // current manifest (e.g. files:read added 2026-09-05 — drift otherwise
     // only surfaces as attachment 403s / silent reactions at runtime).
+    // files:write has no harmless probe method; read it from auth.test's header instead.
+    checks.push(grantedScopeCheck("scope files:write (send-file, diff uploads)", "files:write", scopes));
     for (const probe of [
       { name: "scope files:read (attachments)", method: "files.info", payload: { file: "F0000000000" } },
       { name: "scope reactions:write (✅/❌)", method: "reactions.add", payload: { channel: "C0000000000", name: "x", timestamp: "0" } },

@@ -14,9 +14,9 @@ import type { OcSession } from "../src/opencode/api.js";
 
 let fixtureCounter = 0;
 
-function sess(id: string, dir: string, title: string, ageMs: number, summary?: OcSession["summary"]): OcSession {
+function sess(id: string, dir: string, title: string, ageMs: number): OcSession {
   const updated = Date.now() - ageMs;
-  return { id, directory: dir, title, summary, time: { created: updated - 1000, updated } };
+  return { id, directory: dir, title, time: { created: updated - 1000, updated } };
 }
 
 function mkCtx(sessions: OcSession[], opts: { threadSession?: string; cwd?: string; threadDir?: string } = {}): CmdCtx {

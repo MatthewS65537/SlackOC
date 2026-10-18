@@ -1,16 +1,18 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { localChecks, runDoctor, scopeCheck } from "../src/doctor.js";
+import { grantedScopeCheck, localChecks, runDoctor, scopeCheck, serviceCheck } from "../src/doctor.js";
 
-const f = vi.hoisted(() => ({ exec: vi.fn() }));
+const f = vi.hoisted(() => ({ exec: vi.fn(), config: null as unknown }));
 vi.mock("node:child_process", () => ({ execFile: Object.assign(vi.fn(), {
   [Symbol.for("nodejs.util.promisify.custom")]: f.exec,
 }) }));
+// Never touch a live OpenCode service from tests.
+vi.mock("@opencode/client/service", () => ({ Service: { discover: async () => undefined } }));
 const FIXTURES = vi.hoisted(() => `${import.meta.dirname}/.fixtures/doctor`);
-vi.mock("../src/config.js", () => ({ loadConfig: () => null, CONFIG_DIR: `${FIXTURES}/slackoc` }));
+vi.mock("../src/config.js", () => ({ loadConfig: () => f.config, CONFIG_DIR: `${FIXTURES}/slackoc` }));
 afterAll(() => rmSync(FIXTURES, { recursive: true, force: true }));
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); f.config = null; });
 
 describe("doctor V2 CLI version check", () => {
   it.each([
@@ -52,6 +54,51 @@ describe("doctor live scope probes (RQ6)", () => {
 
   it("a failed response without an error is inconclusive, not granted", () => {
     expect(scopeCheck("s", { ok: false }).ok).toBe(false);
+  });
+
+  it("files:write comes from auth.test's x-oauth-scopes header: granted, missing (reinstall), or unverifiable (warn)", () => {
+    expect(grantedScopeCheck("s", "files:write", ["chat:write", "files:write"])).toEqual({ name: "s", ok: true, detail: "granted" });
+    const missing = grantedScopeCheck("s", "files:write", ["chat:write", "files:read"]);
+    expect(missing).toMatchObject({ ok: false, detail: expect.stringContaining("reinstall") });
+    expect(grantedScopeCheck("s", "files:write", null)).toMatchObject({ ok: true, warn: true, detail: expect.stringContaining("couldn't verify scopes") });
+  });
+
+  it("doctor fails on a token without files:write, read from the header, never by calling a write method", async () => {
+    f.exec.mockResolvedValue({ stdout: "opencode v2.0.21\n" });
+    f.config = { slackBotToken: "xoxb-t", slackAppToken: "xapp-t", ownerSlackUserId: "U01234ABCD" };
+    const methods: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const method = new URL(url).pathname.split("/").pop()!;
+      methods.push(method);
+      const body = method === "files.info" ? { ok: false, error: "file_not_found" }
+        : method === "reactions.add" ? { ok: false, error: "channel_not_found" }
+        : { ok: true, user: { real_name: "Owner" } };
+      return new Response(JSON.stringify(body), { headers: method === "auth.test" ? { "x-oauth-scopes": "chat:write,files:read,reactions:write" } : {} });
+    }));
+    const output = vi.spyOn(console, "log").mockImplementation(() => {});
+    expect(await runDoctor()).toBe(1);
+    expect(methods).toEqual(["auth.test", "apps.connections.open", "users.info", "files.info", "reactions.add"]);
+    const lines = output.mock.calls.map(([line]) => String(line));
+    expect(lines).toContainEqual(expect.stringMatching(/✗ scope files:write .*reinstall/));
+    expect(lines).toContainEqual(expect.stringContaining("✓ scope files:read"));
+  });
+});
+
+describe("doctor OpenCode service check", () => {
+  it("passes with the discovered endpoint", async () => {
+    expect(await serviceCheck(async () => ({ url: "http://127.0.0.1:4096" }))).toMatchObject({ ok: true, detail: expect.stringContaining("http://127.0.0.1:4096") });
+  });
+
+  it("only warns when none is running, since start launches one", async () => {
+    const check = await serviceCheck(async () => undefined);
+    expect(check).toMatchObject({ ok: true, warn: true });
+    expect(check.detail).toContain("opencode serve --service");
+  });
+
+  it("fails with the reason and a fix hint when discovery errors", async () => {
+    const check = await serviceCheck(async () => { throw new Error("EACCES: service.json"); });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toMatch(/unreachable — EACCES: service\.json; run `opencode serve --service`/);
   });
 });
 
